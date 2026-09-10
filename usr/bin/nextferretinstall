@@ -675,11 +675,25 @@ EOF
 chmod +x /etc/grub.d/11_arvor_recovery || true
 
 update-initramfs -c -k all || update-initramfs -u
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arvor-linux --removable || true
+
+# Named install -> creates EFI/arvor-linux/grubx64.efi, used by the efibootmgr NVRAM entry
+# below. IMPORTANT: --removable must NOT be combined with --bootloader-id here — when both
+# are passed together, grub-install ignores --bootloader-id entirely and only ever writes to
+# EFI/BOOT/, so EFI/arvor-linux/ never gets created. That's what was causing "grub rescue>"
+# (the NVRAM entry pointed at a file that didn't exist) and Recovery Mode never being
+# populated (the copy below had nothing to copy from).
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arvor-linux --recheck || true
+
+# Separate removable/fallback install -> creates EFI/BOOT/BOOTX64.EFI, for firmware that
+# ignores NVRAM boot entries and only looks at the removable-media default path. Kept as its
+# own call so it never overwrites the named install above.
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck || true
 
 mkdir -p /boot/efi/EFI/arvor-recovery
 if [ -f /boot/efi/EFI/arvor-linux/grubx64.efi ]; then
     cp -a /boot/efi/EFI/arvor-linux/grubx64.efi /boot/efi/EFI/arvor-recovery/grubx64.efi
+else
+    echo "WARNING: EFI/arvor-linux/grubx64.efi missing after grub-install, Recovery EFI copy skipped" >&2
 fi
 cat << 'EOF' > /boot/efi/EFI/arvor-recovery/grub.cfg
 search --no-floppy --set=root --label ARVOR_RECOVERY
@@ -703,7 +717,10 @@ exit 0
         chroot_script_path = os.path.join(self.mount, "s.sh")
         with open(chroot_script_path, "w") as f: f.write(script)
         self.run_cmd(f"chmod +x {chroot_script_path}")
-        self.run_cmd(f"chroot {self.mount} /s.sh")
+        if not self.run_cmd(f"chroot {self.mount} /s.sh"):
+            self.log_msg.emit("ERROR: chroot install script failed (see log above). Aborting before marking install as complete.")
+            self.finished.emit(False)
+            return
         self.progress.emit(90)
 
         # Setup and populate dedicated Recovery partition (p3)
@@ -712,15 +729,37 @@ exit 0
         os.makedirs(rec_mnt, exist_ok=True)
         self.run_cmd(f"mount {p3} {rec_mnt}")
 
+        # Driver packages selected by the user (Recovery Mode gets the same hardware drivers
+        # as the main system, so networking/graphics/wifi work when booted into recovery)
+        driver_pkgs_list = self.conf.get("driver_pkgs", "").split()
+        driver_include = ("," + ",".join(driver_pkgs_list)) if driver_pkgs_list else ""
+
         # 1. Debootstrap standalone minimal base for recovery
         deb_rec_cmd = (
             f"debootstrap --variant=minbase --arch=amd64 "
-            f"--include=python3,python3-pyqt6,lvm2,xfsprogs,e2fsprogs,parted,util-linux,pciutils,iproute2,systemd-sysv,bash,coreutils,kmod,linux-image-amd64,sudo,rsync,grub-efi-amd64-signed "
+            f"--components=main,contrib,non-free,non-free-firmware "
+            f"--include=python3,python3-pyqt6,lvm2,xfsprogs,e2fsprogs,parted,util-linux,python3-pyqt6.qtsvg,pciutils,iproute2,systemd-sysv,bash,coreutils,kmod,linux-image-amd64,sudo,rsync,grub-efi-amd64-signed{driver_include} "
             f"trixie {rec_mnt} http://deb.debian.org/debian"
         )
         if not self.run_cmd(deb_rec_cmd):
             self.log_msg.emit("Recovery debootstrap network failed, falling back to base sync from target...")
             self.run_cmd(f"rsync -aHAX --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* --exclude=/run/* --exclude=/tmp/* --exclude=/home/* --exclude=/root/* --exclude=/boot/efi/* {self.mount}/ {rec_mnt}/")
+
+            # If we fell back to rsync from the target, the target already has drivers
+            # installed (from the main de_sh install step), so nothing else to do here.
+            # If debootstrap succeeded but somehow missed a driver package, try to install
+            # it directly inside the fresh recovery chroot as a best-effort second pass.
+        elif driver_pkgs_list:
+            self.log_msg.emit(f"Installing hardware drivers into Recovery Mode: {' '.join(driver_pkgs_list)}")
+            self.run_cmd(f"cp /etc/resolv.conf {rec_mnt}/etc/resolv.conf")
+            for m in ["/dev", "/dev/pts", "/proc", "/sys"]:
+                self.run_cmd(f"mount --bind {m} {rec_mnt}{m}")
+            self.run_cmd(
+                f'chroot {rec_mnt} /bin/sh -c '
+                f'"apt-get update && apt-get install -y --no-install-recommends {" ".join(driver_pkgs_list)}"'
+            )
+            for m in ["/sys", "/proc", "/dev/pts", "/dev"]:
+                self.run_cmd(f"umount -l {rec_mnt}{m}")
 
         # 2. Configure credentials in recovery: root (root:root) and default user arvor (arvor:arvor with sudo)
         self.run_cmd(f'chroot {rec_mnt} /bin/sh -c "echo \"root:root\" | chpasswd"')
@@ -892,7 +931,7 @@ class InstallerGUI(QMainWindow):
             "luks": False, "luks_pass": "",
             "keymap": auto_keymap if auto_keymap in self.list_of_keymaps else default_keymap,
             "timezone": auto_tz if auto_tz in self.list_of_timezones else default_tz,
-            "de_name": "None", "de_pkgs": "", "extra_pkgs": "",
+            "de_name": "None", "de_pkgs": "", "extra_pkgs": "", "driver_pkgs": "",
             "swap_mode": "zram"
         }
         self.user_manually_edited = False
@@ -1205,6 +1244,7 @@ class InstallerGUI(QMainWindow):
         if hasattr(self, 'chk_vlc'): self.chk_vlc.setText(self.t("app_vlc"))
         if hasattr(self, 'chk_nvidia'): self.chk_nvidia.setText(self.t("drv_nvidia"))
         if hasattr(self, 'chk_firmware'): self.chk_firmware.setText(self.t("drv_firmware"))
+        if hasattr(self, 'chk_mediatek'): self.chk_mediatek.setText(self.t("drv_mediatek"))
 
         if hasattr(self, 'btn_back'): self.btn_back.setText(self.t("back"))
         if hasattr(self, 'btn_next'):
@@ -1353,9 +1393,11 @@ class InstallerGUI(QMainWindow):
         self.chk_nvidia = QCheckBox(self.t("drv_nvidia"))
         self.chk_firmware = QCheckBox(self.t("drv_firmware"))
         self.chk_firmware.setChecked(True)
+        self.chk_mediatek = QCheckBox(self.t("drv_mediatek"))
 
         drivers_grid.addWidget(self.chk_nvidia, 0, 0)
         drivers_grid.addWidget(self.chk_firmware, 0, 1)
+        drivers_grid.addWidget(self.chk_mediatek, 1, 0)
         cl.addLayout(drivers_grid)
 
         l.addWidget(card)
@@ -2184,14 +2226,19 @@ class InstallerGUI(QMainWindow):
         elif idx == 3:
             self.conf["de_name"] = self.c_de.currentText()
             self.conf["de_pkgs"] = self.c_de.currentData()
-            extra_list = []
-            if hasattr(self, 'chk_firefox') and self.chk_firefox.isChecked(): extra_list.append("firefox-esr")
-            if hasattr(self, 'chk_chromium') and self.chk_chromium.isChecked(): extra_list.append("chromium")
-            if hasattr(self, 'chk_office') and self.chk_office.isChecked(): extra_list.append("libreoffice libreoffice-gtk3")
-            if hasattr(self, 'chk_vlc') and self.chk_vlc.isChecked(): extra_list.append("vlc")
-            if hasattr(self, 'chk_nvidia') and self.chk_nvidia.isChecked(): extra_list.append("nvidia-driver")
-            if hasattr(self, 'chk_firmware') and self.chk_firmware.isChecked(): extra_list.append("firmware-linux-nonfree")
-            self.conf["extra_pkgs"] = " ".join(extra_list)
+            app_list = []
+            if hasattr(self, 'chk_firefox') and self.chk_firefox.isChecked(): app_list.append("firefox-esr")
+            if hasattr(self, 'chk_chromium') and self.chk_chromium.isChecked(): app_list.append("chromium")
+            if hasattr(self, 'chk_office') and self.chk_office.isChecked(): app_list.append("libreoffice libreoffice-gtk3")
+            if hasattr(self, 'chk_vlc') and self.chk_vlc.isChecked(): app_list.append("vlc")
+
+            driver_list = []
+            if hasattr(self, 'chk_nvidia') and self.chk_nvidia.isChecked(): driver_list.append("nvidia-driver")
+            if hasattr(self, 'chk_firmware') and self.chk_firmware.isChecked(): driver_list.append("firmware-linux-nonfree")
+            if hasattr(self, 'chk_mediatek') and self.chk_mediatek.isChecked(): driver_list.append("firmware-mediatek")
+
+            self.conf["driver_pkgs"] = " ".join(driver_list)
+            self.conf["extra_pkgs"] = " ".join(app_list + driver_list)
         elif idx == 4:
             if hasattr(self, 'c_swap'):
                 self.conf["swap_mode"] = self.c_swap.currentData() or "zram"
