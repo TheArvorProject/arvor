@@ -450,17 +450,23 @@ private:
 }
 
 [[nodiscard]] int create(int argc, char** argv) {
+    if (::getuid() != 0) {
+        std::println(stderr, "lxsm -c requires root. Try: sudo lxsm -c ...");
+        return 1;
+    }
+
     cli::parser p(argc, argv, {
-        {"-n", true}, {"-d", true}, {"-r", true}, {"-url", true}
+        {"-n", true}, {"-d", true}, {"-r", true}, {"-url", true}, {"--no-mesa", false}
     });
 
     auto name = p.get("-n");
     auto distro = p.get("-d");
     auto release = p.get("-r");
     auto url = p.get("-url");
+    bool skip_mesa = p.has("--no-mesa");
 
     if (!name || name->empty() || !distro || distro->empty() || !release || release->empty()) {
-        std::println(stderr, "Usage: lxsm -c -n <name> -d <distro> -r <release> -url <url>");
+        std::println(stderr, "Usage: lxsm -c -n <name> -d <distro> -r <release> -url <url> [--no-mesa]");
         return 1;
     }
 
@@ -480,9 +486,12 @@ private:
     std::vector<std::string> storage = {
         "debootstrap",
         "--arch=amd64",
-        *release,
-        path.string(),
     };
+    if (!skip_mesa) {
+        storage.push_back("--include=mesa-utils,libgl1-mesa-dri,mesa-va-drivers,mesa-vulkan-drivers");
+    }
+    storage.push_back(*release);
+    storage.push_back(path.string());
     if (url && !url->empty()) storage.push_back(*url);
 
     auto holder = detail::make_argv(std::move(storage));
@@ -505,6 +514,14 @@ private:
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         std::println(stderr, "debootstrap failed (status {})", status);
+        std::error_code cleanup_ec;
+        fs::remove_all(path, cleanup_ec);
+        if (cleanup_ec) {
+            std::println(stderr, "warning: cleanup of {} failed: {}",
+                path.string(), cleanup_ec.message());
+        } else {
+            std::println(stderr, "cleaned up partial sandbox: {}", path.string());
+        }
         return 1;
     }
 
