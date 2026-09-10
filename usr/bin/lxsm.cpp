@@ -14,6 +14,7 @@
 #include <iostream>
 #include <linux/audit.h>
 #include <linux/filter.h>
+#include <linux/memfd.h>
 #include <linux/seccomp.h>
 #include <linux/types.h>
 #include <map>
@@ -24,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -33,6 +35,10 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
 
 extern "C" {
 
@@ -84,6 +90,10 @@ struct argv_holder {
 
     [[nodiscard]] char** data() noexcept { return ptrs.data(); }
 };
+
+[[nodiscard]] inline bool is_root() noexcept {
+    return ::geteuid() == 0;
+}
 
 [[nodiscard]] argv_holder make_argv(std::vector<std::string> args) {
     argv_holder h;
@@ -236,6 +246,42 @@ using dl_handle = std::shared_ptr<void>;
     return {};
 }
 
+[[nodiscard]] std::expected<void, std::string> setup_pivot_root(const fs::path& new_root) {
+    std::error_code ec;
+    fs::create_directories(new_root, ec);
+    if (ec) {
+        return std::unexpected(std::string("mkdir new_root: ") + ec.message());
+    }
+
+    if (mount(new_root.c_str(), new_root.c_str(), nullptr, MS_BIND | MS_REC, nullptr) < 0) {
+        return std::unexpected(std::string("bind new_root: ") + std::strerror(errno));
+    }
+
+    fs::path put_old = new_root / ".old_root";
+    fs::create_directory(put_old, ec);
+    if (ec) {
+        return std::unexpected(std::string("mkdir .old_root: ") + ec.message());
+    }
+
+    if (chdir(new_root.c_str()) < 0) {
+        return std::unexpected(std::string("chdir new_root: ") + std::strerror(errno));
+    }
+
+    if (syscall(SYS_pivot_root, ".", ".old_root") < 0) {
+        return std::unexpected(std::string("pivot_root: ") + std::strerror(errno));
+    }
+
+    if (umount2(".old_root", MNT_DETACH) < 0) {
+        return std::unexpected(std::string("umount old_root: ") + std::strerror(errno));
+    }
+
+    fs::remove("/.old_root", ec);
+    if (chdir("/") < 0) {
+        return std::unexpected(std::string("chdir /: ") + std::strerror(errno));
+    }
+    return {};
+}
+
 [[nodiscard]] std::string read_file(const std::string& path) {
     std::ifstream in(path);
     if (!in) return {};
@@ -278,10 +324,9 @@ using dl_handle = std::shared_ptr<void>;
     auto content = spoof_cpuinfo();
     if (content.empty()) return {};
 
-    char tmpl[] = "/tmp/lxsm_cpu_XXXXXX";
-    int fd = mkstemp(tmpl);
+    int fd = static_cast<int>(syscall(SYS_memfd_create, "lxsm_cpuinfo", MFD_CLOEXEC));
     if (fd < 0) {
-        return std::unexpected(std::string("mkstemp: ") + std::strerror(errno));
+        return std::unexpected(std::string("memfd_create: ") + std::strerror(errno));
     }
 
     std::size_t total = 0;
@@ -289,18 +334,18 @@ using dl_handle = std::shared_ptr<void>;
         ssize_t n = ::write(fd, content.data() + total, content.size() - total);
         if (n < 0) {
             ::close(fd);
-            ::unlink(tmpl);
             return std::unexpected(std::string("write fake cpuinfo: ") + std::strerror(errno));
         }
         total += static_cast<std::size_t>(n);
     }
-    ::close(fd);
 
-    if (mount(tmpl, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) < 0) {
-        ::unlink(tmpl);
+    char fd_path[64];
+    std::snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    if (mount(fd_path, "/proc/cpuinfo", nullptr, MS_BIND, nullptr) < 0) {
+        ::close(fd);
         return std::unexpected(std::string("bind cpuinfo: ") + std::strerror(errno));
     }
-    ::unlink(tmpl);
+    ::close(fd);
     return {};
 }
 
@@ -315,7 +360,7 @@ using dl_handle = std::shared_ptr<void>;
     return {};
 }
 
-[[noreturn]] void exec_shell(const std::string& cmd) {
+[[nodiscard]] std::expected<void, std::string> exec_shell(const std::string& cmd) {
     std::vector<std::string> storage;
 
     if (!cmd.empty()) {
@@ -330,8 +375,7 @@ using dl_handle = std::shared_ptr<void>;
 
     auto holder = make_argv(std::move(storage));
     execvp(holder.ptrs[0], holder.data());
-    std::perror("execvp");
-    std::_Exit(127);
+    return std::unexpected(std::string("execvp: ") + std::strerror(errno));
 }
 
 [[nodiscard]] std::uintmax_t compute_size(const fs::path& p) {
@@ -428,7 +472,15 @@ public:
             if (a != flag) continue;
             auto it = specs_.find(flag);
             if (it == specs_.end() || !it->second) return std::string{};
-            if (i + 1 >= argc_) return std::nullopt;
+            if (i + 1 >= argc_) {
+                std::println(stderr, "E: flag '{}' requires a value", flag);
+                return std::nullopt;
+            }
+            std::string_view next(argv_[i + 1]);
+            if (!next.empty() && next[0] == '-' && next.size() > 1) {
+                std::println(stderr, "E: flag '{}' missing value (got '{}')", flag, next);
+                return std::nullopt;
+            }
             return std::string(argv_[i + 1]);
         }
         return std::nullopt;
@@ -441,6 +493,18 @@ public:
         return false;
     }
 
+    [[nodiscard]] bool validate() const {
+        for (int i = 0; i < argc_; ++i) {
+            std::string_view a(argv_[i]);
+            if (a.empty() || a[0] != '-') continue;
+            if (!specs_.contains(a)) {
+                std::println(stderr, "E: unknown flag '{}'", a);
+                return false;
+            }
+        }
+        return true;
+    }
+
 private:
     int argc_;
     char** argv_;
@@ -450,14 +514,15 @@ private:
 }
 
 [[nodiscard]] int create(int argc, char** argv) {
-    if (::getuid() != 0) {
-        std::println(stderr, "lxsm -c requires root. Try: sudo lxsm -c ...");
+    if (!detail::is_root()) {
+        std::println(stderr, "E: This Script Needs Root Privileges");
         return 1;
     }
 
     cli::parser p(argc, argv, {
         {"-n", true}, {"-d", true}, {"-r", true}, {"-url", true}, {"--no-mesa", false}
     });
+    if (!p.validate()) return 1;
 
     auto name = p.get("-n");
     auto distro = p.get("-d");
@@ -530,7 +595,13 @@ private:
 }
 
 [[nodiscard]] int remove(int argc, char** argv) {
+    if (!detail::is_root()) {
+        std::println(stderr, "E: This Script Needs Root Privileges");
+        return 1;
+    }
+
     cli::parser p(argc, argv, {{"-n", true}});
+    if (!p.validate()) return 1;
     auto name = p.get("-n");
 
     if (!name || name->empty()) {
@@ -557,6 +628,7 @@ private:
 
 [[nodiscard]] int enter(int argc, char** argv) {
     cli::parser p(argc, argv, {{"-n", true}, {"-r", false}, {"-s", true}});
+    if (!p.validate()) return 1;
     auto name = p.get("-n");
     auto cmd = p.get("-s");
     bool as_root = p.has("-r");
@@ -571,7 +643,7 @@ private:
         return 1;
     }
 
-    if (::getuid() != 0) {
+    if (!detail::is_root()) {
         if (auto r = detail::setup_user_namespace(); !r) {
             std::println(stderr, "{}", r.error());
             return 1;
@@ -579,12 +651,8 @@ private:
     }
 
     fs::path path = abi::sandbox_path(*name);
-    if (chroot(path.c_str()) < 0) {
-        std::perror("chroot");
-        return 1;
-    }
-    if (chdir("/") < 0) {
-        std::perror("chdir");
+    if (auto r = detail::setup_pivot_root(path); !r) {
+        std::println(stderr, "{}", r.error());
         return 1;
     }
 
@@ -608,7 +676,11 @@ private:
         return 1;
     }
 
-    detail::exec_shell(cmd.value_or(""));
+    if (auto r = detail::exec_shell(cmd.value_or("")); !r) {
+        std::println(stderr, "{}", r.error());
+        return 1;
+    }
+    std::unreachable();
 }
 
 [[nodiscard]] int list(int argc, char** argv) {
