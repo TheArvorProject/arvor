@@ -220,7 +220,7 @@ using dl_handle = std::shared_ptr<void>;
     uid_t uid = ::getuid();
     gid_t gid = ::getgid();
 
-    int flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
+    int flags = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC;
     if (unshare(flags) < 0) {
         return std::unexpected(std::string("unshare: ") + std::strerror(errno));
     }
@@ -239,7 +239,7 @@ using dl_handle = std::shared_ptr<void>;
 }
 
 [[nodiscard]] std::expected<void, std::string> setup_root_namespaces() {
-    int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
+    int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC;
     if (unshare(flags) < 0) {
         return std::unexpected(std::string("unshare: ") + std::strerror(errno));
     }
@@ -956,6 +956,8 @@ private:
         return 1;
     }
 
+    std::string resolv_conf = detail::read_file("/etc/resolv.conf");
+
     if (auto r = detail::setup_pivot_root(path); !r) {
         std::println(stderr, "{}", r.error());
         std::_Exit(1);
@@ -969,6 +971,18 @@ private:
     if (auto r = detail::mount_devpts(); !r) {
         std::println(stderr, "{}", r.error());
         std::_Exit(1);
+    }
+
+    if (!resolv_conf.empty()) {
+        if (auto r = detail::write_file("/etc/resolv.conf", resolv_conf); !r) {
+            std::println(stderr, "{}", r.error());
+            std::_Exit(1);
+        }
+        std::error_code ec;
+        fs::permissions("/etc/resolv.conf",
+            fs::perms::owner_read | fs::perms::owner_write |
+            fs::perms::group_read | fs::perms::others_read,
+            fs::perm_options::replace, ec);
     }
 
     if (auto r = detail::apply_cpu_spoofing(); !r) {
