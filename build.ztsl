@@ -1,25 +1,25 @@
-zstl.start
+ztsl.start # start
 }
 func "nsm" 
-sys.exec
+sys.exec # compiles nsm
 ```shell
 gcc -o nsm ./usr/bin/nsm.c
 ```
 }
 func "napt"
-sys.exec
+sys.exec # compiles napt
 ```shell
 g++ -std=c++23 -Wall -Wextra -Werror -lapt-pkg -pthread ./usr/bin/napt.cpp -o napt
 ```
 }
 func "lxsm"
-sys.exec
+sys.exec # compiles lxsm
 ```shell
 g++ -std=c++23 -O2 ./usr/bin/lxsm.cpp -o lxsm -ldl
 ```
 }
 func "debootstrap"
-sys.exec
+sys.exec # debootstraps arvor
 ```shell
 sudo debootstrap \
   --arch=amd64 \
@@ -31,7 +31,7 @@ sudo debootstrap \
 ```
 }
 func "drivers"
-sys.exec
+sys.exec # install drivers
 ```
 set -e
 
@@ -60,14 +60,14 @@ sudo chroot "$TARGET_DIR" env DEBIAN_FRONTEND=noninteractive apt-get install -y 
   
 ```
 }
-func "install_codes"
+func "install_codes" # install the codes
 sys.exec
 ```
 sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/napt./usr/bin/,./usr/bin/lxsm,./usr/bin/arvor*,./usr/bin/nsmd_start} ./arvor/usr/bin
 ```
 }
 func "chroot"
-text.show
+text.show # prints the text
 ```
  █████  ██████  ██    ██  ██████  ██████      ██      ██ ███    ██ ██    ██ ██   ██
 ██   ██ ██   ██ ██    ██ ██    ██ ██   ██     ██      ██ ████   ██ ██    ██  ██ ██
@@ -78,4 +78,4 @@ text.show
 Welcome To The Arvor Linux Chroot!
 ```
 }
-zstl.end
+ztsl.end # end
