@@ -1,0 +1,81 @@
+zstl.start
+}
+func "nsm" 
+sys.exec
+```shell
+gcc -o nsm ./usr/bin/nsm.c
+```
+}
+func "napt"
+sys.exec
+```shell
+g++ -std=c++23 -Wall -Wextra -Werror -lapt-pkg -pthread ./usr/bin/napt.cpp -o napt
+```
+}
+func "lxsm"
+sys.exec
+```shell
+g++ -std=c++23 -O2 ./usr/bin/lxsm.cpp -o lxsm -ldl
+```
+}
+func "debootstrap"
+sys.exec
+```shell
+sudo debootstrap \
+  --arch=amd64 \
+  --components=main,contrib,non-free,non-free-firmware \
+  --include=xfsprogs,lvm2,python3-pyqt6,python3-pyqt6.qtsvg,mesa-utils,mesa-vulkan-drivers,libgl1-mesa-dri
+  trixie \
+  ./arvor \
+  http://deb.debian.org/debian/ 
+```
+}
+func "drivers"
+sys.exec
+```
+set -e
+
+TARGET_DIR="./arvor"
+
+cat << 'EOF' | sudo tee "$TARGET_DIR/etc/apt/sources.list"
+deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+
+deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb-src http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+
+deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+EOF
+
+
+sudo chroot "$TARGET_DIR" env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo chroot "$TARGET_DIR" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  firmware-amd-graphics \
+  firmware-intel-sound \
+  firmware-linux \
+  firmware-linux-nonfree \
+  firmware-mediatek \
+  firmware-realtek
+  
+```
+}
+func "install_codes"
+sys.exec
+```
+sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/napt./usr/bin/,./usr/bin/lxsm,./usr/bin/arvor*,./usr/bin/nsmd_start} ./arvor/usr/bin
+```
+}
+func "chroot"
+text.show
+```
+ █████  ██████  ██    ██  ██████  ██████      ██      ██ ███    ██ ██    ██ ██   ██
+██   ██ ██   ██ ██    ██ ██    ██ ██   ██     ██      ██ ████   ██ ██    ██  ██ ██
+███████ ██████  ██    ██ ██    ██ ██████      ██      ██ ██ ██  ██ ██    ██   ███
+██   ██ ██   ██  ██  ██  ██    ██ ██   ██     ██      ██ ██  ██ ██ ██    ██  ██ ██
+██   ██ ██   ██   ████    ██████  ██   ██     ███████ ██ ██   ████  ██████  ██   ██
+
+Welcome To The Arvor Linux Chroot!
+```
+}
+zstl.end
