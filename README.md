@@ -241,7 +241,7 @@ NSM provides a cleaner architecture and serves as the foundation for future rele
 
 # License
 
-**Software Cujo Código é Aberto (SCCA)**
+**The Arvor License**
 
 Copyright © NextFerret
 
