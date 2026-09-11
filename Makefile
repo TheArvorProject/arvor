@@ -60,11 +60,6 @@ install: all
 	install -m 644 etc/systemd/system/arvor-guard.service $(SYSTEMDDIR)/arvor-guard.service
 	install -m 644 etc/systemd/system/arvor-guard.timer $(SYSTEMDDIR)/arvor-guard.timer
 
-	# Initramfs & GRUB
-	install -m 755 etc/initramfs-tools/hooks/arvor_lvm_rollback $(INITRAMFS_HOOKS)/arvor_lvm_rollback
-	install -m 755 etc/initramfs-tools/scripts/local-top/arvor_lvm_snapshot $(INITRAMFS_SCRIPTS)/arvor_lvm_snapshot
-	install -m 755 etc/grub.d/10_arvor_snapshots $(GRUBDIR)/10_arvor_snapshots
-
 clean:
 	@echo "  CLEAN   Removing compiled binaries"
 	rm -f napt nsm nlc *.o
