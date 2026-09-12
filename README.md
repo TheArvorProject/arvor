@@ -71,11 +71,11 @@ The result is a system that remains familiar to Linux administrators while provi
 
 | Component | Description |
 |----------|-------------|
-| **arvorctl** | Central CLI for inspecting boot health, managing atomic A/B/C rotation slots, inspecting diffs, and triggering instant rollbacks. |
+| **arvorctl** | Central CLI for inspecting boot health, inspecting diffs, and triggering instant rollbacks. |
 | **arvor-guard** | Proactive Thin Pool storage guardian service that prevents out-of-space lockups by auto-cleaning stale snapshots. |
 | **napt** | High-performance C++ transactional package manager with multithreading, package redirection (`replaces=`), and pre-transaction snapshots. |
 | **nsm** | Snapshot Manager responsible for creating, managing and restoring system snapshots. |
-| **nlc** | Lightweight chroot environment manager used internally by Arvor. |
+| **lxsm** | Lightweight sandbox environment manager used to play around with it. |
 
 ---
 
