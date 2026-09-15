@@ -2919,21 +2919,6 @@ int main(int argc, char** argv) {
 
     if (command.empty()) { show_help(); return 0; }
 
-    if (command == "moo") {
-        if (!pkgs.empty() && pkgs[0] == "moo") {
-            cout << "There are no easter eggs in this program.\n";
-        } else {
-            cout << "         (__) \n"
-                 << "         (oo) \n"
-                 << "   /------\\/ \n"
-                 << "  / |    ||  \n"
-                 << " *  ||---||  \n"
-                 << "    ^^   ^^  \n"
-                 << "...Have you mooed today?\n";
-        }
-        return 0;
-    }
-
     if (command == "stats") {
         return show_stats();
     } else if (command == "history" || command == "log") {
@@ -2999,4 +2984,4 @@ int main(int argc, char** argv) {
     }
 
     return 0;
-} 
+}
