@@ -42,12 +42,12 @@ SIMULATE = "--simulate" in sys.argv
 
 FILES = [
     "/usr/bin/nsm",
-    "/usr/bin/napt",
+    "/usr/bin/weld",
     "/usr/bin/arvorctl",
     "/usr/bin/arvor-guard",
     "/usr/share/nextferret/credits",
     "/usr/bin/apt-nf-tree",
-    "/etc/napt/sources.list",
+    "/etc/weld/sources.list",
     "/usr/bin/lxsm",
     "/usr/bin/nsmd_start",
     "/etc/motd"
@@ -590,7 +590,7 @@ if [ -f /tmp/nextferret-base.deb ]; then
 fi
 
 dpkg-divert --add --package nextferret-core --rename --divert /usr/bin/old-apt /usr/bin/apt
-ln -sf /usr/bin/napt /usr/bin/apt
+ln -sf /usr/bin/weld /usr/bin/apt
 
 apt-get install -y --no-install-recommends debootstrap python3 linux-image-amd64 sudo network-manager firmware-linux grub-efi-amd64-signed shim-signed locales keyboard-configuration console-setup ca-certificates plymouth plymouth-themes lvm2 xfsprogs grub-common gawk inotify-tools git make efibootmgr curl xz-utils
 
@@ -685,7 +685,7 @@ grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck
 efibootmgr -c -d {self.conf["disk"]} -p 1 -L "Arvor Linux" -l "\\EFI\\arvor-linux\\grubx64.efi" || true
 update-grub
 
-napt sync
+weld sync
 apt-get clean
 rm /s.sh
 exit 0
