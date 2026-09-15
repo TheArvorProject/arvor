@@ -22,6 +22,7 @@
 #include <csignal>
 #include <mutex>
 #include <future>
+#include <curl/curl.h>
 #include <apt-pkg/init.h>
 #include <apt-pkg/configuration.h>
 #include <apt-pkg/pkgsystem.h>
@@ -95,14 +96,11 @@
 #define SECCOMP_TARGET_ARCH 0
 #endif
 
-#define ARVOR_VERSION_TO_STR_HELPER(x) #x
-#define ARVOR_VERSION_TO_STR(x) ARVOR_VERSION_TO_STR_HELPER(x)
 #ifdef arvor_version
-#define ARVOR_VERSION ARVOR_VERSION_TO_STR(arvor_version)
+#define ARVOR_VERSION arvor_version
 #else
 #define ARVOR_VERSION "arvor linux 0.0"
 #endif
-
 
 using namespace std;
 namespace fs = std::filesystem;
@@ -835,7 +833,7 @@ string sanitize_filename(const string& raw) {
     string base = (pos_slash == string::npos) ? raw : raw.substr(pos_slash + 1);
     size_t start = base.find_first_not_of(" \n\r\t");
     string cleaned = (start == string::npos) ? "" : base.substr(start, base.find_last_not_of(" \n\r\t") - start + 1);
-    
+
     string safe;
     safe.reserve(cleaned.size());
     for (char c : cleaned) {
@@ -848,14 +846,6 @@ string sanitize_filename(const string& raw) {
     }
     if (safe == "." || safe == "..") safe = "safe_file";
     return safe.empty() ? "safe_file" : safe;
-}
-
-string fetch_url(const string& url) {
-    if (url.empty()) return "";
-    size_t start = url.find_first_not_of(" \n\r\t");
-    string norm_url = (start == string::npos) ? "" : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
-    if (norm_url.front() == '-') return "";
-    return exec_argv_capture({"curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "10", "--max-time", "30", "--", norm_url});
 }
 
 string trim_copy(const string& s) {
@@ -1255,6 +1245,100 @@ bool parse_weld_repo_metadata(const string& text, WeldRepoMetadata& metadata) {
     return !metadata.release.empty();
 }
 
+size_t curl_string_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    size_t total = size * nmemb;
+    static_cast<string*>(userdata)->append(ptr, total);
+    return total;
+}
+
+string curl_fetch_string(const string& url, const string& user_agent = "", long timeout_sec = 30) {
+    if (url.empty()) return "";
+    size_t start = url.find_first_not_of(" \n\r\t");
+    string norm_url = (start == string::npos) ? "" : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
+    if (norm_url.empty() || norm_url.front() == '-') return "";
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    string response;
+    curl_easy_setopt(curl, CURLOPT_URL, norm_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_string_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    if (!user_agent.empty()) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
+    } else {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.1");
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || response_code != 200) return "";
+    return response;
+}
+
+size_t curl_file_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    FILE* fp = static_cast<FILE*>(userdata);
+    return fwrite(ptr, size, nmemb, fp);
+}
+
+bool curl_download_file(const string& url, const string& dest_path, const string& user_agent = "") {
+    if (url.empty() || dest_path.empty()) return false;
+
+    FILE* fp = fopen(dest_path.c_str(), "wb");
+    if (!fp) return false;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        fclose(fp);
+        unlink(dest_path.c_str());
+        return false;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_file_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    if (!user_agent.empty()) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
+    } else {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.1");
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+    fclose(fp);
+
+    if (res != CURLE_OK || response_code != 200) {
+        unlink(dest_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+string fetch_url(const string& url) {
+    return curl_fetch_string(url);
+}
+
+string fetch_url_with_ua(const string& url, const string& user_agent) {
+    return curl_fetch_string(url, user_agent);
+}
+
 bool sync_weld_metadata() {
 #ifndef allow_weld_repositories
     return true;
@@ -1271,7 +1355,7 @@ bool sync_weld_metadata() {
         futures.push_back(std::async(std::launch::async, [source]() -> bool {
             print_weld_repo_warning(source.base_url);
             string url = source.base_url + "/releases/" + source.release + "/repo-metadata";
-            string metadata = fetch_url(url);
+            string metadata = curl_fetch_string(url);
             if (metadata.empty()) {
                 safe_log("Failed to fetch metadata: ", url, "\n");
                 return false;
@@ -1726,7 +1810,7 @@ bool cache_weld_package(const WeldPackageCandidate& candidate, string& local_pat
     local_path = release_dir + "/" + safe_file;
     string url = build_weld_download_url(candidate);
     if (url.empty() || url.front() == '-') return false;
-    return exec_argv_devnull_out({"curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "-o", local_path, "--", url}) == 0;
+    return curl_download_file(url, local_path);
 #endif
 }
 
@@ -1754,6 +1838,7 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
 
     for (size_t t = 0; t < num_threads; ++t) {
         workers.emplace_back([&]() {
+            curl_global_init(CURL_GLOBAL_DEFAULT);
             while (true) {
                 size_t idx = current_index.fetch_add(1);
                 if (idx >= pending_weld_downloads.size()) break;
@@ -1804,6 +1889,7 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
                 }
                 pending.success = true;
             }
+            curl_global_cleanup();
         });
     }
 
@@ -1825,11 +1911,11 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
             decisions.push_back(decision);
             if (!quiet) {
                 if (pending.candidate.is_replacement) {
-                    safe_log("Selected ", pending.candidate.actual_pkg_name, 
+                    safe_log("Selected ", pending.candidate.actual_pkg_name,
                              (!pending.candidate.version.empty() ? " (" + pending.candidate.version + ")" : ""),
                              " from the Weld repository (replacing ", pending.pkg_name, ").\n");
                 } else {
-                    safe_log("Selected ", pending.pkg_name, 
+                    safe_log("Selected ", pending.pkg_name,
                              (!pending.candidate.version.empty() ? " (" + pending.candidate.version + ")" : ""),
                              " from the Weld repository.\n");
                 }
@@ -1886,7 +1972,7 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
             if (weld_candidate.is_replacement) {
                 use_weld = true;
                 if (!quiet) {
-                    cout << "Note: Package '" << pkg_name << "' is replaced by Weld package '" 
+                    cout << "Note: Package '" << pkg_name << "' is replaced by Weld package '"
                          << weld_candidate.actual_pkg_name << "' (replaces rule). Redirecting...\n";
                 }
             } else if (!apt_state.found || apt_state.candidate_version.empty()) {
@@ -1939,23 +2025,6 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
     }
 
     return !had_error;
-}
-
-string fetch_url_with_ua(const string& url, const string& user_agent) {
-    if (url.empty()) return "";
-    size_t start = url.find_first_not_of(" \n\r\t");
-    string norm_url = (start == string::npos) ? "" : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
-    if (norm_url.empty() || norm_url.front() == '-') return "";
-    vector<string> args = {
-        "curl", "-fsSL",
-        "-A", user_agent,
-        "--proto", "=https",
-        "--proto-redir", "=https",
-        "--connect-timeout", "10",
-        "--max-time", "30",
-        "--", norm_url
-    };
-    return exec_argv_capture(args);
 }
 
 string parse_arvor_ua_version(const string& page) {
@@ -2057,20 +2126,23 @@ void print_successful_install(const string& action, const vector<string>& target
 
 void do_nflinux_upgrade(bool apply_host, const string& arv_version) {
     string user_agent = "ArvorLinux/" + arv_version;
-    string ua_page = fetch_url_with_ua("https://nextferret.github.io/ua", user_agent);
+    string ua_page = curl_fetch_string("https://nextferret.github.io/ua", user_agent);
     string remote_version = parse_arvor_ua_version(ua_page);
 
     if (!remote_version.empty()) {
         int cmp = compare_arvor_versions(arv_version, remote_version);
         if (cmp > 0) {
-            cout << "You're Using Arvor Linux's Developer Builds\n";
+            cout << "You are running a development build of Arvor Linux, or the remote release server may be outdated.\n";
+            cout << "Local version: " << arv_version << " | Remote version: " << remote_version << "\n";
+            cout << "No upgradeable release was found for your channel.\n";
             return;
         }
         if (cmp == 0) {
-            cout << "Arvor is Already updated.\n";
+            cout << "Arvor Linux is already up to date (version " << arv_version << ").\n";
             return;
         }
-        cout << "Arvor Linux is Currently in version (" << remote_version << "), upgrade? [Y/n] ";
+        cout << "Arvor Linux local version: " << arv_version << "\n";
+        cout << "A newer release (" << remote_version << ") is available. Proceed with upgrade? [Y/n] ";
         cout.flush();
         if (!assume_yes) {
             string answer;
@@ -2085,9 +2157,9 @@ void do_nflinux_upgrade(bool apply_host, const string& arv_version) {
 #ifdef nflinux
     global_config_backup.backup();
 
-    string os_release = fetch_url_with_ua("https://nextferret.github.io/etc/os-release", user_agent);
-    string codenames = fetch_url_with_ua("https://nextferret.github.io/version_codename", user_agent);
-    string repo_number_str = trim_copy(fetch_url_with_ua("https://nextferret.github.io/repo-number", user_agent));
+    string os_release = curl_fetch_string("https://nextferret.github.io/etc/os-release", user_agent);
+    string codenames = curl_fetch_string("https://nextferret.github.io/version_codename", user_agent);
+    string repo_number_str = trim_copy(curl_fetch_string("https://nextferret.github.io/repo-number", user_agent));
     string weld_sources = "";
     string apt_sources = "";
 
@@ -2098,7 +2170,7 @@ void do_nflinux_upgrade(bool apply_host, const string& arv_version) {
             string debian_code = trim_copy(codenames.substr(comma + 1));
             string base_repo_url = "https://nextferretdur.github.io/repo-nflinux-" + repo_number_str;
             string meta_url = base_repo_url + "/releases/" + weld_code + "/repo-metadata";
-            if (!fetch_url(meta_url).empty()) {
+            if (!curl_fetch_string(meta_url).empty()) {
                 weld_sources = "deb " + base_repo_url + " " + weld_code + "\n";
                 apt_sources = "deb http://deb.debian.org/debian " + debian_code + " main contrib non-free non-free-firmware\n";
                 apt_sources += "deb http://deb.debian.org/debian-security " + debian_code + "-security main contrib non-free non-free-firmware\n";
@@ -2650,7 +2722,7 @@ int show_package_info(const string& pkg_name) {
         cout << "Weld Version:  " << weld_cand.version << "\n";
         cout << "SHA256:        " << (weld_cand.sha256.empty() ? "None" : weld_cand.sha256) << "\n";
         if (weld_cand.is_replacement) {
-            cout << "Replaces Rule: " << yellow << "Replaces package '" << weld_cand.original_query_name 
+            cout << "Replaces Rule: " << yellow << "Replaces package '" << weld_cand.original_query_name
                  << "' with '" << weld_cand.actual_pkg_name << "'" << reset << "\n";
         }
     }
@@ -2896,6 +2968,7 @@ void do_transaction_rollback() {
 
 int main(int argc, char** argv) {
     setup_safety_handlers();
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     pkgInitConfig(*_config);
     pkgInitSystem(*_config, _system);
     string command;
@@ -2982,5 +3055,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    curl_global_cleanup();
     return 0;
 }
