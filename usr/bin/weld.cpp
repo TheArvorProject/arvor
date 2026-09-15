@@ -1791,7 +1791,6 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
                 }
 
                 if (!quiet) {
-                    string checkmark = "\033[1;32m✔\033[0m";
                     string cyan = "\033[1;36m";
                     string gray = "\033[38;2;148;163;184m";
                     string reset = "\033[0m";
@@ -1799,7 +1798,7 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
                     if (!sz_str.empty()) details += sz_str;
                     if (!speed_str.empty()) details += (details.empty() ? "" : " | ") + speed_str;
 
-                    safe_log(" ", checkmark, " ", cyan, pending.pkg_name, reset,
+                    safe_log(" * ", cyan, pending.pkg_name, reset,
                              (!details.empty() ? " " + gray + "(" + details + ")" + reset : ""),
                              "\n");
                 }
@@ -2071,12 +2070,12 @@ void do_nflinux_upgrade(bool apply_host, const string& arv_version) {
             cout << "Arvor is Already updated.\n";
             return;
         }
-        cout << "Arvor Linux is Currently in version (" << remote_version << "), upgrade? ";
+        cout << "Arvor Linux is Currently in version (" << remote_version << "), upgrade? [Y/n] ";
         cout.flush();
         if (!assume_yes) {
             string answer;
             getline(cin, answer);
-            if (answer != "y" && answer != "Y" && answer != "yes" && answer != "YES") {
+            if (answer != "y" && answer != "Y") {
                 cout << "Upgrade cancelled.\n";
                 return;
             }
@@ -2310,12 +2309,12 @@ void perform_transaction_argv(const string& action, const vector<string>& target
             cout << render_weld_progress(100, "Verifying Transaction") << "\n\n";
 
             if (!assume_yes) {
-                cout << "\033[1;32m✔\033[0m Sandbox verification passed without errors.\n";
+                cout << "Sandbox verification passed without errors.\n";
                 cout << "The transaction is now ready to be applied to the host system.\n";
-                cout << "Do you wish to continue? Type 'yes' to confirm, or press Enter to abort: ";
+                cout << "Do you wish to continue? [Y/n] ";
                 string confirm;
                 getline(cin, confirm);
-                if (confirm != "yes" && confirm != "YES") {
+                if (confirm != "y" && confirm != "Y") {
                     global_config_backup.restore_orig();
                     cout << "Transaction aborted by user.\n";
                     return;
@@ -2738,7 +2737,7 @@ int show_package_why(const string& pkg_name) {
         if (parent->CurrentVer != 0) {
             string pname = parent.Name();
             if (seen_parents.insert(pname).second) {
-                cout << "  " << green << "✔ " << pname << reset << " (" << parent.CurrentVer().VerStr() << ")"
+                cout << "  " << green << "- " << pname << reset << " (" << parent.CurrentVer().VerStr() << ")"
                      << gray << " [requires " << dep.DepType() << ": " << pkg_name << "]" << reset << "\n";
                 rev_count++;
             }
@@ -2872,7 +2871,7 @@ int show_stats() {
 }
 
 void do_transaction_rollback() {
-    cout << "\033[1;33m==>\033[0m Querying available recovery snapshots for rollback...\n";
+    cout << "Querying available recovery snapshots for rollback...\n";
     string latest_snap = get_latest_snapshot("apt-pre");
     if (latest_snap.empty()) {
         latest_snap = get_latest_snapshot("root-auto");
@@ -2885,10 +2884,10 @@ void do_transaction_rollback() {
     }
 
     cout << "Found latest pre-transaction snapshot: \033[1;32m" << latest_snap << "\033[0m\n";
-    cout << "Are you sure you want to rollback to this snapshot? Type 'yes' to proceed: ";
+    cout << "Are you sure you want to rollback to this snapshot? [Y/n] ";
     string confirm;
     getline(cin, confirm);
-    if (confirm == "yes" || confirm == "YES") {
+    if (confirm == "y" || confirm == "Y") {
         do_rollback("apt-pre");
     } else {
         cout << "Rollback cancelled.\n";
