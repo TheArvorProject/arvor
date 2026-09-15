@@ -7,10 +7,17 @@ sys.exec # compiles nsm
 gcc -o nsm ./usr/bin/nsm.c
 ```
 }
-func "napt"
-sys.exec # compiles napt
+func "weld"
+sys.exec # compiles weld
 ```shell
-g++ -std=c++23 -Wall -Wextra -Werror -lapt-pkg -pthread ./usr/bin/napt.cpp -o napt
+
+ g++ -std=c++23 -O2 \
+    -Dallow_weld_repositories \
+    -Dnflinux \
+    -Darvor_version=\"8.1\" \
+    usr/bin/weld.cpp -o weld \
+    -lapt-pkg -lcurl
+
 ```
 }
 func "lxsm"
