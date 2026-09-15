@@ -772,17 +772,6 @@ int main(int argc, char *argv[])
 
     const char *cmd = argv[1];
 
-    if (strcmp(cmd, "moo") == 0) {
-        printf("\n         (__) \n"
-               "         (oo)   snapshot edition\n"
-               "   /------\\/ \n"
-               "  / |    ||  \n"
-               " *  ||---||  \n"
-               "    ^^   ^^  \n"
-               "...This NSM Has Super Snapshot Powers.\n\n");
-        return 0;
-    }
-
     if (geteuid() != 0) {
         fprintf(stderr, "Error: root privileges required.\n");
         return 1;
