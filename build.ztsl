@@ -1,4 +1,6 @@
 # to compile it use ztc: https://github.com/ZeonTheFerret/ztc
+# this code also can be compiled as an ELF and an .c,but it is not tha case here.
+# Zeon (@zeontheferret — both github and discord.)
 ztsl.start # start
 }
 func "nsm" 
