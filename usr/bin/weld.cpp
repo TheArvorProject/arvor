@@ -376,17 +376,25 @@ void show_help() {
 
     cout << hdr << "Query Commands:" << reset << "\n";
     cout << "  " << qx << "search" << reset << "        <term>      Search the package index (supports -p <page>)\n";
-    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin, version, SHA256, and replace rules\n";
+#ifdef allow_weld_repositories
+    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin, version, and SHA256\n";
+#else
+    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin and version\n";
+#endif
     cout << "  " << qx << "why" << reset << "           <pkg>       Show why a package is installed (reverse dependencies)\n";
     cout << "  " << qx << "depends" << reset << "       <pkg>       List a package's direct dependencies\n";
-    cout << "  " << qx << "list" << reset << "                      List all installed packages\n";
-    cout << "  " << qx << "stats" << reset << "                     Show repository, package, and cache statistics\n";
-    cout << "  " << qx << "history" << reset << "                   Show recent transaction history\n\n";
+    cout << "  " << qx << "list" << reset << "                      List all installed packages\n\n";
 
     cout << hdr << "Maintenance Commands:" << reset << "\n";
-    cout << "  " << "sync" << "                      Refresh repository metadata\n";
-    cout << "  " << "clean" << "                     Clear the APT and Weld package caches\n";
-    cout << "  " << "autoclean" << "                 Remove obsolete packages from the APT and Weld caches\n\n";
+#ifdef allow_weld_repositories
+    cout << "  sync                      Refresh repository metadata (APT + Weld)\n";
+    cout << "  clean                     Clear the APT and Weld package caches\n";
+    cout << "  autoclean                 Remove obsolete packages from the APT and Weld caches\n\n";
+#else
+    cout << "  sync                      Refresh APT repository metadata\n";
+    cout << "  clean                     Clear the APT package cache\n";
+    cout << "  autoclean                 Remove obsolete packages from the APT cache\n\n";
+#endif
 
     cout << hdr << "Options:" << reset << "\n";
     cout << "  " << dim << "--apply-host" << reset << "              Skip sandbox verification and apply directly to the host\n";
@@ -1495,68 +1503,6 @@ string format_bytes(uint64_t bytes) {
     return string(buf);
 }
 
-class TerminalProgressBar {
-public:
-    static string render(int percentage, const string& action_label, const string& extra_stats = "", int bar_width = 22) {
-        if (percentage < 0) percentage = 0;
-        if (percentage > 100) percentage = 100;
-
-        int filled = (percentage * bar_width) / 100;
-        int empty = bar_width - filled;
-
-        string bar;
-        for (int i = 0; i < filled; ++i) bar += "\u2588";
-        for (int i = 0; i < empty; ++i)  bar += "\u2591";
-
-        string cyan_bold = "\033[1;36m";
-        string green = "\033[38;2;52;211;153m";
-        string gray = "\033[38;2;148;163;184m";
-        string reset = "\033[0m";
-
-        ostringstream oss;
-        char pct_buf[16];
-        snprintf(pct_buf, sizeof(pct_buf), "%3d%%", percentage);
-        oss << "\r " << cyan_bold << pct_buf << reset << " ["
-            << green << bar << reset << "] "
-            << action_label;
-        if (!extra_stats.empty()) {
-            oss << " " << gray << "(" << extra_stats << ")" << reset;
-        }
-        oss << "   ";
-        return oss.str();
-    }
-};
-
-class ETAEstimator {
-    chrono::steady_clock::time_point start_time;
-public:
-    ETAEstimator() : start_time(chrono::steady_clock::now()) {}
-
-    void reset() {
-        start_time = chrono::steady_clock::now();
-    }
-
-    string get_stats(int current_percent) {
-        if (current_percent <= 0) return "Calculating...";
-        auto now = chrono::steady_clock::now();
-        double elapsed_sec = chrono::duration_cast<chrono::duration<double>>(now - start_time).count();
-        if (elapsed_sec < 0.25) return "Estimating...";
-
-        double pct_per_sec = static_cast<double>(current_percent) / elapsed_sec;
-        if (pct_per_sec <= 0.001) return "Calculating...";
-
-        double remaining_pct = 100.0 - current_percent;
-        double remaining_sec = remaining_pct / pct_per_sec;
-
-        int mins = static_cast<int>(remaining_sec) / 60;
-        int secs = static_cast<int>(remaining_sec) % 60;
-
-        char buf[64];
-        snprintf(buf, sizeof(buf), "ETA: %02d:%02d", mins, secs);
-        return string(buf);
-    }
-};
-
 vector<WeldRepoMetadata> load_cached_weld_metadata();
 
 class WeldArchiveCleaner final : public pkgArchiveCleaner {
@@ -1909,17 +1855,6 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
             decision.selected_version = pending.candidate.version;
             decision.from_weld        = true;
             decisions.push_back(decision);
-            if (!quiet) {
-                if (pending.candidate.is_replacement) {
-                    safe_log("Selected ", pending.candidate.actual_pkg_name,
-                             (!pending.candidate.version.empty() ? " (" + pending.candidate.version + ")" : ""),
-                             " from the Weld repository (replacing ", pending.pkg_name, ").\n");
-                } else {
-                    safe_log("Selected ", pending.pkg_name,
-                             (!pending.candidate.version.empty() ? " (" + pending.candidate.version + ")" : ""),
-                             " from the Weld repository.\n");
-                }
-            }
         }
     }
     return ok;
@@ -1948,7 +1883,6 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
             if (!ec) abs_path = fs::weakly_canonical(abs_path, ec);
             string resolved_path = ec ? pkg_name : abs_path.string();
 
-            if (!quiet) cout << "Selecting local package archive: " << resolved_path << ".\n";
             InstallDecision decision;
             decision.package_name     = resolved_path;
             decision.apt_argument     = resolved_path;
@@ -1971,10 +1905,6 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
         if (weld_candidate.found) {
             if (weld_candidate.is_replacement) {
                 use_weld = true;
-                if (!quiet) {
-                    cout << "Note: Package '" << pkg_name << "' is replaced by Weld package '"
-                         << weld_candidate.actual_pkg_name << "' (replaces rule). Redirecting...\n";
-                }
             } else if (!apt_state.found || apt_state.candidate_version.empty()) {
                 use_weld = true;
             } else if (compare_versions(weld_candidate.version, apt_state.candidate_version) > 0) {
@@ -2013,11 +1943,6 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
         decision.selected_version = apt_state.candidate_version;
         decision.from_weld        = false;
         decisions.push_back(decision);
-        if (!quiet) {
-            cout << "Selected " << pkg_name;
-            if (!apt_state.candidate_version.empty()) cout << " (" << apt_state.candidate_version << ")";
-            cout << " from the Debian archive.\n";
-        }
     }
 
     if (!download_weld_packages(pending_weld_downloads, decisions, quiet)) {
@@ -2085,9 +2010,15 @@ string render_weld_progress(int percentage, const string& label) {
     return oss.str();
 }
 
+string strip_maintainer_email(const string& maintainer) {
+    if (maintainer.empty()) return "";
+    size_t pos = maintainer.find(" <");
+    if (pos != string::npos) return maintainer.substr(0, pos);
+    return maintainer;
+}
+
 void print_successful_install(const string& action, const vector<string>& targets) {
     string green = "\033[38;5;114m";
-    string gray = "\033[38;5;245m";
     string reset = "\033[0m";
     if (action != "install" && action != "upgrade" && action != "dist-upgrade") {
         cout << green << "Transaction completed successfully." << reset << "\n";
@@ -2113,10 +2044,11 @@ void print_successful_install(const string& action, const vector<string>& target
             pkgRecords::Parser& parser = records.Lookup(vf);
             maintainer = parser.Maintainer();
         }
-        cout << green << "Successfully Installed" << reset << " "
-             << gray << "(" << t << ", " << version
-             << (maintainer.empty() ? "" : (", " + maintainer)) << ")"
-             << reset << ".\n";
+        string maint_name = strip_maintainer_email(maintainer);
+        cout << green << "Successfully Installed " << t;
+        if (!version.empty()) cout << ", Version " << version;
+        if (!maint_name.empty()) cout << " by " << maint_name;
+        cout << reset << "\n";
         printed_any = true;
     }
     if (!printed_any) {
@@ -2417,7 +2349,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     cout.flush();
     cerr.flush();
 
-    cout << render_weld_progress(0, "Applying Transaction To The Computer") << flush;
+    cout << render_weld_progress(0, "Applying Transaction") << flush;
 
     int host_pipe[2];
     bool have_host_pipe = (pipe(host_pipe) == 0);
@@ -2426,6 +2358,13 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     if (host_pid == 0) {
         int devnull_r = open("/dev/null", O_RDONLY);
         if (devnull_r >= 0) { dup2(devnull_r, STDIN_FILENO); close(devnull_r); }
+
+        int devnull_w = open("/dev/null", O_WRONLY);
+        if (devnull_w >= 0) {
+            dup2(devnull_w, STDOUT_FILENO);
+            dup2(devnull_w, STDERR_FILENO);
+            close(devnull_w);
+        }
 
         int status_fd = -1;
         if (have_host_pipe) {
@@ -2437,7 +2376,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
 
         for (int fd = 4; fd < 1024; ++fd) close(fd);
         setenv("DEBIAN_FRONTEND", "noninteractive", 1);
-        bool ok = run_libapt_transaction(action, targets, status_fd, false);
+        bool ok = run_libapt_transaction(action, targets, status_fd, true);
         cout.flush();
         cerr.flush();
         _exit(ok ? 0 : 1);
@@ -2473,7 +2412,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                     if (pct > host_percent.load()) host_percent.store(pct);
                     int current = host_percent.load();
                     if (current != last_shown) {
-                        cout << render_weld_progress(current, "Applying Transaction To The Computer") << flush;
+                        cout << render_weld_progress(current, "Applying Transaction") << flush;
                         last_shown = current;
                     }
                 } catch (...) {}
@@ -2487,7 +2426,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     }
 
     if (host_ok) {
-        cout << render_weld_progress(100, "Applying Transaction To The Computer") << "\n\n";
+        cout << render_weld_progress(100, "Applying Transaction") << "\n\n";
         create_snapshot("apt-post");
         print_successful_install(action, targets);
     } else {
@@ -2709,26 +2648,23 @@ int show_package_info(const string& pkg_name) {
 
     string cyan_bold = "\033[1;36m";
     string green = "\033[1;32m";
-    string yellow = "\033[1;33m";
     string reset = "\033[0m";
 
     cout << cyan_bold << "Package Information: " << pkg_name << reset << "\n";
     cout << "----------------------------------------\n";
-    cout << "Installed:     " << (apt_state.installed ? (green + "yes (" + apt_state.installed_version + ")" + reset) : "no") << "\n";
 
-    if (weld_cand.found) {
-        cout << "Weld Source:   " << weld_cand.base_url << " (" << weld_cand.release << ")\n";
-        cout << "Weld File:     " << weld_cand.file_name << "\n";
-        cout << "Weld Version:  " << weld_cand.version << "\n";
-        cout << "SHA256:        " << (weld_cand.sha256.empty() ? "None" : weld_cand.sha256) << "\n";
-        if (weld_cand.is_replacement) {
-            cout << "Replaces Rule: " << yellow << "Replaces package '" << weld_cand.original_query_name
-                 << "' with '" << weld_cand.actual_pkg_name << "'" << reset << "\n";
-        }
+    if (apt_state.installed) {
+        cout << "Installed:    " << green << "yes (" << apt_state.installed_version << ")" << reset << "\n";
+    } else {
+        cout << "Installed:    no\n";
     }
 
-    if (apt_state.found && !apt_state.candidate_version.empty()) {
-        cout << "Debian Ver:    " << apt_state.candidate_version << "\n";
+    if (weld_cand.found) {
+        cout << "Source:       " << weld_cand.base_url << " (" << weld_cand.release << ")\n";
+        cout << "Version:      " << weld_cand.version << "\n";
+        cout << "SHA256:       " << (weld_cand.sha256.empty() ? "None" : weld_cand.sha256) << "\n";
+    } else if (apt_state.found && !apt_state.candidate_version.empty()) {
+        cout << "Version:      " << apt_state.candidate_version << "\n";
     }
 
     return 0;
@@ -2818,8 +2754,10 @@ int show_package_why(const string& pkg_name) {
 
     if (rev_count == 0) {
         cout << "  " << gray << "No installed packages depend on '" << pkg_name << "'. It was likely installed manually or as a top-level requirement." << reset << "\n";
+    } else if (rev_count == 1) {
+        cout << "\nRequired by 1 currently installed package.\n";
     } else {
-        cout << "\nRequired by " << rev_count << " currently installed package(s).\n";
+        cout << "\nRequired by " << rev_count << " currently installed packages.\n";
     }
     return 0;
 }
@@ -2861,84 +2799,6 @@ int show_package_depends(const string& pkg_name) {
         if (dep.TargetVer() != nullptr) cout << " (" << dep.CompType() << " " << dep.TargetVer() << ")";
         cout << "\n";
     }
-    return 0;
-}
-
-int show_history() {
-    cout << "\033[1;36m=== Weld Transaction History ===\033[0m\n\n";
-    string log_path = "/var/log/dpkg.log";
-    if (!fs::exists(log_path)) {
-        cout << "No package history log found at " << log_path << ".\n";
-        return 0;
-    }
-
-    ifstream in(log_path);
-    if (!in.is_open()) {
-        cout << "Unable to open history log.\n";
-        return 1;
-    }
-
-    string line;
-    vector<string> relevant_lines;
-    while (getline(in, line)) {
-        if (line.find(" install ") != string::npos ||
-            line.find(" upgrade ") != string::npos ||
-            line.find(" remove ") != string::npos ||
-            line.find(" purge ") != string::npos) {
-            relevant_lines.push_back(line);
-        }
-    }
-
-    size_t start = (relevant_lines.size() > 25) ? (relevant_lines.size() - 25) : 0;
-    for (size_t i = start; i < relevant_lines.size(); ++i) {
-        const string& l = relevant_lines[i];
-        if (l.find(" install ") != string::npos) {
-            cout << "\033[1;32m[INSTALL]\033[0m " << l << "\n";
-        } else if (l.find(" upgrade ") != string::npos) {
-            cout << "\033[1;33m[UPGRADE]\033[0m " << l << "\n";
-        } else if (l.find(" remove ") != string::npos || l.find(" purge ") != string::npos) {
-            cout << "\033[1;31m[REMOVE]\033[0m  " << l << "\n";
-        }
-    }
-    return 0;
-}
-
-int show_stats() {
-    pkgCacheFile cache_file;
-    pkgCache* cache = cache_file.GetPkgCache();
-    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
-    vector<WeldSource> sources = load_weld_sources();
-
-    int total_pkgs = 0;
-    int installed_pkgs = 0;
-
-    if (cache != nullptr) {
-        for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
-            total_pkgs++;
-            if (pkg->CurrentVer != 0) installed_pkgs++;
-        }
-    }
-
-    uint64_t cache_bytes = 0;
-    error_code ec;
-    string cache_dir = WELD_CACHE_DIR;
-    if (fs::exists(cache_dir, ec)) {
-        for (const auto& entry : fs::recursive_directory_iterator(cache_dir, ec)) {
-            if (entry.is_regular_file()) cache_bytes += entry.file_size(ec);
-        }
-    }
-
-    string cyan_bold = "\033[1;36m";
-    string green = "\033[1;32m";
-    string reset = "\033[0m";
-
-    cout << cyan_bold << "=== Arvor Weld System & Cache Statistics ===" << reset << "\n\n";
-    cout << "  Weld Repositories Configured: " << green << sources.size() << reset << "\n";
-    cout << "  Weld Metadata Sources Loaded: " << green << repos.size() << reset << "\n";
-    cout << "  Total Package Symbols:        " << total_pkgs << "\n";
-    cout << "  Installed Packages:           " << green << installed_pkgs << reset << "\n";
-    cout << "  Weld Cache Disk Footprint:    " << format_bytes(cache_bytes) << " (" << cache_dir << ")\n";
-    cout << "  LVM Snapshot Sandbox Engine:  " << green << "Active (Thin / Thick LVM Supported)" << reset << "\n\n";
     return 0;
 }
 
@@ -2991,11 +2851,7 @@ int main(int argc, char** argv) {
 
     if (command.empty()) { show_help(); return 0; }
 
-    if (command == "stats") {
-        return show_stats();
-    } else if (command == "history" || command == "log") {
-        return show_history();
-    } else if (command == "why") {
+    if (command == "why") {
         if (pkgs.empty()) { cout << "Usage: weld why <package_name>\n"; return 1; }
         return show_package_why(pkgs[0]);
     } else if (command == "depends" || command == "deps") {
