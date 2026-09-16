@@ -22,6 +22,7 @@
 #include <csignal>
 #include <mutex>
 #include <future>
+#include <curl/curl.h>
 #include <apt-pkg/init.h>
 #include <apt-pkg/configuration.h>
 #include <apt-pkg/pkgsystem.h>
@@ -42,6 +43,7 @@
 #include <apt-pkg/fileutl.h>
 #include <apt-pkg/tagfile.h>
 #include <apt-pkg/update.h>
+#include <apt-pkg/clean.h>
 #include <memory>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -94,22 +96,33 @@
 #define SECCOMP_TARGET_ARCH 0
 #endif
 
+#ifdef arvor_version
+#define ARVOR_VERSION arvor_version
+#else
+#define ARVOR_VERSION "arvor linux 0.0"
+#endif
 
 using namespace std;
 namespace fs = std::filesystem;
 
-const string TREE_ROOT = "/nsm/napt/root";
+const string TREE_ROOT = "/nsm/weld/root";
 const string NF_TREE_BIN = "/usr/bin/nsm";
 const string AUTO_SNAP_DIR = "/nsm/snapshots/auto";
-const string NAPT_ETC_DIR = "/etc/napt";
-const string NAPT_SOURCES_FILE = "/etc/napt/sources.list";
-const string NAPT_SOURCES_DIR  = "/etc/napt/sources.list.d";
-const string NAPT_CACHE_DIR = "/etc/napt/cache";
-const string NAPT_ALLOWED_FILE = "/etc/napt/allowed";
+
+const string WELD_ETC_DIR       = "/etc/weld";
+const string WELD_SOURCES_FILE  = "/etc/weld/sources.list";
+const string WELD_SOURCES_DIR   = "/etc/weld/sources.list.d";
+const string WELD_CACHE_DIR     = "/etc/weld/cache";
+const string WELD_ALLOWED_FILE  = "/etc/weld/allowed";
 
 static bool assume_yes = false;
-static bool g_enable_seccomp = true;
 static std::atomic<bool> sandbox_created_and_mounted(false);
+
+static string get_root_device();
+static string get_root_fstype();
+static string get_vg_name(const string& lv_path);
+static bool is_lv_thin(const string& lv_path);
+static double get_vg_free_gb(const string& vg_name);
 
 class ChrootSeccompManager {
 public:
@@ -226,11 +239,11 @@ bool write_text_file(const string& path, const string& content);
 struct ConfigBackup {
     string os_release_orig;
     string apt_sources_orig;
-    string napt_sources_orig;
+    string weld_sources_orig;
 
     string os_release_new;
     string apt_sources_new;
-    string napt_sources_new;
+    string weld_sources_new;
 
     bool backed_up = false;
     bool has_new = false;
@@ -238,17 +251,17 @@ struct ConfigBackup {
     void backup() {
         os_release_orig.clear();
         apt_sources_orig.clear();
-        napt_sources_orig.clear();
+        weld_sources_orig.clear();
         read_text_file("/etc/os-release", os_release_orig);
         read_text_file("/etc/apt/sources.list", apt_sources_orig);
-        read_text_file("/etc/napt/sources.list", napt_sources_orig);
+        read_text_file("/etc/weld/sources.list", weld_sources_orig);
         backed_up = true;
     }
 
-    void set_new(const string& os, const string& apt, const string& napt) {
+    void set_new(const string& os, const string& apt, const string& weld) {
         os_release_new = os;
         apt_sources_new = apt;
-        napt_sources_new = napt;
+        weld_sources_new = weld;
         has_new = true;
     }
 
@@ -258,26 +271,26 @@ struct ConfigBackup {
         else unlink("/etc/os-release");
         if (!apt_sources_orig.empty()) write_text_file("/etc/apt/sources.list", apt_sources_orig);
         else unlink("/etc/apt/sources.list");
-        if (!napt_sources_orig.empty()) write_text_file("/etc/napt/sources.list", napt_sources_orig);
-        else unlink("/etc/napt/sources.list");
+        if (!weld_sources_orig.empty()) write_text_file("/etc/weld/sources.list", weld_sources_orig);
+        else unlink("/etc/weld/sources.list");
     }
 
     void apply_new() {
         if (!has_new) return;
         if (!os_release_new.empty()) write_text_file("/etc/os-release", os_release_new);
         if (!apt_sources_new.empty()) write_text_file("/etc/apt/sources.list", apt_sources_new);
-        if (!napt_sources_new.empty()) write_text_file("/etc/napt/sources.list", napt_sources_new);
+        if (!weld_sources_new.empty()) write_text_file("/etc/weld/sources.list", weld_sources_new);
     }
 };
 
 static ConfigBackup global_config_backup;
 
-struct NaptSource {
+struct WeldSource {
     string base_url;
     string release;
 };
 
-struct NaptRepoMetadata {
+struct WeldRepoMetadata {
     string base_url;
     string release;
     map<string, pair<string, string>> packages;
@@ -285,7 +298,7 @@ struct NaptRepoMetadata {
     map<string, string> replaces;
 };
 
-struct NaptPackageCandidate {
+struct WeldPackageCandidate {
     bool found = false;
     string base_url;
     string release;
@@ -308,7 +321,7 @@ struct InstallDecision {
     string package_name;
     string apt_argument;
     string selected_version;
-    bool from_napt = false;
+    bool from_weld = false;
 };
 
 void perform_install_transaction(const vector<string>& pkgs, bool apply_host, bool is_upgrade = false);
@@ -318,42 +331,77 @@ bool nf_tree_available() {
     return access(NF_TREE_BIN.c_str(), X_OK) == 0;
 }
 
+static string weld_arch() {
+#if defined(__x86_64__)
+    return "amd64";
+#elif defined(__aarch64__)
+    return "arm64";
+#elif defined(__i386__)
+    return "i386";
+#elif defined(__arm__)
+    return "armhf";
+#elif defined(__riscv) && __riscv_xlen == 64
+    return "riscv64";
+#elif defined(__powerpc64__)
+    return "ppc64el";
+#elif defined(__s390x__)
+    return "s390x";
+#else
+    return "unknown";
+#endif
+}
+
+static string weld_version_str() {
+    return string("Weld 4.1 (") + weld_arch() + ")";
+}
+
 void show_help() {
-    string cyan = "\033[1;36m";
-    string green = "\033[1;32m";
-    string yellow = "\033[1;33m";
-    string bold = "\033[1m";
+    string title = "\033[1;36m";
+    string hdr = "\033[1;97m";
+    string tx = "\033[38;5;114m";
+    string qx = "\033[38;5;179m";
+    string dim = "\033[2m";
     string reset = "\033[0m";
 
-    cout << cyan << bold << "New Advanced Packaging Tool (NAPT) - Version 4.1" << reset << "\n";
-    cout << "Atomic, Transactional & Hardened Package Management for Arvor Linux\n\n";
-    cout << bold << "Usage:" << reset << " napt [command] [packages/options]\n\n";
-    cout << bold << "Core Transaction Commands:" << reset << "\n";
-    cout << "  " << green << "install" << reset << " <pkgs...>       Install packages or local .deb archives (sandbox-verified)\n";
-    cout << "  " << green << "remove" << reset << " <pkgs...>        Safely remove packages from the system\n";
-    cout << "  " << green << "purge" << reset << " <pkgs...>         Remove packages along with all configuration files\n";
-    cout << "  " << green << "upgrade" << reset << " [pkgs...]      Upgrade all or specified packages transactionally\n";
-    cout << "  " << green << "dist-upgrade" << reset << "          Perform a complete system release distribution upgrade\n";
-    cout << "  " << green << "rollback" << reset << "              Revert the last transaction using pre-transaction snapshot\n\n";
-    cout << bold << "Query & Inspection Commands:" << reset << "\n";
-    cout << "  " << yellow << "search" << reset << " <term> [-p N]   Search package index by keyword with pagination\n";
-    cout << "  " << yellow << "info" << reset << " <pkg>             Display detailed package origin, version, SHA256 & replaces\n";
-    cout << "  " << yellow << "why" << reset << " <pkg>              Explain why a package is installed (reverse dependency tree)\n";
-    cout << "  " << yellow << "depends" << reset << " <pkg>          List forward dependencies (Depends, Recommends, Suggests)\n";
-    cout << "  " << yellow << "list" << reset << "                 List all currently installed packages on the system\n";
-    cout << "  " << yellow << "stats" << reset << "                Display repository, package count and cache disk usage\n";
-    cout << "  " << yellow << "history" << reset << "              Display recent package transaction history log\n\n";
-    cout << bold << "Maintenance Commands:" << reset << "\n";
-    cout << "  sync                 Refresh repository metadata concurrently with SHA256 validation\n";
-    cout << "  clean                Clear the entire NAPT package download cache\n";
-    cout << "  autoclean            Clear obsolete and stale packages from cache\n\n";
-    cout << bold << "Transaction Flags:" << reset << "\n";
-    cout << "  --apply-host         Skip sandbox test and apply transaction directly to host\n";
-    cout << "  --no-seccomp         Disable BPF SECCOMP syscall filtering inside sandbox\n";
-    cout << "  -y, --yes            Assume yes to all confirmation prompts\n";
-    cout << "  --vb                 Enable verbose debug logging for transactions\n";
-    cout << "  -h, --help           Show this comprehensive help screen\n\n";
-    cout << "                 This napt Has Super Cow Powers.\n";
+    cout << title << weld_version_str() << reset << "\n";
+    cout << "Usage: weld <command> [packages] [options]\n\n";
+
+    cout << hdr << "Transaction Commands:" << reset << "\n";
+    cout << "  " << tx << "install" << reset << "       <pkgs...>   Install packages or local .deb archives\n";
+    cout << "  " << tx << "remove" << reset << "        <pkgs...>   Remove packages from the system\n";
+    cout << "  " << tx << "purge" << reset << "         <pkgs...>   Remove packages along with their configuration files\n";
+    cout << "  " << tx << "upgrade" << reset << "       [pkgs...]   Upgrade all packages, or only those specified\n";
+    cout << "  " << tx << "dist-upgrade" << reset << "               Perform a full system release upgrade\n";
+    cout << "  " << tx << "rollback" << reset << "                   Revert the last transaction using its pre-transaction snapshot\n\n";
+
+    cout << hdr << "Query Commands:" << reset << "\n";
+    cout << "  " << qx << "search" << reset << "        <term>      Search the package index (supports -p <page>)\n";
+#ifdef allow_weld_repositories
+    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin, version, and SHA256\n";
+#else
+    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin and version\n";
+#endif
+    cout << "  " << qx << "why" << reset << "           <pkg>       Show why a package is installed (reverse dependencies)\n";
+    cout << "  " << qx << "depends" << reset << "       <pkg>       List a package's direct dependencies\n";
+    cout << "  " << qx << "list" << reset << "                      List all installed packages\n\n";
+
+    cout << hdr << "Maintenance Commands:" << reset << "\n";
+#ifdef allow_weld_repositories
+    cout << "  sync                      Refresh repository metadata (APT + Weld)\n";
+    cout << "  clean                     Clear the APT and Weld package caches\n";
+    cout << "  autoclean                 Remove obsolete packages from the APT and Weld caches\n\n";
+#else
+    cout << "  sync                      Refresh APT repository metadata\n";
+    cout << "  clean                     Clear the APT package cache\n";
+    cout << "  autoclean                 Remove obsolete packages from the APT cache\n\n";
+#endif
+
+    cout << hdr << "Options:" << reset << "\n";
+    cout << "  " << dim << "--apply-host" << reset << "              Skip sandbox verification and apply directly to the host\n";
+    cout << "  " << dim << "-y, --yes" << reset << "                 Assume yes to all confirmation prompts\n";
+    cout << "  " << dim << "--vb" << reset << "                      Enable verbose transaction logging\n";
+    cout << "  " << dim << "-h, --help" << reset << "                Show this help message\n";
+    cout << "  " << dim << "-v, --version" << reset << "             Show the Weld version\n";
 }
 
 static bool wait_for_child(pid_t pid, int& status) {
@@ -623,14 +671,14 @@ bool manage_sandbox(const string& action) {
     string vg_name = get_vg_name(root_dev);
     g_cached_root_dev = root_dev;
     g_cached_vg_name = vg_name;
-    string snap_lv_name = "napt_sandbox_snap";
+    string snap_lv_name = "weld_sandbox_snap";
     string snap_dev = "/dev/" + vg_name + "/" + snap_lv_name;
 
     if (action == "create") {
         umount_fs();
         exec_argv_devnull_out({"umount", "-l", TREE_ROOT});
         exec_argv_devnull_out({"lvremove", "-f", snap_dev});
-        exec_argv_devnull_out({"mkdir", "-p", "/nsm/napt"});
+        exec_argv_devnull_out({"mkdir", "-p", "/nsm/weld"});
 
         if (root_dev.empty() || vg_name.empty()) {
             cout << "E: Unable to determine the root LVM device or volume group.\n";
@@ -726,7 +774,7 @@ void cleanup_sandbox_on_exit() {
 
         string vg_name = !g_cached_vg_name.empty() ? g_cached_vg_name : get_vg_name(get_root_device());
         if (!vg_name.empty()) {
-            string snap_dev = "/dev/" + vg_name + "/napt_sandbox_snap";
+            string snap_dev = "/dev/" + vg_name + "/weld_sandbox_snap";
             exec_argv_devnull_out({"lvremove", "-f", snap_dev});
         }
         sandbox_created_and_mounted.store(false);
@@ -793,7 +841,7 @@ string sanitize_filename(const string& raw) {
     string base = (pos_slash == string::npos) ? raw : raw.substr(pos_slash + 1);
     size_t start = base.find_first_not_of(" \n\r\t");
     string cleaned = (start == string::npos) ? "" : base.substr(start, base.find_last_not_of(" \n\r\t") - start + 1);
-    
+
     string safe;
     safe.reserve(cleaned.size());
     for (char c : cleaned) {
@@ -806,14 +854,6 @@ string sanitize_filename(const string& raw) {
     }
     if (safe == "." || safe == "..") safe = "safe_file";
     return safe.empty() ? "safe_file" : safe;
-}
-
-string fetch_url(const string& url) {
-    if (url.empty()) return "";
-    size_t start = url.find_first_not_of(" \n\r\t");
-    string norm_url = (start == string::npos) ? "" : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
-    if (norm_url.front() == '-') return "";
-    return exec_argv_capture({"curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "10", "--max-time", "30", "--", norm_url});
 }
 
 string trim_copy(const string& s) {
@@ -832,13 +872,13 @@ bool ends_with(const string& value, const string& suffix) {
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-class NaptAcquireStatus final : public pkgAcquireStatus {
+class WeldAcquireStatus final : public pkgAcquireStatus {
     int fd;
     bool show_host;
     string label;
     int last_shown = -1;
 public:
-    NaptAcquireStatus(int fd_, bool show_host_, string label_ = "packages")
+    WeldAcquireStatus(int fd_, bool show_host_, string label_ = "packages")
         : fd(fd_), show_host(show_host_), label(std::move(label_)) {}
     bool MediaChange(string, string) override { return false; }
     bool Pulse(pkgAcquire* owner) override {
@@ -976,7 +1016,7 @@ bool run_libapt_transaction(const string& action, const vector<string>& targets,
         }
     }
 
-    NaptAcquireStatus acquire_status(status_fd, !quiet && status_fd < 0);
+    WeldAcquireStatus acquire_status(status_fd, !quiet && status_fd < 0);
     fetcher.SetLog(&acquire_status);
     if (fetcher.Run() != pkgAcquire::Continue) {
         _error->DumpErrors();
@@ -1014,7 +1054,7 @@ string path_basename(const string& path) {
     return path.substr(pos + 1);
 }
 
-string normalize_napt_base_url(const string& raw_url) {
+string normalize_weld_base_url(const string& raw_url) {
     string url = trim_copy(raw_url);
     if (url.find("http://") != 0 && url.find("https://") != 0)
         url = "https://" + url;
@@ -1023,21 +1063,15 @@ string normalize_napt_base_url(const string& raw_url) {
 }
 
 bool is_repo_allowed(const string& url) {
-#ifdef allowrepo
-    if (normalize_napt_base_url(string(allowrepo)) == normalize_napt_base_url(url))
-        return true;
-#endif
-    ifstream in(NAPT_ALLOWED_FILE);
-    if (!in) return false;
-    string line;
-    string norm_url = normalize_napt_base_url(url);
-    while (getline(in, line)) {
-        if (normalize_napt_base_url(line) == norm_url) return true;
-    }
+#ifdef allow_weld_repositories
+    (void)url;
+    return true;
+#else
     return false;
+#endif
 }
 
-void print_napt_repo_warning(const string& url) {
+void print_weld_repo_warning(const string& url) {
     if (is_repo_allowed(url)) return;
     static set<string> warned_repos;
     if (warned_repos.count(url)) return;
@@ -1047,14 +1081,14 @@ void print_napt_repo_warning(const string& url) {
          << "W: Proceed only if this repository is trusted.\n";
 }
 
-bool parse_napt_source_line(const string& raw_line, NaptSource& source) {
+bool parse_weld_source_line(const string& raw_line, WeldSource& source) {
     string line = trim_copy(raw_line);
     if (line.empty() || line[0] == '#') return false;
     istringstream iss(line);
     string type, base_url, release;
     if (!(iss >> type >> base_url >> release)) return false;
     if (type != "deb") return false;
-    base_url = normalize_napt_base_url(base_url);
+    base_url = normalize_weld_base_url(base_url);
     release = trim_copy(release);
     if (base_url.empty() || release.empty()) return false;
     source.base_url = base_url;
@@ -1062,40 +1096,44 @@ bool parse_napt_source_line(const string& raw_line, NaptSource& source) {
     return true;
 }
 
-void load_napt_sources_from_file(const string& path, vector<NaptSource>& sources) {
+void load_weld_sources_from_file(const string& path, vector<WeldSource>& sources) {
     ifstream in(path);
     if (!in) return;
     string line;
     while (getline(in, line)) {
-        NaptSource source;
-        if (parse_napt_source_line(line, source)) sources.push_back(source);
+        WeldSource source;
+        if (parse_weld_source_line(line, source)) sources.push_back(source);
     }
 }
 
-vector<NaptSource> load_napt_sources() {
-    vector<NaptSource> sources;
+vector<WeldSource> load_weld_sources() {
+#ifndef allow_weld_repositories
+    return {};
+#else
+    vector<WeldSource> sources;
 
-    if (path_is_regular_file(NAPT_SOURCES_FILE))
-        load_napt_sources_from_file(NAPT_SOURCES_FILE, sources);
+    if (path_is_regular_file(WELD_SOURCES_FILE))
+        load_weld_sources_from_file(WELD_SOURCES_FILE, sources);
 
-    if (path_is_directory(NAPT_SOURCES_DIR)) {
-        DIR* dir = opendir(NAPT_SOURCES_DIR.c_str());
+    if (path_is_directory(WELD_SOURCES_DIR)) {
+        DIR* dir = opendir(WELD_SOURCES_DIR.c_str());
         if (dir != nullptr) {
             vector<string> files;
             struct dirent* entry;
             while ((entry = readdir(dir)) != NULL) {
                 string name = entry->d_name;
                 if (name == "." || name == "..") continue;
-                string path = NAPT_SOURCES_DIR + "/" + name;
+                string path = WELD_SOURCES_DIR + "/" + name;
                 if (path_is_regular_file(path)) files.push_back(path);
             }
             closedir(dir);
             sort(files.begin(), files.end());
-            for (const auto& path : files) load_napt_sources_from_file(path, sources);
+            for (const auto& path : files) load_weld_sources_from_file(path, sources);
         }
     }
 
     return sources;
+#endif
 }
 
 bool write_text_file(const string& path, const string& content) {
@@ -1127,7 +1165,7 @@ bool read_text_file(const string& path, string& content) {
     return true;
 }
 
-bool parse_napt_repo_metadata(const string& text, NaptRepoMetadata& metadata) {
+bool parse_weld_repo_metadata(const string& text, WeldRepoMetadata& metadata) {
     metadata.packages.clear();
     metadata.required_packages.clear();
     metadata.replaces.clear();
@@ -1138,7 +1176,7 @@ bool parse_napt_repo_metadata(const string& text, NaptRepoMetadata& metadata) {
     stringstream ss(text);
     while (getline(ss, line)) {
         string trimmed = trim_copy(line);
-        if (trimmed.empty() || trimmed == "[napt repository]") continue;
+        if (trimmed.empty() || trimmed == "[weld repository]") continue;
         if (starts_with(trimmed, "release=")) {
             metadata.release = trim_copy(trimmed.substr(8));
             continue;
@@ -1215,26 +1253,123 @@ bool parse_napt_repo_metadata(const string& text, NaptRepoMetadata& metadata) {
     return !metadata.release.empty();
 }
 
-bool sync_napt_metadata() {
-    vector<NaptSource> sources = load_napt_sources();
+size_t curl_string_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    size_t total = size * nmemb;
+    static_cast<string*>(userdata)->append(ptr, total);
+    return total;
+}
+
+string curl_fetch_string(const string& url, const string& user_agent = "", long timeout_sec = 30) {
+    if (url.empty()) return "";
+    size_t start = url.find_first_not_of(" \n\r\t");
+    string norm_url = (start == string::npos) ? "" : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
+    if (norm_url.empty() || norm_url.front() == '-') return "";
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    string response;
+    curl_easy_setopt(curl, CURLOPT_URL, norm_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_string_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    if (!user_agent.empty()) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
+    } else {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.1");
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || response_code != 200) return "";
+    return response;
+}
+
+size_t curl_file_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    FILE* fp = static_cast<FILE*>(userdata);
+    return fwrite(ptr, size, nmemb, fp);
+}
+
+bool curl_download_file(const string& url, const string& dest_path, const string& user_agent = "") {
+    if (url.empty() || dest_path.empty()) return false;
+
+    FILE* fp = fopen(dest_path.c_str(), "wb");
+    if (!fp) return false;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        fclose(fp);
+        unlink(dest_path.c_str());
+        return false;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_file_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    if (!user_agent.empty()) {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
+    } else {
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.1");
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+    fclose(fp);
+
+    if (res != CURLE_OK || response_code != 200) {
+        unlink(dest_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+string fetch_url(const string& url) {
+    return curl_fetch_string(url);
+}
+
+string fetch_url_with_ua(const string& url, const string& user_agent) {
+    return curl_fetch_string(url, user_agent);
+}
+
+bool sync_weld_metadata() {
+#ifndef allow_weld_repositories
+    return true;
+#else
+    vector<WeldSource> sources = load_weld_sources();
     if (sources.empty()) return true;
 
-    exec_argv_devnull_out({"mkdir", "-p", NAPT_ETC_DIR});
+    exec_argv_devnull_out({"mkdir", "-p", WELD_ETC_DIR});
 
     vector<future<bool>> futures;
     futures.reserve(sources.size());
 
     for (const auto& source : sources) {
         futures.push_back(std::async(std::launch::async, [source]() -> bool {
-            print_napt_repo_warning(source.base_url);
+            print_weld_repo_warning(source.base_url);
             string url = source.base_url + "/releases/" + source.release + "/repo-metadata";
-            string metadata = fetch_url(url);
+            string metadata = curl_fetch_string(url);
             if (metadata.empty()) {
                 safe_log("Failed to fetch metadata: ", url, "\n");
                 return false;
             }
             string safe_release = sanitize_filename(source.release);
-            string release_dir = NAPT_ETC_DIR + "/" + safe_release;
+            string release_dir = WELD_ETC_DIR + "/" + safe_release;
             if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) {
                 safe_log("Failed to create metadata directory: ", release_dir, "\n");
                 return false;
@@ -1254,23 +1389,70 @@ bool sync_napt_metadata() {
         if (!fut.get()) ok = false;
     }
     return ok;
+#endif
 }
 
-bool clean_napt_cache() {
+bool clean_apt_archives_cache() {
+    string archives = _config->FindDir("Dir::Cache::archives");
+    if (archives.empty()) archives = "/var/cache/apt/archives/";
+    if (!archives.empty() && archives.back() != '/') archives += "/";
+
     error_code ec;
-    if (!fs::exists(NAPT_CACHE_DIR, ec)) {
-        if (!fs::create_directories(NAPT_CACHE_DIR, ec)) {
-            cout << "Failed to create cache directory: " << NAPT_CACHE_DIR << "\n";
-            return false;
-        }
-        cout << "Cache is already clean.\n";
+    if (!fs::exists(archives, ec)) {
+        cout << "APT archives directory does not exist: " << archives << "\n";
         return true;
     }
 
     bool removed_any = false;
-    for (const auto& entry : fs::directory_iterator(NAPT_CACHE_DIR, ec)) {
+    uint64_t bytes_freed = 0;
+
+    for (const auto& entry : fs::directory_iterator(archives, ec)) {
         if (ec) {
-            cout << "Failed to read cache directory: " << NAPT_CACHE_DIR << "\n";
+            cout << "Failed to read APT archives directory: " << archives << "\n";
+            return false;
+        }
+        string name = entry.path().filename().string();
+        if (name == "partial" || name == "lock") continue;
+
+        error_code fec;
+        if (!entry.is_regular_file(fec)) continue;
+
+        uint64_t sz = entry.file_size(fec);
+        error_code rm_ec;
+        fs::remove(entry.path(), rm_ec);
+        if (!rm_ec) {
+            bytes_freed += sz;
+            removed_any = true;
+        }
+    }
+
+    if (removed_any)
+        cout << "APT archives cleaned: " << archives << "(" << format_bytes(bytes_freed) << " freed)\n";
+    else
+        cout << "APT archives already clean: " << archives << "\n";
+
+    return true;
+}
+
+bool clean_weld_cache_only() {
+#ifndef allow_weld_repositories
+    return true;
+#else
+    error_code ec;
+    string cache_dir = WELD_CACHE_DIR;
+    if (!fs::exists(cache_dir, ec)) {
+        if (!fs::create_directories(cache_dir, ec)) {
+            cout << "Failed to create Weld cache directory: " << cache_dir << "\n";
+            return false;
+        }
+        cout << "Weld cache is already clean.\n";
+        return true;
+    }
+
+    bool removed_any = false;
+    for (const auto& entry : fs::directory_iterator(cache_dir, ec)) {
+        if (ec) {
+            cout << "Failed to read Weld cache directory: " << cache_dir << "\n";
             return false;
         }
         fs::remove_all(entry.path(), ec);
@@ -1281,17 +1463,24 @@ bool clean_napt_cache() {
         removed_any = true;
     }
 
-    if (!fs::exists(NAPT_CACHE_DIR, ec) && !fs::create_directories(NAPT_CACHE_DIR, ec)) {
-        cout << "Failed to recreate cache directory: " << NAPT_CACHE_DIR << "\n";
+    if (!fs::exists(cache_dir, ec) && !fs::create_directories(cache_dir, ec)) {
+        cout << "Failed to recreate Weld cache directory: " << cache_dir << "\n";
         return false;
     }
 
     if (removed_any)
-        cout << "Cache cleaned: " << NAPT_CACHE_DIR << "\n";
+        cout << "Weld cache cleaned: " << cache_dir << "\n";
     else
-        cout << "Cache is already clean.\n";
+        cout << "Weld cache is already clean.\n";
 
     return true;
+#endif
+}
+
+bool clean_weld_cache() {
+    bool apt_ok = clean_apt_archives_cache();
+    bool weld_ok = clean_weld_cache_only();
+    return apt_ok && weld_ok;
 }
 
 string format_bytes(uint64_t bytes) {
@@ -1314,78 +1503,77 @@ string format_bytes(uint64_t bytes) {
     return string(buf);
 }
 
-class TerminalProgressBar {
+vector<WeldRepoMetadata> load_cached_weld_metadata();
+
+class WeldArchiveCleaner final : public pkgArchiveCleaner {
 public:
-    static string render(int percentage, const string& action_label, const string& extra_stats = "", int bar_width = 22) {
-        if (percentage < 0) percentage = 0;
-        if (percentage > 100) percentage = 100;
-
-        int filled = (percentage * bar_width) / 100;
-        int empty = bar_width - filled;
-
-        string bar;
-        for (int i = 0; i < filled; ++i) bar += "\u2588";
-        for (int i = 0; i < empty; ++i)  bar += "\u2591";
-
-        string cyan_bold = "\033[1;36m";
-        string green = "\033[38;2;52;211;153m";
-        string gray = "\033[38;2;148;163;184m";
-        string reset = "\033[0m";
-
-        ostringstream oss;
-        char pct_buf[16];
-        snprintf(pct_buf, sizeof(pct_buf), "%3d%%", percentage);
-        oss << "\r " << cyan_bold << pct_buf << reset << " ["
-            << green << bar << reset << "] "
-            << action_label;
-        if (!extra_stats.empty()) {
-            oss << " " << gray << "(" << extra_stats << ")" << reset;
+    size_t   removed_count = 0;
+    uint64_t bytes_freed   = 0;
+protected:
+    void Erase(int const dirfd, char const * const File,
+               string const &Pkg, string const &Ver,
+               struct stat const &St) override {
+        (void)Pkg; (void)Ver;
+        bytes_freed += static_cast<uint64_t>(St.st_size);
+        if (unlinkat(dirfd, File, 0) == 0) {
+            ++removed_count;
         }
-        oss << "   ";
-        return oss.str();
     }
 };
 
-class ETAEstimator {
-    chrono::steady_clock::time_point start_time;
-public:
-    ETAEstimator() : start_time(chrono::steady_clock::now()) {}
-
-    void reset() {
-        start_time = chrono::steady_clock::now();
+bool autoclean_apt_archives_cache() {
+    pkgCacheFile cache_file;
+    pkgCache* cache = cache_file.GetPkgCache();
+    if (cache == nullptr) {
+        _error->DumpErrors();
+        cout << "Unable to open APT package cache for autoclean.\n";
+        return false;
     }
 
-    string get_stats(int current_percent) {
-        if (current_percent <= 0) return "Calculating...";
-        auto now = chrono::steady_clock::now();
-        double elapsed_sec = chrono::duration_cast<chrono::duration<double>>(now - start_time).count();
-        if (elapsed_sec < 0.25) return "Estimating...";
+    string archives = _config->FindDir("Dir::Cache::archives");
+    if (archives.empty()) archives = "/var/cache/apt/archives/";
+    if (!archives.empty() && archives.back() != '/') archives += "/";
 
-        double pct_per_sec = static_cast<double>(current_percent) / elapsed_sec;
-        if (pct_per_sec <= 0.001) return "Calculating...";
-
-        double remaining_pct = 100.0 - current_percent;
-        double remaining_sec = remaining_pct / pct_per_sec;
-
-        int mins = static_cast<int>(remaining_sec) / 60;
-        int secs = static_cast<int>(remaining_sec) % 60;
-
-        char buf[64];
-        snprintf(buf, sizeof(buf), "ETA: %02d:%02d", mins, secs);
-        return string(buf);
-    }
-};
-
-vector<NaptRepoMetadata> load_cached_napt_metadata();
-
-bool autoclean_napt_cache() {
     error_code ec;
-    if (!fs::exists(NAPT_CACHE_DIR, ec)) {
-        cout << "Cache directory does not exist: " << NAPT_CACHE_DIR << "\n";
+    if (!fs::exists(archives, ec)) {
+        cout << "APT archives directory does not exist: " << archives << "\n";
+        return true;
+    }
+    if (!fs::exists(archives + "partial", ec)) {
+        cout << "APT archives partial directory missing, skipping APT autoclean: "
+             << archives << "partial/\n";
         return true;
     }
 
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
+    WeldArchiveCleaner cleaner;
+    if (!cleaner.Go(archives, *cache)) {
+        _error->DumpErrors();
+        cout << "APT autoclean encountered errors while cleaning: " << archives << "\n";
+        return false;
+    }
+    _error->DumpErrors();
+
+    if (cleaner.removed_count > 0) {
+        cout << "APT autoclean removed " << cleaner.removed_count
+             << " obsolete .deb file(s) (" << format_bytes(cleaner.bytes_freed) << " freed)\n";
+    } else {
+        cout << "APT archives: no obsolete packages found.\n";
+    }
+    return true;
+}
+
+bool autoclean_weld_cache_only() {
+#ifndef allow_weld_repositories
+    return true;
+#else
+    error_code ec;
+    string cache_dir = WELD_CACHE_DIR;
+    if (!fs::exists(cache_dir, ec)) {
+        cout << "Weld cache directory does not exist: " << cache_dir << "\n";
+        return true;
+    }
+
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
     set<string> valid_filenames;
     for (const auto& repo : repos) {
         for (const auto& entry : repo.packages) {
@@ -1396,7 +1584,7 @@ bool autoclean_napt_cache() {
     bool removed_any = false;
     uint64_t bytes_freed = 0;
 
-    for (const auto& rel_entry : fs::directory_iterator(NAPT_CACHE_DIR, ec)) {
+    for (const auto& rel_entry : fs::directory_iterator(cache_dir, ec)) {
         if (!rel_entry.is_directory()) continue;
         for (const auto& file_entry : fs::directory_iterator(rel_entry.path(), ec)) {
             if (!file_entry.is_regular_file()) continue;
@@ -1406,7 +1594,7 @@ bool autoclean_napt_cache() {
                 if (!ec) bytes_freed += sz;
                 fs::remove(file_entry.path(), ec);
                 if (!ec) {
-                    cout << "Autoclean removed stale package: " << filename << "\n";
+                    cout << "Weld autoclean removed stale package: " << filename << "\n";
                     removed_any = true;
                 }
             }
@@ -1414,11 +1602,18 @@ bool autoclean_napt_cache() {
     }
 
     if (removed_any) {
-        cout << "Autoclean finished. Space freed: " << format_bytes(bytes_freed) << "\n";
+        cout << "Weld autoclean finished. Space freed: " << format_bytes(bytes_freed) << "\n";
     } else {
-        cout << "Cache is already clean. No obsolete packages found.\n";
+        cout << "Weld cache is already clean. No obsolete packages found.\n";
     }
     return true;
+#endif
+}
+
+bool autoclean_weld_cache() {
+    bool apt_ok = autoclean_apt_archives_cache();
+    bool weld_ok = autoclean_weld_cache_only();
+    return apt_ok && weld_ok;
 }
 
 void print_install_already_present_message(const string& pkg_name, bool is_upgrade) {
@@ -1426,26 +1621,30 @@ void print_install_already_present_message(const string& pkg_name, bool is_upgra
         cout << pkg_name << " is already up to date.\n";
         return;
     }
-    cout << pkg_name << " is already installed. To upgrade it, run napt upgrade "
-         << pkg_name << ", or napt upgrade with no arguments to upgrade all packages.\n"
+    cout << pkg_name << " is already installed. To upgrade it, run weld upgrade "
+         << pkg_name << ", or weld upgrade with no arguments to upgrade all packages.\n"
          << "For large transactions, --apply-host skips the chroot verification step.\n";
 }
 
-vector<NaptRepoMetadata> load_cached_napt_metadata() {
-    vector<NaptRepoMetadata> repos;
-    vector<NaptSource> sources = load_napt_sources();
+vector<WeldRepoMetadata> load_cached_weld_metadata() {
+#ifndef allow_weld_repositories
+    return {};
+#else
+    vector<WeldRepoMetadata> repos;
+    vector<WeldSource> sources = load_weld_sources();
     for (const auto& source : sources) {
-        string path = NAPT_ETC_DIR + "/" + source.release + "/repo-metadata";
+        string path = WELD_ETC_DIR + "/" + sanitize_filename(source.release) + "/repo-metadata";
         string content;
         if (!read_text_file(path, content)) continue;
-        NaptRepoMetadata metadata;
+        WeldRepoMetadata metadata;
         metadata.base_url = source.base_url;
         metadata.release = source.release;
-        if (!parse_napt_repo_metadata(content, metadata)) continue;
+        if (!parse_weld_repo_metadata(content, metadata)) continue;
         if (metadata.release.empty()) metadata.release = source.release;
         repos.push_back(metadata);
     }
     return repos;
+#endif
 }
 
 int compare_versions(const string& a, const string& b) {
@@ -1458,7 +1657,7 @@ int compare_versions(const string& a, const string& b) {
     return a < b ? -1 : 1;
 }
 
-string extract_napt_version(const string& pkg_name, const string& file_name) {
+string extract_weld_version(const string& pkg_name, const string& file_name) {
     string base = path_basename(trim_copy(file_name));
     if (!ends_with(base, ".deb")) return "";
     string stem = base.substr(0, base.size() - 4);
@@ -1493,14 +1692,13 @@ AptPackageState get_apt_package_state(pkgCacheFile& cache_file, const string& pk
     return state;
 }
 
-NaptPackageCandidate find_best_napt_candidate(const vector<NaptRepoMetadata>& repos, const string& pkg_name) {
-    NaptPackageCandidate best;
+WeldPackageCandidate find_best_weld_candidate(const vector<WeldRepoMetadata>& repos, const string& pkg_name) {
+    WeldPackageCandidate best;
 
-    // 1. Direct package match
     for (const auto& repo : repos) {
         auto it = repo.packages.find(pkg_name);
         if (it == repo.packages.end()) continue;
-        NaptPackageCandidate candidate;
+        WeldPackageCandidate candidate;
         candidate.found = true;
         candidate.base_url = repo.base_url;
         candidate.release = repo.release;
@@ -1509,31 +1707,30 @@ NaptPackageCandidate find_best_napt_candidate(const vector<NaptRepoMetadata>& re
         candidate.actual_pkg_name = pkg_name;
         candidate.original_query_name = pkg_name;
         candidate.is_replacement = false;
-        candidate.version = extract_napt_version(pkg_name, candidate.file_name);
+        candidate.version = extract_weld_version(pkg_name, candidate.file_name);
         if (!best.found || compare_versions(candidate.version, best.version) > 0)
             best = candidate;
     }
     if (best.found) return best;
 
-    // 2. Replaces match (alias / replacement redirection)
     for (const auto& repo : repos) {
         auto rep_it = repo.replaces.find(pkg_name);
         if (rep_it == repo.replaces.end()) continue;
 
-        string target_napt_pkg = rep_it->second;
-        auto it = repo.packages.find(target_napt_pkg);
+        string target_weld_pkg = rep_it->second;
+        auto it = repo.packages.find(target_weld_pkg);
         if (it == repo.packages.end()) continue;
 
-        NaptPackageCandidate candidate;
+        WeldPackageCandidate candidate;
         candidate.found = true;
         candidate.base_url = repo.base_url;
         candidate.release = repo.release;
         candidate.file_name = it->second.first;
         candidate.sha256 = it->second.second;
-        candidate.actual_pkg_name = target_napt_pkg;
+        candidate.actual_pkg_name = target_weld_pkg;
         candidate.original_query_name = pkg_name;
         candidate.is_replacement = true;
-        candidate.version = extract_napt_version(target_napt_pkg, candidate.file_name);
+        candidate.version = extract_weld_version(target_weld_pkg, candidate.file_name);
         if (!best.found || compare_versions(candidate.version, best.version) > 0)
             best = candidate;
     }
@@ -1541,21 +1738,26 @@ NaptPackageCandidate find_best_napt_candidate(const vector<NaptRepoMetadata>& re
     return best;
 }
 
-string build_napt_download_url(const NaptPackageCandidate& candidate) {
+string build_weld_download_url(const WeldPackageCandidate& candidate) {
     string file_name = trim_copy(candidate.file_name);
     while (!file_name.empty() && file_name.front() == '/') file_name.erase(file_name.begin());
     return candidate.base_url + "/releases/" + candidate.release + "/" + file_name;
 }
 
-bool cache_napt_package(const NaptPackageCandidate& candidate, string& local_path) {
+bool cache_weld_package(const WeldPackageCandidate& candidate, string& local_path) {
+#ifndef allow_weld_repositories
+    (void)candidate; (void)local_path;
+    return false;
+#else
     string safe_release = sanitize_filename(candidate.release);
     string safe_file = sanitize_filename(candidate.file_name);
-    string release_dir = NAPT_CACHE_DIR + "/" + safe_release;
+    string release_dir = WELD_CACHE_DIR + "/" + safe_release;
     if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) return false;
     local_path = release_dir + "/" + safe_file;
-    string url = build_napt_download_url(candidate);
+    string url = build_weld_download_url(candidate);
     if (url.empty() || url.front() == '-') return false;
-    return exec_argv_devnull_out({"curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "-o", local_path, "--", url}) == 0;
+    return curl_download_file(url, local_path);
+#endif
 }
 
 string calculate_sha256(const string& file_path) {
@@ -1565,32 +1767,33 @@ string calculate_sha256(const string& file_path) {
     return trim_copy(out);
 }
 
-struct PendingNaptDownload {
+struct PendingWeldDownload {
     string pkg_name;
-    NaptPackageCandidate candidate;
+    WeldPackageCandidate candidate;
     string local_path;
     bool success = false;
     string error_msg;
 };
 
-static bool download_napt_packages(vector<PendingNaptDownload>& pending_napt_downloads, vector<InstallDecision>& decisions, bool quiet) {
-    if (pending_napt_downloads.empty()) return true;
+static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_downloads, vector<InstallDecision>& decisions, bool quiet) {
+    if (pending_weld_downloads.empty()) return true;
 
-    size_t num_threads = std::min<size_t>(4, pending_napt_downloads.size());
+    size_t num_threads = std::min<size_t>(4, pending_weld_downloads.size());
     vector<thread> workers;
     std::atomic<size_t> current_index(0);
 
     for (size_t t = 0; t < num_threads; ++t) {
         workers.emplace_back([&]() {
+            curl_global_init(CURL_GLOBAL_DEFAULT);
             while (true) {
                 size_t idx = current_index.fetch_add(1);
-                if (idx >= pending_napt_downloads.size()) break;
+                if (idx >= pending_weld_downloads.size()) break;
 
-                auto& pending = pending_napt_downloads[idx];
-                if (!quiet) safe_log("Downloading Napt package: ", pending.pkg_name, "...\n");
+                auto& pending = pending_weld_downloads[idx];
+                if (!quiet) safe_log("Downloading Weld package: ", pending.pkg_name, "...\n");
                 auto start_time = chrono::steady_clock::now();
-                if (!cache_napt_package(pending.candidate, pending.local_path)) {
-                    pending.error_msg = "E: Failed to download " + pending.pkg_name + " from the Napt repository.";
+                if (!cache_weld_package(pending.candidate, pending.local_path)) {
+                    pending.error_msg = "E: Failed to download " + pending.pkg_name + " from the Weld repository.";
                     continue;
                 }
                 auto end_time = chrono::steady_clock::now();
@@ -1619,7 +1822,6 @@ static bool download_napt_packages(vector<PendingNaptDownload>& pending_napt_dow
                 }
 
                 if (!quiet) {
-                    string checkmark = "\033[1;32m✔\033[0m";
                     string cyan = "\033[1;36m";
                     string gray = "\033[38;2;148;163;184m";
                     string reset = "\033[0m";
@@ -1627,12 +1829,13 @@ static bool download_napt_packages(vector<PendingNaptDownload>& pending_napt_dow
                     if (!sz_str.empty()) details += sz_str;
                     if (!speed_str.empty()) details += (details.empty() ? "" : " | ") + speed_str;
 
-                    safe_log(" ", checkmark, " ", cyan, pending.pkg_name, reset,
+                    safe_log(" * ", cyan, pending.pkg_name, reset,
                              (!details.empty() ? " " + gray + "(" + details + ")" + reset : ""),
                              "\n");
                 }
                 pending.success = true;
             }
+            curl_global_cleanup();
         });
     }
 
@@ -1641,7 +1844,7 @@ static bool download_napt_packages(vector<PendingNaptDownload>& pending_napt_dow
     }
 
     bool ok = true;
-    for (const auto& pending : pending_napt_downloads) {
+    for (const auto& pending : pending_weld_downloads) {
         if (!pending.success) {
             if (!quiet) safe_log(pending.error_msg, "\n");
             ok = false;
@@ -1650,19 +1853,8 @@ static bool download_napt_packages(vector<PendingNaptDownload>& pending_napt_dow
             decision.package_name     = pending.candidate.actual_pkg_name.empty() ? pending.pkg_name : pending.candidate.actual_pkg_name;
             decision.apt_argument     = pending.local_path;
             decision.selected_version = pending.candidate.version;
-            decision.from_napt        = true;
+            decision.from_weld        = true;
             decisions.push_back(decision);
-            if (!quiet) {
-                if (pending.candidate.is_replacement) {
-                    safe_log("Selected ", pending.candidate.actual_pkg_name, 
-                             (!pending.candidate.version.empty() ? " (" + pending.candidate.version + ")" : ""),
-                             " from the Napt repository (replacing ", pending.pkg_name, ").\n");
-                } else {
-                    safe_log("Selected ", pending.pkg_name, 
-                             (!pending.candidate.version.empty() ? " (" + pending.candidate.version + ")" : ""),
-                             " from the Napt repository.\n");
-                }
-            }
         }
     }
     return ok;
@@ -1675,9 +1867,9 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
     }
 
     pkgCacheFile cache_file;
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
     bool had_error = false;
-    vector<PendingNaptDownload> pending_napt_downloads;
+    vector<PendingWeldDownload> pending_weld_downloads;
 
     for (const auto& pkg_name : pkgs) {
         if (ends_with(pkg_name, ".deb")) {
@@ -1691,51 +1883,46 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
             if (!ec) abs_path = fs::weakly_canonical(abs_path, ec);
             string resolved_path = ec ? pkg_name : abs_path.string();
 
-            if (!quiet) cout << "Selecting local package archive: " << resolved_path << ".\n";
             InstallDecision decision;
             decision.package_name     = resolved_path;
             decision.apt_argument     = resolved_path;
             decision.selected_version = "";
-            decision.from_napt        = false;
+            decision.from_weld        = false;
             decisions.push_back(decision);
             continue;
         }
 
         AptPackageState apt_state = get_apt_package_state(cache_file, pkg_name);
-        NaptPackageCandidate napt_candidate = find_best_napt_candidate(repos, pkg_name);
+        WeldPackageCandidate weld_candidate = find_best_weld_candidate(repos, pkg_name);
 
-        if (!apt_state.found && !napt_candidate.found) {
+        if (!apt_state.found && !weld_candidate.found) {
             if (!quiet) cout << "E: Unable to locate package " << pkg_name << ".\n";
             had_error = true;
             continue;
         }
 
-        bool use_napt = false;
-        if (napt_candidate.found) {
-            if (napt_candidate.is_replacement) {
-                use_napt = true;
-                if (!quiet) {
-                    cout << "Note: Package '" << pkg_name << "' is replaced by Napt package '" 
-                         << napt_candidate.actual_pkg_name << "' (replaces rule). Redirecting...\n";
-                }
+        bool use_weld = false;
+        if (weld_candidate.found) {
+            if (weld_candidate.is_replacement) {
+                use_weld = true;
             } else if (!apt_state.found || apt_state.candidate_version.empty()) {
-                use_napt = true;
-            } else if (compare_versions(napt_candidate.version, apt_state.candidate_version) > 0) {
-                use_napt = true;
+                use_weld = true;
+            } else if (compare_versions(weld_candidate.version, apt_state.candidate_version) > 0) {
+                use_weld = true;
             }
         }
 
-        if (use_napt) {
-            print_napt_repo_warning(napt_candidate.base_url);
-            AptPackageState target_apt_state = (napt_candidate.is_replacement)
-                ? get_apt_package_state(cache_file, napt_candidate.actual_pkg_name)
+        if (use_weld) {
+            print_weld_repo_warning(weld_candidate.base_url);
+            AptPackageState target_apt_state = (weld_candidate.is_replacement)
+                ? get_apt_package_state(cache_file, weld_candidate.actual_pkg_name)
                 : apt_state;
 
-            if (target_apt_state.installed && compare_versions(target_apt_state.installed_version, napt_candidate.version) >= 0) {
-                if (!quiet) print_install_already_present_message(napt_candidate.actual_pkg_name, is_upgrade);
+            if (target_apt_state.installed && compare_versions(target_apt_state.installed_version, weld_candidate.version) >= 0) {
+                if (!quiet) print_install_already_present_message(weld_candidate.actual_pkg_name, is_upgrade);
                 continue;
             }
-            pending_napt_downloads.push_back({pkg_name, napt_candidate, "", false, ""});
+            pending_weld_downloads.push_back({pkg_name, weld_candidate, "", false, ""});
             continue;
         }
 
@@ -1754,42 +1941,169 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
         decision.package_name     = pkg_name;
         decision.apt_argument     = pkg_name;
         decision.selected_version = apt_state.candidate_version;
-        decision.from_napt        = false;
+        decision.from_weld        = false;
         decisions.push_back(decision);
-        if (!quiet) {
-            cout << "Selected " << pkg_name;
-            if (!apt_state.candidate_version.empty()) cout << " (" << apt_state.candidate_version << ")";
-            cout << " from the Debian archive.\n";
-        }
     }
 
-    if (!download_napt_packages(pending_napt_downloads, decisions, quiet)) {
+    if (!download_weld_packages(pending_weld_downloads, decisions, quiet)) {
         had_error = true;
     }
 
     return !had_error;
 }
 
-void do_nflinux_upgrade(bool apply_host) {
-    (void)apply_host;
+string parse_arvor_ua_version(const string& page) {
+    if (page.empty()) return "";
+    const string needle = "ArvorLinux/";
+    size_t pos = page.find(needle);
+    if (pos == string::npos) return "";
+    pos += needle.size();
+    string ver;
+    while (pos < page.size()) {
+        char c = page[pos];
+        if (std::isdigit(static_cast<unsigned char>(c)) || c == '.') {
+            ver += c;
+            ++pos;
+        } else {
+            break;
+        }
+    }
+    while (!ver.empty() && ver.back() == '.') ver.pop_back();
+    return ver;
+}
+
+int compare_arvor_versions(const string& a, const string& b) {
+    auto parse = [](const string& s) -> pair<int, int> {
+        int major = 0, minor = 0;
+        size_t dot = s.find('.');
+        if (dot == string::npos) {
+            try { major = std::stoi(s); } catch (...) {}
+        } else {
+            try { major = std::stoi(s.substr(0, dot)); } catch (...) {}
+            try { minor = std::stoi(s.substr(dot + 1)); } catch (...) {}
+        }
+        return {major, minor};
+    };
+    auto pa = parse(a);
+    auto pb = parse(b);
+    if (pa.first != pb.first) return pa.first < pb.first ? -1 : 1;
+    if (pa.second != pb.second) return pa.second < pb.second ? -1 : 1;
+    return 0;
+}
+
+string render_weld_progress(int percentage, const string& label) {
+    if (percentage < 0) percentage = 0;
+    if (percentage > 100) percentage = 100;
+    const int bar_width = 32;
+    int filled = (percentage * bar_width) / 100;
+    string bar;
+    bar.reserve(bar_width);
+    for (int i = 0; i < filled; ++i) bar += '-';
+    for (int i = filled; i < bar_width; ++i) bar += ' ';
+    char pct_buf[16];
+    snprintf(pct_buf, sizeof(pct_buf), "%3d%%", percentage);
+    string dim = "\033[38;5;250m";
+    string accent = "\033[38;5;117m";
+    string reset = "\033[0m";
+    ostringstream oss;
+    oss << "\r" << accent << label << reset << " " << dim << bar << reset << " " << pct_buf;
+    return oss.str();
+}
+
+string strip_maintainer_email(const string& maintainer) {
+    if (maintainer.empty()) return "";
+    size_t pos = maintainer.find(" <");
+    if (pos != string::npos) return maintainer.substr(0, pos);
+    return maintainer;
+}
+
+void print_successful_install(const string& action, const vector<string>& targets) {
+    string green = "\033[38;5;114m";
+    string reset = "\033[0m";
+    if (action != "install" && action != "upgrade" && action != "dist-upgrade") {
+        cout << green << "Transaction completed successfully." << reset << "\n";
+        return;
+    }
+    pkgCacheFile cache_file;
+    pkgCache* cache = cache_file.GetPkgCache();
+    if (cache == nullptr) {
+        cout << green << "Transaction completed successfully." << reset << "\n";
+        return;
+    }
+    pkgRecords records(*cache);
+    bool printed_any = false;
+    for (const auto& t : targets) {
+        if (ends_with(t, ".deb")) continue;
+        pkgCache::PkgIterator pkg = cache->FindPkg(t);
+        if (pkg.end() || pkg->CurrentVer == 0) continue;
+        pkgCache::VerIterator ver = pkg.CurrentVer();
+        string version = ver.VerStr();
+        string maintainer;
+        pkgCache::VerFileIterator vf = ver.FileList();
+        if (!vf.end()) {
+            pkgRecords::Parser& parser = records.Lookup(vf);
+            maintainer = parser.Maintainer();
+        }
+        string maint_name = strip_maintainer_email(maintainer);
+        cout << green << "Successfully Installed " << t;
+        if (!version.empty()) cout << ", Version " << version;
+        if (!maint_name.empty()) cout << " by " << maint_name;
+        cout << reset << "\n";
+        printed_any = true;
+    }
+    if (!printed_any) {
+        cout << green << "Transaction completed successfully." << reset << "\n";
+    }
+}
+
+void do_nflinux_upgrade(bool apply_host, const string& arv_version) {
+    string user_agent = "ArvorLinux/" + arv_version;
+    string ua_page = curl_fetch_string("https://nextferret.github.io/ua", user_agent);
+    string remote_version = parse_arvor_ua_version(ua_page);
+
+    if (!remote_version.empty()) {
+        int cmp = compare_arvor_versions(arv_version, remote_version);
+        if (cmp > 0) {
+            cout << "You are running a development build of Arvor Linux, or the remote release server may be outdated.\n";
+            cout << "Local version: " << arv_version << " | Remote version: " << remote_version << "\n";
+            cout << "No upgradeable release was found for your channel.\n";
+            return;
+        }
+        if (cmp == 0) {
+            cout << "Arvor Linux is already up to date (version " << arv_version << ").\n";
+            return;
+        }
+        cout << "Arvor Linux local version: " << arv_version << "\n";
+        cout << "A newer release (" << remote_version << ") is available. Proceed with upgrade? [Y/n] ";
+        cout.flush();
+        if (!assume_yes) {
+            string answer;
+            getline(cin, answer);
+            if (answer != "y" && answer != "Y") {
+                cout << "Upgrade cancelled.\n";
+                return;
+            }
+        }
+    }
+
 #ifdef nflinux
     global_config_backup.backup();
 
-    string os_release = fetch_url("https://nextferret.github.io/etc/os-release");
-    string codenames = fetch_url("https://nextferret.github.io/version_codename");
-    string repo_number_str = trim_copy(fetch_url("https://nextferret.github.io/repo-number"));
-    string napt_sources = "";
+    string os_release = curl_fetch_string("https://nextferret.github.io/etc/os-release-arm", user_agent);
+    string codenames = curl_fetch_string("https://nextferret.github.io/version_codename-arm", user_agent);
+    string repo_number_str = trim_copy(curl_fetch_string("https://nextferret.github.io/repo-number", user_agent));
+    string weld_sources = "";
     string apt_sources = "";
 
     if (!codenames.empty() && !repo_number_str.empty()) {
         size_t comma = codenames.find(',');
         if (comma != string::npos) {
-            string napt_code = trim_copy(codenames.substr(0, comma));
+            string weld_code = trim_copy(codenames.substr(0, comma));
             string debian_code = trim_copy(codenames.substr(comma + 1));
             string base_repo_url = "https://nextferretdur.github.io/repo-nflinux-" + repo_number_str;
-            string meta_url = base_repo_url + "/releases/" + napt_code + "/repo-metadata";
-            if (!fetch_url(meta_url).empty()) {
-                napt_sources = "deb " + base_repo_url + " " + napt_code + "\n";
+            string meta_url = base_repo_url + "/releases/" + weld_code + "/repo-metadata";
+            if (!curl_fetch_string(meta_url).empty()) {
+                weld_sources = "deb " + base_repo_url + " " + weld_code + "\n";
                 apt_sources = "deb http://deb.debian.org/debian " + debian_code + " main contrib non-free non-free-firmware\n";
                 apt_sources += "deb http://deb.debian.org/debian-security " + debian_code + "-security main contrib non-free non-free-firmware\n";
                 apt_sources += "deb http://deb.debian.org/debian " + debian_code + "-updates main contrib non-free non-free-firmware\n";
@@ -1797,12 +2111,12 @@ void do_nflinux_upgrade(bool apply_host) {
         }
     }
 
-    if (!os_release.empty() || !apt_sources.empty() || !napt_sources.empty()) {
-        global_config_backup.set_new(os_release, apt_sources, napt_sources);
+    if (!os_release.empty() || !apt_sources.empty() || !weld_sources.empty()) {
+        global_config_backup.set_new(os_release, apt_sources, weld_sources);
         global_config_backup.apply_new();
     }
 
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
     vector<string> pkgs_to_install;
     for (const auto& repo : repos) {
         for (const auto& req : repo.required_packages)
@@ -1815,6 +2129,8 @@ void do_nflinux_upgrade(bool apply_host) {
         cout << "Installing required packages from repositories...\n";
         perform_install_transaction(pkgs_to_install, apply_host);
     }
+#else
+    (void)apply_host;
 #endif
 }
 
@@ -1870,7 +2186,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                 _exit(1);
             }
 
-            if (g_enable_seccomp) {
+            {
                 string seccomp_err;
                 if (!ChrootSeccompManager::apply_filter(seccomp_err)) {
                     if (have_err && !seccomp_err.empty()) {
@@ -1921,12 +2237,10 @@ void perform_transaction_argv(const string& action, const vector<string>& target
             if (have_pipe) close(apt_pipe[1]);
             if (have_err)  close(err_pipe[1]);
 
-            cout << "\033[1;36m==>\033[0m Verifying transaction in isolated sandbox"
-                 << (g_enable_seccomp ? " (SECCOMP BPF active)...\n" : "...\n");
+            cout << render_weld_progress(0, "Verifying Transaction") << flush;
 
             std::atomic<int> apt_percent(-1);
             string child_stderr_output;
-            ETAEstimator chroot_eta;
 
             std::thread stderr_reader([&]() {
                 if (!have_err) return;
@@ -1962,7 +2276,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                         if (pct > apt_percent.load()) apt_percent.store(pct);
                         int current = apt_percent.load();
                         if (current != last_shown) {
-                            cout << TerminalProgressBar::render(current, "Sandbox Verification", chroot_eta.get_stats(current)) << flush;
+                            cout << render_weld_progress(current, "Verifying Transaction") << flush;
                             last_shown = current;
                         }
                     } catch (...) {}
@@ -1996,15 +2310,15 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                 return;
             }
 
-            cout << TerminalProgressBar::render(100, "Sandbox Verification Successful", "Completed") << "\n\n";
+            cout << render_weld_progress(100, "Verifying Transaction") << "\n\n";
 
             if (!assume_yes) {
-                cout << "\033[1;32m✔\033[0m Sandbox verification passed without errors.\n";
+                cout << "Sandbox verification passed without errors.\n";
                 cout << "The transaction is now ready to be applied to the host system.\n";
-                cout << "Do you wish to continue? Type 'yes' to confirm, or press Enter to abort: ";
+                cout << "Do you wish to continue? [Y/n] ";
                 string confirm;
                 getline(cin, confirm);
-                if (confirm != "yes" && confirm != "YES") {
+                if (confirm != "y" && confirm != "Y") {
                     global_config_backup.restore_orig();
                     cout << "Transaction aborted by user.\n";
                     return;
@@ -2022,7 +2336,6 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     bool snapshot_created = create_snapshot("apt-pre");
     global_config_backup.apply_new();
 
-    // Preserve active kernel modules in case of kernel upgrades
     string kver = trim_copy(exec_argv_capture({"uname", "-r"}));
     if (!kver.empty()) {
         string src = "/lib/modules/" + kver;
@@ -2036,7 +2349,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     cout.flush();
     cerr.flush();
 
-    cout << "\033[1;36m==>\033[0m Applying transaction to the host system...\n";
+    cout << render_weld_progress(0, "Applying Transaction") << flush;
 
     int host_pipe[2];
     bool have_host_pipe = (pipe(host_pipe) == 0);
@@ -2045,6 +2358,13 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     if (host_pid == 0) {
         int devnull_r = open("/dev/null", O_RDONLY);
         if (devnull_r >= 0) { dup2(devnull_r, STDIN_FILENO); close(devnull_r); }
+
+        int devnull_w = open("/dev/null", O_WRONLY);
+        if (devnull_w >= 0) {
+            dup2(devnull_w, STDOUT_FILENO);
+            dup2(devnull_w, STDERR_FILENO);
+            close(devnull_w);
+        }
 
         int status_fd = -1;
         if (have_host_pipe) {
@@ -2056,7 +2376,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
 
         for (int fd = 4; fd < 1024; ++fd) close(fd);
         setenv("DEBIAN_FRONTEND", "noninteractive", 1);
-        bool ok = run_libapt_transaction(action, targets, status_fd, false);
+        bool ok = run_libapt_transaction(action, targets, status_fd, true);
         cout.flush();
         cerr.flush();
         _exit(ok ? 0 : 1);
@@ -2068,7 +2388,6 @@ void perform_transaction_argv(const string& action, const vector<string>& target
         if (have_host_pipe) close(host_pipe[1]);
 
         std::atomic<int> host_percent(-1);
-        ETAEstimator host_eta;
 
         std::thread host_reader([&]() {
             if (!have_host_pipe) return;
@@ -2093,7 +2412,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                     if (pct > host_percent.load()) host_percent.store(pct);
                     int current = host_percent.load();
                     if (current != last_shown) {
-                        cout << TerminalProgressBar::render(current, "Applying to Host", host_eta.get_stats(current)) << flush;
+                        cout << render_weld_progress(current, "Applying Transaction") << flush;
                         last_shown = current;
                     }
                 } catch (...) {}
@@ -2107,9 +2426,9 @@ void perform_transaction_argv(const string& action, const vector<string>& target
     }
 
     if (host_ok) {
-        cout << TerminalProgressBar::render(100, "Transaction Applied Successfully", "Done") << "\n\n";
+        cout << render_weld_progress(100, "Applying Transaction") << "\n\n";
         create_snapshot("apt-post");
-        cout << "\033[1;32m✔\033[0m Transaction completed successfully.\n";
+        print_successful_install(action, targets);
     } else {
         cout << "\n\033[1;31mE:\033[0m Host transaction failed. Rolling back to previous snapshot...\n";
         global_config_backup.restore_orig();
@@ -2140,20 +2459,20 @@ void perform_global_upgrade(bool apply_host) {
     pkgCache* cache = cache_file.GetPkgCache();
     if (cache == nullptr) return;
 
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
-    vector<string> napt_upgrade_args;
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
+    vector<string> weld_upgrade_args;
 
     auto get_installed_version = [&](const string& pkg_name) -> string {
         AptPackageState s = get_apt_package_state(cache_file, pkg_name);
         return s.installed ? s.installed_version : "";
     };
 
-    auto try_queue_napt_upgrade = [&](const string& pkg_name, const string& installed_version) {
-        NaptPackageCandidate candidate = find_best_napt_candidate(repos, pkg_name);
+    auto try_queue_weld_upgrade = [&](const string& pkg_name, const string& installed_version) {
+        WeldPackageCandidate candidate = find_best_weld_candidate(repos, pkg_name);
         if (!candidate.found) return;
         if (!installed_version.empty() && compare_versions(candidate.version, installed_version) <= 0) return;
         string local_path;
-        if (!cache_napt_package(candidate, local_path)) return;
+        if (!cache_weld_package(candidate, local_path)) return;
         if (candidate.sha256.empty()) {
             exec_argv_devnull_out({"rm", "-f", local_path});
             cout << "No SHA256 checksum found in metadata for " << pkg_name << ", skipping.\n";
@@ -2166,11 +2485,11 @@ void perform_global_upgrade(bool apply_host) {
                 return;
             }
         }
-        cout << "Queuing napt upgrade: " << pkg_name;
+        cout << "Queuing weld upgrade: " << pkg_name;
         if (!installed_version.empty()) cout << " (" << installed_version << " -> " << candidate.version << ")";
         else cout << " (" << candidate.version << ")";
         cout << "\n";
-        napt_upgrade_args.push_back(local_path);
+        weld_upgrade_args.push_back(local_path);
     };
 
     set<string> handled_pkgs;
@@ -2182,16 +2501,16 @@ void perform_global_upgrade(bool apply_host) {
         }
         if (!already_installed_req.empty()) {
             string iv = get_installed_version(already_installed_req);
-            try_queue_napt_upgrade(already_installed_req, iv);
+            try_queue_weld_upgrade(already_installed_req, iv);
             handled_pkgs.insert(already_installed_req);
         } else {
             for (const auto& req : repo.required_packages) {
                 string iv = get_installed_version(req);
-                NaptPackageCandidate c = find_best_napt_candidate(repos, req);
+                WeldPackageCandidate c = find_best_weld_candidate(repos, req);
                 if (!iv.empty()) {
                     if (c.found && compare_versions(c.version, iv) > 0) {
                         cout << "Upgrading required package: " << req << " (" << iv << " -> " << c.version << ")\n";
-                        try_queue_napt_upgrade(req, iv);
+                        try_queue_weld_upgrade(req, iv);
                         handled_pkgs.insert(req);
                     }
                     continue;
@@ -2219,12 +2538,12 @@ void perform_global_upgrade(bool apply_host) {
         string pkg_name = pkg.Name();
         if (handled_pkgs.count(pkg_name)) continue;
         AptPackageState apt_state = get_apt_package_state(cache_file, pkg_name);
-        try_queue_napt_upgrade(pkg_name, apt_state.installed_version);
+        try_queue_weld_upgrade(pkg_name, apt_state.installed_version);
     }
 
-    if (!napt_upgrade_args.empty()) {
-        cout << "Upgrading NAPT packages first...\n";
-        perform_transaction_argv("install", napt_upgrade_args, apply_host);
+    if (!weld_upgrade_args.empty()) {
+        cout << "Upgrading Weld packages first...\n";
+        perform_transaction_argv("install", weld_upgrade_args, apply_host);
     }
 
     cout << "Proceeding with standard apt upgrade...\n";
@@ -2244,7 +2563,7 @@ static string to_lower_copy(const string& s) {
 }
 
 int run_search(const vector<string>& terms, int page) {
-    if (terms.empty()) { cout << "Usage: napt search <term> [-p <page>]\n"; return 1; }
+    if (terms.empty()) { cout << "Usage: weld search <term> [-p <page>]\n"; return 1; }
     if (page < 1) page = 1;
     string term = to_lower_copy(terms[0]);
     const int page_size = 30;
@@ -2276,7 +2595,7 @@ int run_search(const vector<string>& terms, int page) {
         ++shown;
     }
 
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
     for (const auto& repo : repos) {
         for (const auto& entry : repo.packages) {
             const string& pkg_name = entry.first;
@@ -2286,8 +2605,8 @@ int run_search(const vector<string>& terms, int page) {
             ++matches;
             if (index < offset || shown >= page_size) continue;
 
-            string version = extract_napt_version(pkg_name, entry.second.first);
-            cout << pkg_name << " - Provided by Napt repository " << repo.base_url;
+            string version = extract_weld_version(pkg_name, entry.second.first);
+            cout << pkg_name << " - Provided by Weld repository " << repo.base_url;
             if (!version.empty()) cout << ", version " << version;
             cout << ".\n";
             ++shown;
@@ -2313,42 +2632,39 @@ int run_search(const vector<string>& terms, int page) {
 
 int show_package_info(const string& pkg_name) {
     if (pkg_name.empty()) {
-        cout << "Usage: napt info <package_name>\n";
+        cout << "Usage: weld info <package_name>\n";
         return 1;
     }
 
     pkgCacheFile cache_file;
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
     AptPackageState apt_state = get_apt_package_state(cache_file, pkg_name);
-    NaptPackageCandidate napt_cand = find_best_napt_candidate(repos, pkg_name);
+    WeldPackageCandidate weld_cand = find_best_weld_candidate(repos, pkg_name);
 
-    if (!apt_state.found && !napt_cand.found) {
+    if (!apt_state.found && !weld_cand.found) {
         cout << "Package '" << pkg_name << "' not found in any configured repository.\n";
         return 1;
     }
 
     string cyan_bold = "\033[1;36m";
     string green = "\033[1;32m";
-    string yellow = "\033[1;33m";
     string reset = "\033[0m";
 
     cout << cyan_bold << "Package Information: " << pkg_name << reset << "\n";
     cout << "----------------------------------------\n";
-    cout << "Installed:     " << (apt_state.installed ? (green + "yes (" + apt_state.installed_version + ")" + reset) : "no") << "\n";
 
-    if (napt_cand.found) {
-        cout << "Napt Source:   " << napt_cand.base_url << " (" << napt_cand.release << ")\n";
-        cout << "Napt File:     " << napt_cand.file_name << "\n";
-        cout << "Napt Version:  " << napt_cand.version << "\n";
-        cout << "SHA256:        " << (napt_cand.sha256.empty() ? "None" : napt_cand.sha256) << "\n";
-        if (napt_cand.is_replacement) {
-            cout << "Replaces Rule: " << yellow << "Replaces package '" << napt_cand.original_query_name 
-                 << "' with '" << napt_cand.actual_pkg_name << "'" << reset << "\n";
-        }
+    if (apt_state.installed) {
+        cout << "Installed:    " << green << "yes (" << apt_state.installed_version << ")" << reset << "\n";
+    } else {
+        cout << "Installed:    no\n";
     }
 
-    if (apt_state.found && !apt_state.candidate_version.empty()) {
-        cout << "Debian Ver:    " << apt_state.candidate_version << "\n";
+    if (weld_cand.found) {
+        cout << "Source:       " << weld_cand.base_url << " (" << weld_cand.release << ")\n";
+        cout << "Version:      " << weld_cand.version << "\n";
+        cout << "SHA256:       " << (weld_cand.sha256.empty() ? "None" : weld_cand.sha256) << "\n";
+    } else if (apt_state.found && !apt_state.candidate_version.empty()) {
+        cout << "Version:      " << apt_state.candidate_version << "\n";
     }
 
     return 0;
@@ -2395,7 +2711,7 @@ bool check_system_locks(bool quiet = false) {
 
 int show_package_why(const string& pkg_name) {
     if (pkg_name.empty()) {
-        cout << "Usage: napt why <package_name>\n";
+        cout << "Usage: weld why <package_name>\n";
         return 1;
     }
     pkgCacheFile cache_file;
@@ -2429,7 +2745,7 @@ int show_package_why(const string& pkg_name) {
         if (parent->CurrentVer != 0) {
             string pname = parent.Name();
             if (seen_parents.insert(pname).second) {
-                cout << "  " << green << "✔ " << pname << reset << " (" << parent.CurrentVer().VerStr() << ")"
+                cout << "  " << green << "- " << pname << reset << " (" << parent.CurrentVer().VerStr() << ")"
                      << gray << " [requires " << dep.DepType() << ": " << pkg_name << "]" << reset << "\n";
                 rev_count++;
             }
@@ -2438,15 +2754,17 @@ int show_package_why(const string& pkg_name) {
 
     if (rev_count == 0) {
         cout << "  " << gray << "No installed packages depend on '" << pkg_name << "'. It was likely installed manually or as a top-level requirement." << reset << "\n";
+    } else if (rev_count == 1) {
+        cout << "\nRequired by 1 currently installed package.\n";
     } else {
-        cout << "\nRequired by " << rev_count << " currently installed package(s).\n";
+        cout << "\nRequired by " << rev_count << " currently installed packages.\n";
     }
     return 0;
 }
 
 int show_package_depends(const string& pkg_name) {
     if (pkg_name.empty()) {
-        cout << "Usage: napt depends <package_name>\n";
+        cout << "Usage: weld depends <package_name>\n";
         return 1;
     }
     pkgCacheFile cache_file;
@@ -2484,85 +2802,8 @@ int show_package_depends(const string& pkg_name) {
     return 0;
 }
 
-int show_history() {
-    cout << "\033[1;36m=== NAPT Transaction History ===\033[0m\n\n";
-    string log_path = "/var/log/dpkg.log";
-    if (!fs::exists(log_path)) {
-        cout << "No package history log found at " << log_path << ".\n";
-        return 0;
-    }
-
-    ifstream in(log_path);
-    if (!in.is_open()) {
-        cout << "Unable to open history log.\n";
-        return 1;
-    }
-
-    string line;
-    vector<string> relevant_lines;
-    while (getline(in, line)) {
-        if (line.find(" install ") != string::npos ||
-            line.find(" upgrade ") != string::npos ||
-            line.find(" remove ") != string::npos ||
-            line.find(" purge ") != string::npos) {
-            relevant_lines.push_back(line);
-        }
-    }
-
-    size_t start = (relevant_lines.size() > 25) ? (relevant_lines.size() - 25) : 0;
-    for (size_t i = start; i < relevant_lines.size(); ++i) {
-        const string& l = relevant_lines[i];
-        if (l.find(" install ") != string::npos) {
-            cout << "\033[1;32m[INSTALL]\033[0m " << l << "\n";
-        } else if (l.find(" upgrade ") != string::npos) {
-            cout << "\033[1;33m[UPGRADE]\033[0m " << l << "\n";
-        } else if (l.find(" remove ") != string::npos || l.find(" purge ") != string::npos) {
-            cout << "\033[1;31m[REMOVE]\033[0m  " << l << "\n";
-        }
-    }
-    return 0;
-}
-
-int show_stats() {
-    pkgCacheFile cache_file;
-    pkgCache* cache = cache_file.GetPkgCache();
-    vector<NaptRepoMetadata> repos = load_cached_napt_metadata();
-    vector<NaptSource> sources = load_napt_sources();
-
-    int total_pkgs = 0;
-    int installed_pkgs = 0;
-
-    if (cache != nullptr) {
-        for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
-            total_pkgs++;
-            if (pkg->CurrentVer != 0) installed_pkgs++;
-        }
-    }
-
-    uint64_t cache_bytes = 0;
-    error_code ec;
-    if (fs::exists(NAPT_CACHE_DIR, ec)) {
-        for (const auto& entry : fs::recursive_directory_iterator(NAPT_CACHE_DIR, ec)) {
-            if (entry.is_regular_file()) cache_bytes += entry.file_size(ec);
-        }
-    }
-
-    string cyan_bold = "\033[1;36m";
-    string green = "\033[1;32m";
-    string reset = "\033[0m";
-
-    cout << cyan_bold << "=== Arvor NAPT System & Cache Statistics ===" << reset << "\n\n";
-    cout << "  Napt Repositories Configured: " << green << sources.size() << reset << "\n";
-    cout << "  Napt Metadata Sources Loaded: " << green << repos.size() << reset << "\n";
-    cout << "  Total Package Symbols:        " << total_pkgs << "\n";
-    cout << "  Installed Packages:           " << green << installed_pkgs << reset << "\n";
-    cout << "  Napt Cache Disk Footprint:    " << format_bytes(cache_bytes) << " (" << NAPT_CACHE_DIR << ")\n";
-    cout << "  LVM Snapshot Sandbox Engine:  " << green << "Active (Thin / Thick LVM Supported)" << reset << "\n\n";
-    return 0;
-}
-
 void do_transaction_rollback() {
-    cout << "\033[1;33m==>\033[0m Querying available recovery snapshots for rollback...\n";
+    cout << "Querying available recovery snapshots for rollback...\n";
     string latest_snap = get_latest_snapshot("apt-pre");
     if (latest_snap.empty()) {
         latest_snap = get_latest_snapshot("root-auto");
@@ -2575,10 +2816,10 @@ void do_transaction_rollback() {
     }
 
     cout << "Found latest pre-transaction snapshot: \033[1;32m" << latest_snap << "\033[0m\n";
-    cout << "Are you sure you want to rollback to this snapshot? Type 'yes' to proceed: ";
+    cout << "Are you sure you want to rollback to this snapshot? [Y/n] ";
     string confirm;
     getline(cin, confirm);
-    if (confirm == "yes" || confirm == "YES") {
+    if (confirm == "y" || confirm == "Y") {
         do_rollback("apt-pre");
     } else {
         cout << "Rollback cancelled.\n";
@@ -2587,20 +2828,21 @@ void do_transaction_rollback() {
 
 int main(int argc, char** argv) {
     setup_safety_handlers();
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     pkgInitConfig(*_config);
     pkgInitSystem(*_config, _system);
     string command;
     vector<string> pkgs;
     bool apply_host = false;
     int search_page = 1;
+    string arv_version = ARVOR_VERSION;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
         if (arg == "-h" || arg == "--help") { show_help(); return 0; }
-        else if (arg == "--v" || arg == "-v" || arg == "--version") { cout << "napt 4.1\n"; return 0; }
+        else if (arg == "--v" || arg == "-v" || arg == "--version") { cout << weld_version_str() << "\n"; return 0; }
         else if (arg == "--vb") { _config->Set("Debug::pkgAcquire", "true"); }
         else if (arg == "--apply-host") { apply_host = true; }
-        else if (arg == "--no-seccomp") { g_enable_seccomp = false; }
         else if (arg == "-y" || arg == "--yes" || arg == "--assume-yes") { assume_yes = true; }
         else if (arg == "-p" && i + 1 < argc) { search_page = atoi(argv[++i]); }
         else if (command.empty() && arg[0] != '-') { command = arg; }
@@ -2609,33 +2851,14 @@ int main(int argc, char** argv) {
 
     if (command.empty()) { show_help(); return 0; }
 
-    if (command == "moo") {
-        if (!pkgs.empty() && pkgs[0] == "moo") {
-            cout << "There are no easter eggs in this program.\n";
-        } else {
-            cout << "         (__) \n"
-                 << "         (oo) \n"
-                 << "   /------\\/ \n"
-                 << "  / |    ||  \n"
-                 << " *  ||---||  \n"
-                 << "    ^^   ^^  \n"
-                 << "...Have you mooed today?\n";
-        }
-        return 0;
-    }
-
-    if (command == "stats") {
-        return show_stats();
-    } else if (command == "history" || command == "log") {
-        return show_history();
-    } else if (command == "why") {
-        if (pkgs.empty()) { cout << "Usage: napt why <package_name>\n"; return 1; }
+    if (command == "why") {
+        if (pkgs.empty()) { cout << "Usage: weld why <package_name>\n"; return 1; }
         return show_package_why(pkgs[0]);
     } else if (command == "depends" || command == "deps") {
-        if (pkgs.empty()) { cout << "Usage: napt depends <package_name>\n"; return 1; }
+        if (pkgs.empty()) { cout << "Usage: weld depends <package_name>\n"; return 1; }
         return show_package_depends(pkgs[0]);
     } else if (command == "info" || command == "show") {
-        if (pkgs.empty()) { cout << "Usage: napt info <package_name>\n"; return 1; }
+        if (pkgs.empty()) { cout << "Usage: weld info <package_name>\n"; return 1; }
         return show_package_info(pkgs[0]);
     } else if (command == "list" || command == "list-installed") {
         return list_installed_packages();
@@ -2652,31 +2875,35 @@ int main(int argc, char** argv) {
         pkgSourceList* src_list = cache_file.GetSourceList();
         bool apt_ok = false;
         if (src_list != nullptr) {
-            NaptAcquireStatus status(-1, true, "metadata");
+            WeldAcquireStatus status(-1, true, "metadata");
             apt_ok = ListUpdate(status, *src_list);
             if (!apt_ok) _error->DumpErrors();
         } else {
             _error->DumpErrors();
         }
-        bool napt_ok = sync_napt_metadata();
-        return (apt_ok && napt_ok) ? 0 : 1;
+        bool weld_ok = sync_weld_metadata();
+        return (apt_ok && weld_ok) ? 0 : 1;
     } else if (command == "clean") {
-        return clean_napt_cache() ? 0 : 1;
+        return clean_weld_cache() ? 0 : 1;
     } else if (command == "autoclean") {
-        return autoclean_napt_cache() ? 0 : 1;
+        return autoclean_weld_cache() ? 0 : 1;
     } else if (command == "rollback") {
         do_transaction_rollback();
     } else if (command == "dist-upgrade") {
 #ifdef nflinux
-        do_nflinux_upgrade(apply_host);
+        do_nflinux_upgrade(apply_host, arv_version);
 #else
+        (void)arv_version;
         perform_transaction("dist-upgrade", pkgs, apply_host);
 #endif
     } else if (command == "install") {
+        (void)arv_version;
         perform_install_transaction(pkgs, apply_host);
     } else if (command == "upgrade") {
+        (void)arv_version;
         perform_upgrade_transaction(pkgs, apply_host);
     } else if (command == "remove" || command == "purge") {
+        (void)arv_version;
         perform_transaction(command, pkgs, apply_host);
     } else {
         cout << "Unknown command: " << command << "\n";
@@ -2684,5 +2911,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    curl_global_cleanup();
     return 0;
 }
