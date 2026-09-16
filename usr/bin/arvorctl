@@ -46,7 +46,7 @@ cmd_status() {
     echo -e "${C_BOLD}Root Device:${C_RESET}       ${root_dev:-Unknown}"
     echo -e "${C_BOLD}Volume Group:${C_RESET}      ${vg_name:-N/A}"
     echo -e "${C_BOLD}Root Volume:${C_RESET}       ${lv_name:-N/A}"
-    
+
     # 1. Boot Health Check
     echo -e "\n${C_BOLD}[Boot Health Verification]${C_RESET}"
     local tag_status="${C_RED}Missing (Dirty / Unverified)${C_RESET}"
@@ -58,7 +58,7 @@ cmd_status() {
         fi
     fi
     echo -e "  LVM Metadata Tag:      $tag_status"
-    
+
     local run_status="${C_RED}Missing${C_RESET}"
     [ -f /run/bootisok ] && run_status="${C_GREEN}Present (/run/bootisok)${C_RESET}"
     echo -e "  Runtime Flag:          $run_status"
@@ -67,38 +67,29 @@ cmd_status() {
     [ -f /var/lib/arvor/bootisok ] && disk_status="${C_GREEN}Present (/var/lib/arvor/bootisok)${C_RESET}"
     echo -e "  Persistent Disk Flag:  $disk_status"
 
-    # 2. A/B/C Rotation Slots
-    echo -e "\n${C_BOLD}[Atomic A/B/C Snapshot Slots]${C_RESET}"
+    # 2. Active Root
+    echo -e "\n${C_BOLD}[Active Root Volume]${C_RESET}"
+    if [ -n "$vg_name" ] && [ -n "$lv_name" ]; then
+        echo -e "  ${C_CYAN}● Running Root:${C_RESET}  /dev/$vg_name/$lv_name"
+    else
+        echo -e "  ${C_RED}Unable to identify running root volume.${C_RESET}"
+    fi
+
+    # 3. Snapshots
+    echo -e "\n${C_BOLD}[Snapshots of Root]${C_RESET}"
     if [ -n "$vg_name" ]; then
-        # Slot A
-        echo -e "  ${C_CYAN}● Slot A [root]:${C_RESET}    Active Running Root (/dev/$vg_name/$lv_name)"
-        
-        # Slot B
-        if lvs "/dev/$vg_name/root_b" >/dev/null 2>&1; then
-            local info_b
-            info_b=$(lvs --noheadings -o data_percent,lv_time "/dev/$vg_name/root_b" 2>/dev/null | sed 's/^[ \t]*//')
-            echo -e "  ${C_GREEN}● Slot B [root_b]:${C_RESET}  Available (Last Stable Boot) [Data: ${info_b}]"
+        local snaps
+        snaps=$(lvs --noheadings -o lv_name,origin,data_percent,lv_time "$vg_name" 2>/dev/null \
+                | awk -v root="$lv_name" '$2 == root {print $1"|"$3"|"$4}')
+        if [ -n "$snaps" ]; then
+            while IFS='|' read -r sname delta stime; do
+                sname=$(echo "$sname" | xargs)
+                delta=$(echo "$delta" | xargs)
+                stime=$(echo "$stime" | xargs)
+                echo -e "  ${C_GREEN}●${C_RESET} ${sname}  ${C_GRAY}(Delta: ${delta:-0}%, Created: ${stime:-unknown})${C_RESET}"
+            done <<< "$snaps"
         else
-            echo -e "  ${C_GRAY}○ Slot B [root_b]:  Not created yet${C_RESET}"
-        fi
-
-        # Slot C
-        if lvs "/dev/$vg_name/root_c" >/dev/null 2>&1; then
-            local info_c
-            info_c=$(lvs --noheadings -o data_percent,lv_time "/dev/$vg_name/root_c" 2>/dev/null | sed 's/^[ \t]*//')
-            echo -e "  ${C_YELLOW}● Slot C [root_c]:${C_RESET}  Available (Fallback Boot) [Data: ${info_c}]"
-        else
-            echo -e "  ${C_GRAY}○ Slot C [root_c]:  Not created yet${C_RESET}"
-        fi
-
-        # Other snapshots
-        echo -e "\n${C_BOLD}[Manual & Auto Snapshots]${C_RESET}"
-        local other_snaps
-        other_snaps=$(lvs --noheadings -o lv_name,origin,data_percent,lv_time "$vg_name" 2>/dev/null | awk -v root="$lv_name" '$2 == root && $1 != "root_b" && $1 != "root_c" {print "  - " $1 " (Delta: " $3 "%, Time: " $4 ")"}')
-        if [ -n "$other_snaps" ]; then
-            echo "$other_snaps"
-        else
-            echo -e "  ${C_GRAY}No additional manual snapshots found.${C_RESET}"
+            echo -e "  ${C_GRAY}No snapshots found for root volume.${C_RESET}"
         fi
     else
         echo -e "  ${C_RED}Unable to inspect LVM volume group.${C_RESET}"
@@ -109,7 +100,7 @@ cmd_status() {
 cmd_snapshot() {
     local name="$1"
     if [ -z "$name" ]; then
-        name="manual_$(date +%Y%m%d_%H%M%S)"
+        name="snap_$(date +%Y%m%d_%H%M%S)"
     fi
 
     if [ "$EUID" -ne 0 ]; then
@@ -129,7 +120,7 @@ cmd_snapshot() {
         exit 1
     fi
 
-    echo -e "${C_CYAN}Creating Thin LVM snapshot '${name}' from /dev/$vg_name/$lv_name...${C_RESET}"
+    echo -e "${C_CYAN}Creating thin LVM snapshot '${name}' from /dev/$vg_name/$lv_name...${C_RESET}"
     if lvcreate -s --name "$name" -k n "/dev/$vg_name/$lv_name"; then
         echo -e "${C_GREEN}✔ Snapshot '${name}' created successfully.${C_RESET}"
     else
@@ -140,10 +131,11 @@ cmd_snapshot() {
 
 cmd_rollback() {
     local target="$1"
-    if [ -z "$target" ] || [ "$target" = "b" ] || [ "$target" = "root_b" ]; then
-        target="root_b"
-    elif [ "$target" = "c" ] || [ "$target" = "root_c" ]; then
-        target="root_c"
+
+    if [ -z "$target" ]; then
+        echo -e "${C_RED}Error:${C_RESET} No snapshot specified."
+        echo -e "Usage: arvorctl rollback <snapshot_name>"
+        exit 1
     fi
 
     if [ "$EUID" -ne 0 ]; then
@@ -180,10 +172,11 @@ cmd_rollback() {
 
 cmd_diff() {
     local target="$1"
-    if [ -z "$target" ] || [ "$target" = "b" ] || [ "$target" = "root_b" ]; then
-        target="root_b"
-    elif [ "$target" = "c" ] || [ "$target" = "root_c" ]; then
-        target="root_c"
+
+    if [ -z "$target" ]; then
+        echo -e "${C_RED}Error:${C_RESET} No snapshot specified."
+        echo -e "Usage: arvorctl diff <snapshot_name>"
+        exit 1
     fi
 
     if [ "$EUID" -ne 0 ]; then
@@ -269,10 +262,10 @@ show_help() {
     echo -e "${C_CYAN}${C_BOLD}arvorctl - Arvor Linux Atomic Management Tool${C_RESET}\n"
     echo -e "Usage: arvorctl [command] [options]\n"
     echo -e "Commands:"
-    echo -e "  ${C_BOLD}status${C_RESET}                Display atomic boot health, A/B/C slots, and snapshots"
+    echo -e "  ${C_BOLD}status${C_RESET}                Display boot health, root volume, and snapshots"
     echo -e "  ${C_BOLD}snapshot [name]${C_RESET}       Create a new thin snapshot of root (auto-named if omitted)"
-    echo -e "  ${C_BOLD}diff [b|c|name]${C_RESET}       Inspect file differences between live system and a snapshot"
-    echo -e "  ${C_BOLD}rollback [b|c|name]${C_RESET}   Rollback root partition to slot B, C, or a custom snapshot"
+    echo -e "  ${C_BOLD}diff <name>${C_RESET}            Inspect file differences between live system and a snapshot"
+    echo -e "  ${C_BOLD}rollback <name>${C_RESET}        Rollback root partition to the specified snapshot"
     echo -e "  ${C_BOLD}mark-ok${C_RESET}               Manually validate and mark current boot state as healthy"
     echo -e "  ${C_BOLD}help${C_RESET}                  Show this help message\n"
 }
