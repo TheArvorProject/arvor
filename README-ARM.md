@@ -1,1 +1,1 @@
-# To Be Written : Arvor Linux 8 will Reintroduce ARM builds.
+# To Be Written : Arvor Linux 8.1 will Reintroduce ARM builds.
