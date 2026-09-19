@@ -117,8 +117,6 @@ arvorctl mark-ok
 - `weld why <pkg>` - Explain why a package is installed with reverse dependency tree.
 - `weld depends <pkg>` - List forward dependencies (Depends, Recommends, Suggests).
 - `weld list` - List all currently installed packages on the system.
-- `weld stats` - Show cache metrics, repository stats, and package footprint.
-- `weld history` - View past installation, upgrade, and removal logs.
 - `weld clean` - Clear the entire package cache.
 - `weld autoclean` - Remove obsolete cached package files and free disk space.
 
@@ -135,38 +133,7 @@ Minimum requirements:
 Recommended:
 
 - SSD
-- 8 GB RAM or more
-
----
-
-# Default Credentials
-
-Fresh installations and recovery deployments are configured with the following default accounts:
-
-| User | Password | Permissions | Description |
-| --- | --- | --- | --- |
-| `root` | `root` | Superuser | System administrator account |
-| `arvor` | `arvor` | `sudo` | Default standard user with sudo privileges |
-
-> [!TIP]
-> It is strongly recommended to change these default passwords upon first login with `passwd` and `passwd arvor`.
-
----
-
-# Architecture
-
-Arvor intentionally avoids technologies commonly used by immutable distributions.
-
-| Technology | Used |
-|-----------|------|
-| OverlayFS | ❌ |
-| OSTree | ❌ |
-| Read-only root filesystem | ❌ |
-| LVM Snapshots | ✅ |
-| Mutable root filesystem | ✅ |
-| Transactional updates | ✅ |
-
----
+- 8 GB RAM or more.
 
 # Frequently Asked Questions
 
