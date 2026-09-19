@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/mount.h>
+#include <sched.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <thread>
@@ -23,6 +26,10 @@
 #include <mutex>
 #include <future>
 #include <curl/curl.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
 #include <apt-pkg/init.h>
 #include <apt-pkg/configuration.h>
 #include <apt-pkg/pkgsystem.h>
@@ -45,6 +52,9 @@
 #include <apt-pkg/update.h>
 #include <apt-pkg/clean.h>
 #include <memory>
+#include <cstdint>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <linux/seccomp.h>
@@ -84,16 +94,46 @@
 #define AUDIT_ARCH_AARCH64 0xc00000b7
 #endif
 
+#ifndef AUDIT_ARCH_I386
+#define AUDIT_ARCH_I386 0x40000003
+#endif
+
+#ifndef AUDIT_ARCH_ARM
+#define AUDIT_ARCH_ARM 0x40000028
+#endif
+
+#ifndef AUDIT_ARCH_RISCV64
+#define AUDIT_ARCH_RISCV64 0xc00000f3
+#endif
+
+#ifndef AUDIT_ARCH_PPC64LE
+#define AUDIT_ARCH_PPC64LE 0xc0000015
+#endif
+
+#ifndef AUDIT_ARCH_S390X
+#define AUDIT_ARCH_S390X 0xc0000016
+#endif
+
 #if defined(__x86_64__)
 #define SECCOMP_TARGET_ARCH AUDIT_ARCH_X86_64
 #elif defined(__aarch64__)
 #define SECCOMP_TARGET_ARCH AUDIT_ARCH_AARCH64
 #elif defined(__i386__)
-#define SECCOMP_TARGET_ARCH 0x40000003
+#define SECCOMP_TARGET_ARCH AUDIT_ARCH_I386
 #elif defined(__arm__)
-#define SECCOMP_TARGET_ARCH 0x40000028
+#define SECCOMP_TARGET_ARCH AUDIT_ARCH_ARM
+#elif defined(__riscv) && __riscv_xlen == 64
+#define SECCOMP_TARGET_ARCH AUDIT_ARCH_RISCV64
+#elif defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define SECCOMP_TARGET_ARCH AUDIT_ARCH_PPC64LE
+#elif defined(__s390x__)
+#define SECCOMP_TARGET_ARCH AUDIT_ARCH_S390X
 #else
 #define SECCOMP_TARGET_ARCH 0
+#endif
+
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000
 #endif
 
 #ifdef arvor_version
@@ -109,11 +149,11 @@ const string TREE_ROOT = "/nsm/weld/root";
 const string NF_TREE_BIN = "/usr/bin/nsm";
 const string AUTO_SNAP_DIR = "/nsm/snapshots/auto";
 
-const string WELD_ETC_DIR       = "/etc/weld";
-const string WELD_SOURCES_FILE  = "/etc/weld/sources.list";
-const string WELD_SOURCES_DIR   = "/etc/weld/sources.list.d";
-const string WELD_CACHE_DIR     = "/etc/weld/cache";
-const string WELD_ALLOWED_FILE  = "/etc/weld/allowed";
+const string WELD_ETC_DIR             = "/etc/weld";
+const string WELD_SOURCES_FILE        = "/etc/weld/sources.list";
+const string WELD_SOURCES_DIR         = "/etc/weld/sources.list.d";
+const string WELD_CACHE_DIR           = "/etc/weld/cache";
+const string WELD_TRUSTED_KEYS_DIR     = "/etc/weld/trusted_keys";
 
 static bool assume_yes = false;
 static std::atomic<bool> sandbox_created_and_mounted(false);
@@ -123,6 +163,107 @@ static string get_root_fstype();
 static string get_vg_name(const string& lv_path);
 static bool is_lv_thin(const string& lv_path);
 static double get_vg_free_gb(const string& vg_name);
+
+namespace {
+
+vector<unsigned char> base64_decode_buf(const string& s) {
+    if (s.empty()) return {};
+    BIO* b64 = BIO_new(BIO_f_base64());
+    if (!b64) return {};
+    BIO* mem = BIO_new_mem_buf(s.data(), static_cast<int>(s.size()));
+    if (!mem) { BIO_free_all(b64); return {}; }
+    BIO_push(b64, mem);
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    vector<unsigned char> out(s.size());
+    int n = BIO_read(b64, out.data(), static_cast<int>(s.size()));
+    BIO_free_all(b64);
+    if (n <= 0) return {};
+    out.resize(static_cast<size_t>(n));
+    return out;
+}
+
+bool compute_blake2b512(const unsigned char* data, size_t len, unsigned char out[64]) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+    bool ok = false;
+    const EVP_MD* md = EVP_blake2b512();
+    if (!md) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+    if (EVP_DigestInit_ex(ctx, md, NULL) == 1) {
+        if (EVP_DigestUpdate(ctx, data, len) == 1) {
+            unsigned int out_len = 0;
+            if (EVP_DigestFinal_ex(ctx, out, &out_len) == 1 && out_len == 64) ok = true;
+        }
+    }
+    EVP_MD_CTX_free(ctx);
+    return ok;
+}
+
+bool verify_ed25519(const unsigned char* msg, size_t msg_len,
+                   const unsigned char sig[64], const unsigned char pubkey[32]) {
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pubkey, 32);
+    if (!pkey) return false;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) { EVP_PKEY_free(pkey); return false; }
+    bool ok = false;
+    if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1) {
+        int rc = EVP_DigestVerify(ctx, sig, 64, msg, msg_len);
+        if (rc == 1) ok = true;
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+struct MinisignPublicKey {
+    unsigned char key_id[8];
+    unsigned char pubkey[32];
+};
+
+struct MinisignSignature {
+    unsigned char sig_alg[2];
+    unsigned char key_id[8];
+    unsigned char sig[64];
+    string trusted_comment;
+    unsigned char global_sig[64];
+};
+
+bool parse_minisign_pub_blob(const vector<unsigned char>& blob, MinisignPublicKey& key) {
+    if (blob.size() != 42) return false;
+    if (blob[0] != 'E' || blob[1] != 'd') return false;
+    memcpy(key.key_id, blob.data() + 2, 8);
+    memcpy(key.pubkey, blob.data() + 10, 32);
+    return true;
+}
+
+bool parse_minisign_sig_blob(const vector<unsigned char>& blob, MinisignSignature& sig) {
+    if (blob.size() != 74) return false;
+    memcpy(sig.sig_alg, blob.data(), 2);
+    bool prehashed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'D');
+    bool raw_ed    = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'd');
+    if (!prehashed && !raw_ed) return false;
+    memcpy(sig.key_id, blob.data() + 2, 8);
+    memcpy(sig.sig,    blob.data() + 10, 64);
+    return true;
+}
+
+string hex_encode(const unsigned char* data, size_t len) {
+    static const char* hexchars = "0123456789abcdef";
+    string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(hexchars[(data[i] >> 4) & 0xF]);
+        out.push_back(hexchars[data[i] & 0xF]);
+    }
+    return out;
+}
+
+}
+
+bool read_text_file(const string& path, string& content);
+bool write_text_file(const string& path, const string& content);
 
 class ChrootSeccompManager {
 public:
@@ -139,78 +280,177 @@ public:
 #if SECCOMP_TARGET_ARCH != 0
         filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_TARGET_ARCH, 1, 0));
         filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)));
+#else
+        filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 #endif
 
         filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, (uint32_t)offsetof(struct seccomp_data, nr)));
 
         vector<int> blocked_syscalls;
 
+        const int syscalls_to_block[] = {
 #ifdef __NR_reboot
-        blocked_syscalls.push_back(__NR_reboot);
+            __NR_reboot,
 #endif
 #ifdef __NR_init_module
-        blocked_syscalls.push_back(__NR_init_module);
+            __NR_init_module,
 #endif
 #ifdef __NR_delete_module
-        blocked_syscalls.push_back(__NR_delete_module);
+            __NR_delete_module,
 #endif
 #ifdef __NR_finit_module
-        blocked_syscalls.push_back(__NR_finit_module);
+            __NR_finit_module,
+#endif
+#ifdef __NR_create_module
+            __NR_create_module,
+#endif
+#ifdef __NR_get_kernel_syms
+            __NR_get_kernel_syms,
+#endif
+#ifdef __NR_query_module
+            __NR_query_module,
 #endif
 #ifdef __NR_kexec_load
-        blocked_syscalls.push_back(__NR_kexec_load);
+            __NR_kexec_load,
 #endif
 #ifdef __NR_kexec_file_load
-        blocked_syscalls.push_back(__NR_kexec_file_load);
+            __NR_kexec_file_load,
 #endif
 #ifdef __NR_swapon
-        blocked_syscalls.push_back(__NR_swapon);
+            __NR_swapon,
 #endif
 #ifdef __NR_swapoff
-        blocked_syscalls.push_back(__NR_swapoff);
+            __NR_swapoff,
 #endif
 #ifdef __NR_acct
-        blocked_syscalls.push_back(__NR_acct);
+            __NR_acct,
 #endif
 #ifdef __NR_ptrace
-        blocked_syscalls.push_back(__NR_ptrace);
+            __NR_ptrace,
 #endif
 #ifdef __NR_bpf
-        blocked_syscalls.push_back(__NR_bpf);
+            __NR_bpf,
 #endif
 #ifdef __NR_userfaultfd
-        blocked_syscalls.push_back(__NR_userfaultfd);
+            __NR_userfaultfd,
 #endif
 #ifdef __NR_syslog
-        blocked_syscalls.push_back(__NR_syslog);
+            __NR_syslog,
 #endif
 #ifdef __NR_iopl
-        blocked_syscalls.push_back(__NR_iopl);
+            __NR_iopl,
 #endif
 #ifdef __NR_ioperm
-        blocked_syscalls.push_back(__NR_ioperm);
+            __NR_ioperm,
 #endif
 #ifdef __NR_vmsplice
-        blocked_syscalls.push_back(__NR_vmsplice);
+            __NR_vmsplice,
 #endif
 #ifdef __NR_add_key
-        blocked_syscalls.push_back(__NR_add_key);
+            __NR_add_key,
 #endif
 #ifdef __NR_request_key
-        blocked_syscalls.push_back(__NR_request_key);
+            __NR_request_key,
 #endif
 #ifdef __NR_keyctl
-        blocked_syscalls.push_back(__NR_keyctl);
+            __NR_keyctl,
 #endif
 #ifdef __NR_pivot_root
-        blocked_syscalls.push_back(__NR_pivot_root);
+            __NR_pivot_root,
+#endif
+#ifdef __NR_chroot
+            __NR_chroot,
+#endif
+#ifdef __NR_mount
+            __NR_mount,
+#endif
+#ifdef __NR_umount
+            __NR_umount,
+#endif
+#ifdef __NR_umount2
+            __NR_umount2,
+#endif
+#ifdef __NR_move_mount
+            __NR_move_mount,
+#endif
+#ifdef __NR_open_tree
+            __NR_open_tree,
+#endif
+#ifdef __NR_fsopen
+            __NR_fsopen,
+#endif
+#ifdef __NR_fspick
+            __NR_fspick,
+#endif
+#ifdef __NR_fsconfig
+            __NR_fsconfig,
+#endif
+#ifdef __NR_fsmount
+            __NR_fsmount,
+#endif
+#ifdef __NR_mount_setattr
+            __NR_mount_setattr,
 #endif
 #ifdef __NR_clock_settime
-        blocked_syscalls.push_back(__NR_clock_settime);
+            __NR_clock_settime,
 #endif
 #ifdef __NR_settimeofday
-        blocked_syscalls.push_back(__NR_settimeofday);
+            __NR_settimeofday,
 #endif
+#ifdef __NR_stime
+            __NR_stime,
+#endif
+#ifdef __NR_sethostname
+            __NR_sethostname,
+#endif
+#ifdef __NR_setdomainname
+            __NR_setdomainname,
+#endif
+#ifdef __NR_unshare
+            __NR_unshare,
+#endif
+#ifdef __NR_setns
+            __NR_setns,
+#endif
+#ifdef __NR_personality
+            __NR_personality,
+#endif
+#ifdef __NR_process_vm_readv
+            __NR_process_vm_readv,
+#endif
+#ifdef __NR_process_vm_writev
+            __NR_process_vm_writev,
+#endif
+#ifdef __NR_lookup_dcookie
+            __NR_lookup_dcookie,
+#endif
+#ifdef __NR_perf_event_open
+            __NR_perf_event_open,
+#endif
+#ifdef __NR_open_by_handle_at
+            __NR_open_by_handle_at,
+#endif
+#ifdef __NR_fanotify_init
+            __NR_fanotify_init,
+#endif
+#ifdef __NR_quotactl
+            __NR_quotactl,
+#endif
+#ifdef __NR_nfsservctl
+            __NR_nfsservctl,
+#endif
+#ifdef __NR_ioprio_set
+            __NR_ioprio_set,
+#endif
+#ifdef __NR_nfsservctl
+            __NR_nfsservctl,
+#endif
+        };
+
+        for (int sys_nr : syscalls_to_block) {
+            if (sys_nr <= 0) continue;
+            blocked_syscalls.push_back(sys_nr);
+        }
 
         for (int sys_nr : blocked_syscalls) {
             filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)sys_nr, 0, 1));
@@ -232,9 +472,128 @@ public:
     }
 };
 
+bool parse_minisign_pub_file(const string& content, MinisignPublicKey& key) {
+    stringstream ss(content);
+    string line;
+    int line_num = 0;
+    while (getline(ss, line)) {
+        ++line_num;
+        if (line_num != 2) continue;
+        string b64 = line;
+        while (!b64.empty() && (b64.back() == '\r' || b64.back() == '\n')) b64.pop_back();
+        auto blob = base64_decode_buf(b64);
+        return parse_minisign_pub_blob(blob, key);
+    }
+    return false;
+}
 
-bool read_text_file(const string& path, string& content);
-bool write_text_file(const string& path, const string& content);
+bool parse_minisign_sig_file(const string& content, MinisignSignature& sig) {
+    stringstream ss(content);
+    string line;
+    vector<string> lines;
+    while (getline(ss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        lines.push_back(line);
+    }
+    if (lines.size() < 4) return false;
+    auto sig_blob = base64_decode_buf(lines[1]);
+    if (!parse_minisign_sig_blob(sig_blob, sig)) return false;
+    static const string trusted_prefix = "trusted comment: ";
+    if (lines[2].rfind(trusted_prefix, 0) != 0) return false;
+    sig.trusted_comment = lines[2].substr(trusted_prefix.size());
+    auto global_blob = base64_decode_buf(lines[3]);
+    if (global_blob.size() != 64) return false;
+    memcpy(sig.global_sig, global_blob.data(), 64);
+    return true;
+}
+
+bool verify_minisign_signature(const string& content, const MinisignSignature& sig, const MinisignPublicKey& key) {
+    if (memcmp(sig.key_id, key.key_id, 8) != 0) return false;
+
+    bool prehashed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'D');
+    bool raw_ed    = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'd');
+    if (!prehashed && !raw_ed) return false;
+
+    if (raw_ed) {
+        if (!verify_ed25519(reinterpret_cast<const unsigned char*>(content.data()),
+                            content.size(), sig.sig, key.pubkey)) {
+            return false;
+        }
+    } else {
+        unsigned char hash[64];
+        if (!compute_blake2b512(reinterpret_cast<const unsigned char*>(content.data()),
+                               content.size(), hash)) {
+            return false;
+        }
+        if (!verify_ed25519(hash, 64, sig.sig, key.pubkey)) {
+            return false;
+        }
+    }
+
+    vector<unsigned char> signed_comment;
+    signed_comment.reserve(64 + sig.trusted_comment.size());
+    signed_comment.insert(signed_comment.end(), sig.sig, sig.sig + 64);
+    signed_comment.insert(signed_comment.end(),
+                          sig.trusted_comment.begin(),
+                          sig.trusted_comment.end());
+
+    return verify_ed25519(signed_comment.data(), signed_comment.size(),
+                          sig.global_sig, key.pubkey);
+}
+
+vector<MinisignPublicKey> load_trusted_minisign_keys() {
+    vector<MinisignPublicKey> keys;
+    DIR* dir = opendir(WELD_TRUSTED_KEYS_DIR.c_str());
+    if (!dir) return keys;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        string name = entry->d_name;
+        if (name.size() < 5) continue;
+        if (name.substr(name.size() - 4) != ".pub") continue;
+        string path = WELD_TRUSTED_KEYS_DIR + "/" + name;
+        ifstream in(path);
+        if (!in) continue;
+        stringstream buf;
+        buf << in.rdbuf();
+        MinisignPublicKey key;
+        if (parse_minisign_pub_file(buf.str(), key)) keys.push_back(key);
+    }
+    closedir(dir);
+    return keys;
+}
+
+bool verify_repo_metadata_signature(const string& metadata, const string& sig_content,
+                                     string& trusted_comment_out, string& error_out) {
+    MinisignSignature sig;
+    if (!parse_minisign_sig_file(sig_content, sig)) {
+        error_out = "minisign signature is malformed";
+        return false;
+    }
+
+    vector<MinisignPublicKey> keys = load_trusted_minisign_keys();
+    if (keys.empty()) {
+        error_out = "no trusted minisign keys installed in " + WELD_TRUSTED_KEYS_DIR;
+        return false;
+    }
+
+    bool key_seen = false;
+    for (const auto& key : keys) {
+        if (memcmp(key.key_id, sig.key_id, 8) != 0) continue;
+        key_seen = true;
+        if (verify_minisign_signature(metadata, sig, key)) {
+            trusted_comment_out = sig.trusted_comment;
+            return true;
+        }
+    }
+
+    if (!key_seen) {
+        error_out = "no trusted key matches the signature key id " + hex_encode(sig.key_id, 8);
+    } else {
+        error_out = "signature verification failed for matched trusted key";
+    }
+    return false;
+}
+
 
 struct ConfigBackup {
     string os_release_orig;
@@ -293,7 +652,11 @@ struct WeldSource {
 struct WeldRepoMetadata {
     string base_url;
     string release;
+    string name;
+    string maintainer;
+    string trusted_comment;
     map<string, pair<string, string>> packages;
+    map<string, string> descriptions;
     vector<string> required_packages;
     map<string, string> replaces;
 };
@@ -307,6 +670,7 @@ struct WeldPackageCandidate {
     string sha256;
     string actual_pkg_name;
     string original_query_name;
+    string description;
     bool is_replacement = false;
 };
 
@@ -352,7 +716,7 @@ static string weld_arch() {
 }
 
 static string weld_version_str() {
-    return string("Weld 4.1 (") + weld_arch() + ")";
+    return string("Weld 4.2 (") + weld_arch() + ")";
 }
 
 void show_help() {
@@ -376,11 +740,7 @@ void show_help() {
 
     cout << hdr << "Query Commands:" << reset << "\n";
     cout << "  " << qx << "search" << reset << "        <term>      Search the package index (supports -p <page>)\n";
-#ifdef allow_weld_repositories
-    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin, version, and SHA256\n";
-#else
-    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin and version\n";
-#endif
+    cout << "  " << qx << "info" << reset << "          <pkg>       Show package origin, version and SHA256\n";
     cout << "  " << qx << "why" << reset << "           <pkg>       Show why a package is installed (reverse dependencies)\n";
     cout << "  " << qx << "depends" << reset << "       <pkg>       List a package's direct dependencies\n";
     cout << "  " << qx << "list" << reset << "                      List all installed packages\n\n";
@@ -390,10 +750,19 @@ void show_help() {
     cout << "  sync                      Refresh repository metadata (APT + Weld)\n";
     cout << "  clean                     Clear the APT and Weld package caches\n";
     cout << "  autoclean                 Remove obsolete packages from the APT and Weld caches\n\n";
+
+    cout << hdr << "Security:" << reset << "\n";
+    cout << "  Weld repositories are never trusted by default. Every repository\n";
+    cout << "  metadata must be accompanied by a minisign signature and verified\n";
+    cout << "  against the trusted keyring at " << WELD_TRUSTED_KEYS_DIR << ".\n\n";
 #else
     cout << "  sync                      Refresh APT repository metadata\n";
     cout << "  clean                     Clear the APT package cache\n";
     cout << "  autoclean                 Remove obsolete packages from the APT cache\n\n";
+
+    cout << hdr << "Security:" << reset << "\n";
+    cout << "  Weld repository support is not compiled in.\n";
+    cout << "  Rebuild with -Dallow_weld_repositories to enable Weld repos.\n\n";
 #endif
 
     cout << hdr << "Options:" << reset << "\n";
@@ -412,6 +781,35 @@ static bool wait_for_child(pid_t pid, int& status) {
         if (ret == -1 && errno == EINTR) continue;
         return false;
     }
+}
+
+static bool is_safe_argument(const string& arg) {
+    if (arg.empty()) return false;
+    if (arg[0] == '-') return false;
+    if (arg.find('\0') != string::npos) return false;
+    if (arg.find('\n') != string::npos) return false;
+    if (arg.find('\r') != string::npos) return false;
+    return true;
+}
+
+static bool is_safe_device_path(const string& path) {
+    if (path.empty()) return false;
+    if (path[0] != '/') return false;
+    if (path.find("..") != string::npos) return false;
+    if (path.find('\0') != string::npos) return false;
+    if (path.find('\n') != string::npos) return false;
+    if (path.size() > 4096) return false;
+    if (path.find(" ") != string::npos) return false;
+    if (path.find(";") != string::npos) return false;
+    if (path.find("|") != string::npos) return false;
+    if (path.find("&") != string::npos) return false;
+    if (path.find("$") != string::npos) return false;
+    if (path.find("`") != string::npos) return false;
+    if (path.find("()") != string::npos) return false;
+    if (path.find("<") != string::npos) return false;
+    if (path.find(">") != string::npos) return false;
+    if (path.find("\\") != string::npos) return false;
+    return true;
 }
 
 static void exec_abs_argv(const vector<char*>& argv_ptrs) {
@@ -498,6 +896,14 @@ static int exec_argv_devnull_out(const vector<string>& args) {
     return rc;
 }
 
+static int exec_argv_devnull_out_checked(const vector<string>& args) {
+    if (args.empty()) return 1;
+    for (const auto& a : args) {
+        if (!is_safe_argument(a)) return 1;
+    }
+    return exec_argv_devnull_out(args);
+}
+
 static string exec_argv_capture(const vector<string>& args) {
     if (args.empty()) return "";
 
@@ -539,14 +945,15 @@ static string exec_argv_capture(const vector<string>& args) {
 }
 
 bool create_snapshot(const string& name) {
+    if (name.empty() || name.find('/') != string::npos) return false;
     if (nf_tree_available()) {
-        if (exec_argv_devnull_out({NF_TREE_BIN, "create", name}) == 0) return true;
+        if (exec_argv_devnull_out_checked({NF_TREE_BIN, "create", name}) == 0) return true;
     }
     string root_dev = get_root_device();
     string vg_name = get_vg_name(root_dev);
-    if (!root_dev.empty() && !vg_name.empty()) {
+    if (!root_dev.empty() && !vg_name.empty() && is_safe_device_path(root_dev)) {
         string snap_name = name + "_" + to_string(time(nullptr));
-        return exec_argv_devnull_out({"lvcreate", "-s", "--name", snap_name, "-k", "n", root_dev}) == 0;
+        return exec_argv_devnull_out_checked({"lvcreate", "-s", "--name", snap_name, "-k", "n", root_dev}) == 0;
     }
     return false;
 }
@@ -599,15 +1006,53 @@ PrecheckResult precheck_transaction(const string& action, const vector<string>& 
     return has_changes ? PrecheckResult::Proceed : PrecheckResult::NoChanges;
 }
 
+static void bind_safe_dev_node(const string& host_path, const string& chroot_path, mode_t mode) {
+    error_code ec;
+    if (!fs::exists(host_path, ec)) return;
+    if (!fs::exists(chroot_path, ec)) {
+        if (!fs::create_directories(fs::path(chroot_path).parent_path(), ec)) return;
+        mknod(chroot_path.c_str(), mode | 0, 0);
+    }
+    exec_argv_devnull_out({"mount", "--bind", host_path, chroot_path});
+}
+
 void mount_fs() {
-    exec_argv_devnull_out({"mount", "--bind", "/dev",      TREE_ROOT + "/dev"});
-    exec_argv_devnull_out({"mount", "--bind", "/dev/pts",  TREE_ROOT + "/dev/pts"});
+    error_code ec;
+    fs::create_directories(TREE_ROOT + "/dev", ec);
+    fs::create_directories(TREE_ROOT + "/dev/pts", ec);
+
+    exec_argv_devnull_out({"mount", "-t", "devtmpfs", "-o", "nosuid,noexec,mode=755", "devtmpfs", TREE_ROOT + "/dev"});
+
+    bind_safe_dev_node("/dev/null",   TREE_ROOT + "/dev/null",   S_IFCHR | 0666);
+    bind_safe_dev_node("/dev/zero",   TREE_ROOT + "/dev/zero",   S_IFCHR | 0666);
+    bind_safe_dev_node("/dev/random",  TREE_ROOT + "/dev/random", S_IFCHR | 0666);
+    bind_safe_dev_node("/dev/urandom", TREE_ROOT + "/dev/urandom", S_IFCHR | 0666);
+    bind_safe_dev_node("/dev/full",   TREE_ROOT + "/dev/full",   S_IFCHR | 0666);
+    bind_safe_dev_node("/dev/tty",    TREE_ROOT + "/dev/tty",    S_IFCHR | 0666);
+
+    exec_argv_devnull_out({"mount", "-t", "devpts", "-o", "nosuid,noexec,mode=620,ptmxmode=666",
+                            "devpts", TREE_ROOT + "/dev/pts"});
+
+    exec_argv_devnull_out({"mount", "-t", "tmpfs", "-o", "nosuid,noexec,mode=755,size=512M",
+                            "tmpfs", TREE_ROOT + "/dev/shm"});
+
+    if (fs::exists("/dev/ptmx", ec)) {
+        if (!fs::exists(TREE_ROOT + "/dev/ptmx", ec)) mknod((TREE_ROOT + "/dev/ptmx").c_str(), S_IFCHR | 0666, 0);
+        exec_argv_devnull_out({"mount", "--bind", "/dev/ptmx", TREE_ROOT + "/dev/ptmx"});
+    }
+
     exec_argv_devnull_out({"mount", "--bind", "/proc",     TREE_ROOT + "/proc"});
+    exec_argv_devnull_out({"mount", "-o", "remount,nosuid,nodev,hidepid=2", TREE_ROOT + "/proc"});
     exec_argv_devnull_out({"mount", "--bind", "/sys",      TREE_ROOT + "/sys"});
+    exec_argv_devnull_out({"mount", "-o", "remount,ro,nosuid,nodev,noexec", TREE_ROOT + "/sys"});
+
+    exec_argv_devnull_out({"mount", "-t", "tmpfs", "tmpfs", TREE_ROOT + "/tmp",
+                            "-o", "mode=1777,nosuid,nodev,noexec,size=2G"});
+    exec_argv_devnull_out({"mount", "-t", "tmpfs", "tmpfs", TREE_ROOT + "/run",
+                            "-o", "mode=755,nosuid,nodev,noexec,size=512M"});
 
     string resolv_target = TREE_ROOT + "/etc/resolv.conf";
     if (!fs::exists("/etc/resolv.conf")) return;
-    error_code ec;
     if (!fs::exists(resolv_target, ec)) {
         ofstream touch(resolv_target);
     }
@@ -615,8 +1060,18 @@ void mount_fs() {
 }
 
 void umount_fs() {
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/run"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/tmp"});
     exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/etc/resolv.conf"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/shm"});
     exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/pts"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/ptmx"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/null"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/zero"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/random"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/urandom"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/full"});
+    exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/tty"});
     exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev"});
     exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/proc"});
     exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/sys"});
@@ -636,6 +1091,9 @@ static string get_root_device() {
     if (bracket != string::npos) out = out.substr(0, bracket);
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
         out.pop_back();
+    if (out.empty()) return "";
+    if (!is_safe_device_path(out)) return "";
+    if (out.find("/dev/") != 0) return "";
     return out;
 }
 
@@ -666,6 +1124,50 @@ static double get_vg_free_gb(const string& vg_name) {
 static string g_cached_root_dev;
 static string g_cached_vg_name;
 
+#ifndef _LINUX_CAPABILITY_VERSION_3
+#define _LINUX_CAPABILITY_VERSION_3 0x20080522
+#endif
+
+struct weld_cap_header {
+    uint32_t version;
+    int pid;
+};
+
+struct weld_cap_data {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+};
+
+static void drop_all_capabilities() {
+    struct weld_cap_header hdr;
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    struct weld_cap_data data[2];
+    memset(&data, 0, sizeof(data));
+    syscall(__NR_capset, &hdr, data);
+}
+
+static void apply_strict_resource_limits() {
+    struct rlimit rl;
+
+    rl.rlim_cur = 4096;
+    rl.rlim_max = 8192;
+    setrlimit(RLIMIT_NOFILE, &rl);
+
+    rl.rlim_cur = 8192;
+    rl.rlim_max = 16384;
+    setrlimit(RLIMIT_NPROC, &rl);
+
+    rl.rlim_cur = 16ULL * 1024 * 1024 * 1024;
+    rl.rlim_max = 32ULL * 1024 * 1024 * 1024;
+    setrlimit(RLIMIT_FSIZE, &rl);
+
+    rl.rlim_cur = 0;
+    rl.rlim_max = 0;
+    setrlimit(RLIMIT_CORE, &rl);
+}
+
 bool manage_sandbox(const string& action) {
     string root_dev = get_root_device();
     string vg_name = get_vg_name(root_dev);
@@ -676,11 +1178,12 @@ bool manage_sandbox(const string& action) {
 
     if (action == "create") {
         umount_fs();
-        exec_argv_devnull_out({"umount", "-l", TREE_ROOT});
-        exec_argv_devnull_out({"lvremove", "-f", snap_dev});
-        exec_argv_devnull_out({"mkdir", "-p", "/nsm/weld"});
+        exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT});
+        if (!snap_dev.empty() && is_safe_device_path(snap_dev))
+            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
+        exec_argv_devnull_out_checked({"mkdir", "-p", "/nsm/weld"});
 
-        if (root_dev.empty() || vg_name.empty()) {
+        if (root_dev.empty() || vg_name.empty() || !is_safe_device_path(root_dev)) {
             cout << "E: Unable to determine the root LVM device or volume group.\n";
             return false;
         }
@@ -688,7 +1191,7 @@ bool manage_sandbox(const string& action) {
         bool thin = is_lv_thin(root_dev);
         int rc;
         if (thin) {
-            rc = exec_argv_devnull_out({"lvcreate", "-s", "--name", snap_lv_name, "-k", "n", root_dev});
+            rc = exec_argv_devnull_out_checked({"lvcreate", "-s", "--name", snap_lv_name, "-k", "n", root_dev});
         } else {
             double free_gb = get_vg_free_gb(vg_name);
             if (free_gb < 1.0) {
@@ -700,7 +1203,7 @@ bool manage_sandbox(const string& action) {
             else if (free_gb >= 5.0) snap_size = "3G";
             else if (free_gb >= 2.0) snap_size = "1.5G";
 
-            rc = exec_argv_devnull_out({"lvcreate", "-L", snap_size, "-s", "--name", snap_lv_name, root_dev});
+            rc = exec_argv_devnull_out_checked({"lvcreate", "-L", snap_size, "-s", "--name", snap_lv_name, root_dev});
         }
 
         if (rc != 0) {
@@ -708,8 +1211,8 @@ bool manage_sandbox(const string& action) {
             return false;
         }
 
-        exec_argv_devnull_out({"lvchange", "-ay", "--ignoreactivationskip", snap_dev});
-        exec_argv_devnull_out({"udevadm", "settle"});
+        exec_argv_devnull_out_checked({"lvchange", "-ay", "--ignoreactivationskip", snap_dev});
+        exec_argv_devnull_out_checked({"udevadm", "settle"});
 
         struct stat dev_st;
         bool dev_ready = false;
@@ -720,25 +1223,25 @@ bool manage_sandbox(const string& action) {
 
         if (!dev_ready) {
             cout << "E: Snapshot device " << snap_dev << " did not become available in time.\n";
-            exec_argv_devnull_out({"lvremove", "-f", snap_dev});
+            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
             return false;
         }
 
-        exec_argv_devnull_out({"mkdir", "-p", TREE_ROOT});
+        exec_argv_devnull_out_checked({"mkdir", "-p", TREE_ROOT});
 
         string fstype = get_root_fstype();
         int mount_rc;
         if (fstype == "xfs") {
-            mount_rc = exec_argv_devnull_out({"mount", "-t", "xfs", "-o", "nouuid", snap_dev, TREE_ROOT});
-        } else if (!fstype.empty()) {
-            mount_rc = exec_argv_devnull_out({"mount", "-t", fstype, snap_dev, TREE_ROOT});
+            mount_rc = exec_argv_devnull_out_checked({"mount", "-t", "xfs", "-o", "nouuid", snap_dev, TREE_ROOT});
+        } else if (!fstype.empty() && fstype.find(',') == string::npos) {
+            mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, TREE_ROOT});
         } else {
-            mount_rc = exec_argv_devnull_out({"mount", snap_dev, TREE_ROOT});
+            mount_rc = exec_argv_devnull_out_checked({"mount", snap_dev, TREE_ROOT});
         }
 
         if (mount_rc != 0) {
             cout << "E: Unable to mount snapshot at " << TREE_ROOT << " (exit code " << mount_rc << ").\n";
-            exec_argv_devnull_out({"lvremove", "-f", snap_dev});
+            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
             return false;
         }
 
@@ -748,14 +1251,16 @@ bool manage_sandbox(const string& action) {
             return false;
         }
 
-        exec_argv_devnull_out({"mkdir", "-p", TREE_ROOT + "/tmp"});
+        exec_argv_devnull_out_checked({"mkdir", "-p", TREE_ROOT + "/tmp"});
+        exec_argv_devnull_out_checked({"chmod", "1777", TREE_ROOT + "/tmp"});
         sandbox_created_and_mounted.store(true);
         return true;
 
     } else if (action == "delete") {
         umount_fs();
-        exec_argv_devnull_out({"umount", "-l", TREE_ROOT});
-        exec_argv_devnull_out({"lvremove", "-f", snap_dev});
+        exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT});
+        if (!snap_dev.empty() && is_safe_device_path(snap_dev))
+            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
         sandbox_created_and_mounted.store(false);
         return true;
     }
@@ -765,8 +1270,18 @@ bool manage_sandbox(const string& action) {
 
 void cleanup_sandbox_on_exit() {
     if (sandbox_created_and_mounted.load()) {
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/run"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/tmp"});
         exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/etc/resolv.conf"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/shm"});
         exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/pts"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/ptmx"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/null"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/zero"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/random"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/urandom"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/full"});
+        exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev/tty"});
         exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/dev"});
         exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/proc"});
         exec_argv_devnull_out({"umount", "-l", TREE_ROOT + "/sys"});
@@ -1054,31 +1569,13 @@ string path_basename(const string& path) {
     return path.substr(pos + 1);
 }
 
+#ifdef allow_weld_repositories
 string normalize_weld_base_url(const string& raw_url) {
     string url = trim_copy(raw_url);
     if (url.find("http://") != 0 && url.find("https://") != 0)
         url = "https://" + url;
     while (!url.empty() && url.back() == '/') url.pop_back();
     return url;
-}
-
-bool is_repo_allowed(const string& url) {
-#ifdef allow_weld_repositories
-    (void)url;
-    return true;
-#else
-    return false;
-#endif
-}
-
-void print_weld_repo_warning(const string& url) {
-    if (is_repo_allowed(url)) return;
-    static set<string> warned_repos;
-    if (warned_repos.count(url)) return;
-    warned_repos.insert(url);
-    cout << "W: Repository not authenticated: " << url << "\n"
-         << "W: Packages originating from this source are unverified and may pose a security risk.\n"
-         << "W: Proceed only if this repository is trusted.\n";
 }
 
 bool parse_weld_source_line(const string& raw_line, WeldSource& source) {
@@ -1105,6 +1602,7 @@ void load_weld_sources_from_file(const string& path, vector<WeldSource>& sources
         if (parse_weld_source_line(line, source)) sources.push_back(source);
     }
 }
+#endif
 
 vector<WeldSource> load_weld_sources() {
 #ifndef allow_weld_repositories
@@ -1137,23 +1635,68 @@ vector<WeldSource> load_weld_sources() {
 }
 
 bool write_text_file(const string& path, const string& content) {
-    static std::atomic<uint64_t> seq{0};
-    string tmp_path = path + ".tmp." + to_string(getpid()) + "_" + to_string(seq.fetch_add(1));
-    {
-        ofstream out(tmp_path, ios::out | ios::trunc);
-        if (!out) return false;
-        out << content;
-        out.flush();
-        if (!out.good()) {
-            unlink(tmp_path.c_str());
-            return false;
-        }
-    }
-    if (rename(tmp_path.c_str(), path.c_str()) != 0) {
-        unlink(tmp_path.c_str());
+    string dir = path;
+    size_t slash = dir.find_last_of('/');
+    if (slash != string::npos) dir = dir.substr(0, slash);
+    else dir = ".";
+
+    char tmpl[4096];
+    int n = snprintf(tmpl, sizeof(tmpl), "%s/.weld_XXXXXX", dir.c_str());
+    if (n < 0 || static_cast<size_t>(n) >= sizeof(tmpl)) return false;
+
+    sigset_t old_mask, block_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGINT);
+    sigaddset(&block_mask, SIGTERM);
+    sigaddset(&block_mask, SIGQUIT);
+    sigaddset(&block_mask, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &block_mask, &old_mask);
+
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
         return false;
     }
-    return true;
+
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        unlink(tmpl);
+        pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+        return false;
+    }
+
+    bool write_ok = true;
+    if (!content.empty()) {
+        const char* data = content.data();
+        size_t remaining = content.size();
+        while (remaining > 0) {
+            ssize_t written = write(fd, data, remaining);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                write_ok = false;
+                break;
+            }
+            data += written;
+            remaining -= static_cast<size_t>(written);
+        }
+    }
+
+    if (fsync(fd) != 0) write_ok = false;
+
+    if (close(fd) != 0) write_ok = false;
+
+    if (!write_ok) {
+        unlink(tmpl);
+        pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+        return false;
+    }
+
+    bool renamed = (rename(tmpl, path.c_str()) == 0);
+    if (!renamed) {
+        unlink(tmpl);
+    }
+    pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+    return renamed;
 }
 
 bool read_text_file(const string& path, string& content) {
@@ -1165,123 +1708,348 @@ bool read_text_file(const string& path, string& content) {
     return true;
 }
 
-bool parse_weld_repo_metadata(const string& text, WeldRepoMetadata& metadata) {
+string strip_inline_comment(const string& line) {
+    string result;
+    result.reserve(line.size());
+    bool in_string = false;
+    char string_quote = '\0';
+    char prev = ' ';
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (in_string) {
+            result.push_back(c);
+            if (c == string_quote) in_string = false;
+        } else if (c == '"' || c == '\'') {
+            in_string = true;
+            string_quote = c;
+            result.push_back(c);
+        } else if (c == '#' && (i == 0 || prev == ' ' || prev == '\t')) {
+            break;
+        } else {
+            result.push_back(c);
+        }
+        prev = c;
+    }
+    return result;
+}
+
+string strip_quotes(const string& value) {
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        return value.substr(1, value.size() - 2);
+    }
+    if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
+}
+
+bool parse_weld_repo_metadata_v2(const string& text, WeldRepoMetadata& metadata, string& error_out) {
     metadata.packages.clear();
     metadata.required_packages.clear();
     metadata.replaces.clear();
-    string line;
-    bool in_packages = false;
-    bool in_required = false;
-    bool in_replaces = false;
+    metadata.descriptions.clear();
+    metadata.name.clear();
+    metadata.maintainer.clear();
+
+    enum class Section { None, RepoInfo, Packages, Replaces, Required };
+    Section current_section = Section::None;
+
+    bool seen_repoinfo = false;
+    bool seen_pkgs = false;
+    bool seen_replaces = false;
+    bool seen_required = false;
+
+    struct TempPkg {
+        string name;
+        string description;
+        string sha256;
+        string deb;
+    };
+    struct TempReplaces {
+        string name;
+        string replaces;
+    };
+    struct TempRequired {
+        string name;
+    };
+
+    TempPkg pending_pkg;
+    bool has_pending_pkg = false;
+    TempReplaces pending_rep;
+    bool has_pending_rep = false;
+    TempRequired pending_req;
+    bool has_pending_req = false;
+
+    string cur_repo_name;
+    string cur_repo_maintainer;
+    bool has_pending_repo = false;
+
+    auto flush_repo = [&]() -> bool {
+        if (!has_pending_repo) return true;
+        if (cur_repo_name.empty() && cur_repo_maintainer.empty()) {
+            has_pending_repo = false;
+            return true;
+        }
+        if (cur_repo_name.empty()) {
+            error_out = "repoinfo record missing required field: name";
+            return false;
+        }
+        if (cur_repo_maintainer.empty()) {
+            error_out = "repoinfo record missing required field: maintainer";
+            return false;
+        }
+        metadata.name = cur_repo_name;
+        metadata.maintainer = cur_repo_maintainer;
+        cur_repo_name.clear();
+        cur_repo_maintainer.clear();
+        has_pending_repo = false;
+        return true;
+    };
+
+    auto flush_pkg = [&]() -> bool {
+        if (!has_pending_pkg) return true;
+        if (pending_pkg.name.empty()) {
+            has_pending_pkg = false;
+            pending_pkg = TempPkg();
+            return true;
+        }
+        if (pending_pkg.sha256.empty()) {
+            error_out = "package record for '" + pending_pkg.name + "' missing required field: sha256";
+            return false;
+        }
+        if (pending_pkg.deb.empty()) {
+            error_out = "package record for '" + pending_pkg.name + "' missing required field: deb";
+            return false;
+        }
+        metadata.packages[pending_pkg.name] = {pending_pkg.deb, pending_pkg.sha256};
+        metadata.descriptions[pending_pkg.name] = pending_pkg.description;
+        pending_pkg = TempPkg();
+        has_pending_pkg = false;
+        return true;
+    };
+
+    auto flush_rep = [&]() -> bool {
+        if (!has_pending_rep) return true;
+        if (pending_rep.name.empty()) {
+            has_pending_rep = false;
+            pending_rep = TempReplaces();
+            return true;
+        }
+        if (pending_rep.replaces.empty()) {
+            error_out = "replaces record for '" + pending_rep.name + "' missing required field: replaces";
+            return false;
+        }
+        metadata.replaces[pending_rep.replaces] = pending_rep.name;
+        pending_rep = TempReplaces();
+        has_pending_rep = false;
+        return true;
+    };
+
+    auto flush_req = [&]() -> bool {
+        if (!has_pending_req) return true;
+        if (pending_req.name.empty()) {
+            has_pending_req = false;
+            pending_req = TempRequired();
+            return true;
+        }
+        metadata.required_packages.push_back(pending_req.name);
+        pending_req = TempRequired();
+        has_pending_req = false;
+        return true;
+    };
+
     stringstream ss(text);
-    while (getline(ss, line)) {
+    string raw_line;
+    while (getline(ss, raw_line)) {
+        string line = strip_inline_comment(raw_line);
         string trimmed = trim_copy(line);
-        if (trimmed.empty() || trimmed == "[weld repository]") continue;
-        if (starts_with(trimmed, "release=")) {
-            metadata.release = trim_copy(trimmed.substr(8));
+        if (trimmed.empty()) continue;
+
+        if (trimmed == "[repoinfo_st]") {
+            current_section = Section::RepoInfo;
+            has_pending_repo = false;
+            cur_repo_name.clear();
+            cur_repo_maintainer.clear();
+            seen_repoinfo = true;
             continue;
         }
-        if (trimmed == "packages:") { in_packages = true; in_required = false; in_replaces = false; continue; }
-        if (trimmed == "required:") { in_required = true; in_packages = false; in_replaces = false; continue; }
-        if (trimmed == "replaces:") { in_replaces = true; in_packages = false; in_required = false; continue; }
+        if (trimmed == "[repoinfo_fn]") {
+            if (current_section != Section::RepoInfo) {
+                error_out = "[repoinfo_fn] without matching [repoinfo_st]";
+                return false;
+            }
+            if (!flush_repo()) return false;
+            current_section = Section::None;
+            continue;
+        }
+        if (trimmed == "[pkgs_st]") {
+            current_section = Section::Packages;
+            has_pending_pkg = false;
+            pending_pkg = TempPkg();
+            seen_pkgs = true;
+            continue;
+        }
+        if (trimmed == "[pkgs_fn]") {
+            if (current_section != Section::Packages) {
+                error_out = "[pkgs_fn] without matching [pkgs_st]";
+                return false;
+            }
+            if (!flush_pkg()) return false;
+            current_section = Section::None;
+            continue;
+        }
+        if (trimmed == "[replaces_st]") {
+            current_section = Section::Replaces;
+            has_pending_rep = false;
+            pending_rep = TempReplaces();
+            seen_replaces = true;
+            continue;
+        }
+        if (trimmed == "[replaces_fn]") {
+            if (current_section != Section::Replaces) {
+                error_out = "[replaces_fn] without matching [replaces_st]";
+                return false;
+            }
+            if (!flush_rep()) return false;
+            current_section = Section::None;
+            continue;
+        }
+        if (trimmed == "[required_st]") {
+            current_section = Section::Required;
+            has_pending_req = false;
+            pending_req = TempRequired();
+            seen_required = true;
+            continue;
+        }
+        if (trimmed == "[required_fn]") {
+            if (current_section != Section::Required) {
+                error_out = "[required_fn] without matching [required_st]";
+                return false;
+            }
+            if (!flush_req()) return false;
+            current_section = Section::None;
+            continue;
+        }
 
-        if (in_required) {
-            size_t start = trimmed.find('{');
-            size_t end = trimmed.find('}');
-            if (start != string::npos && end != string::npos && end > start) {
-                string req_pkg = trim_copy(trimmed.substr(start + 1, end - start - 1));
-                if (!req_pkg.empty()) metadata.required_packages.push_back(req_pkg);
+        if (trimmed == "}") {
+            if (current_section == Section::RepoInfo) {
+                if (!flush_repo()) return false;
+                has_pending_repo = true;
+            } else if (current_section == Section::Packages) {
+                if (!flush_pkg()) return false;
+                has_pending_pkg = true;
+            } else if (current_section == Section::Replaces) {
+                if (!flush_rep()) return false;
+                has_pending_rep = true;
+            } else if (current_section == Section::Required) {
+                if (!flush_req()) return false;
+                has_pending_req = true;
             }
             continue;
         }
 
-        if (in_replaces) {
-            size_t pos = trimmed.find('=');
-            if (pos != string::npos) {
-                string orig_pkg = trim_copy(trimmed.substr(0, pos));
-                string rep_pkg = trim_copy(trimmed.substr(pos + 1));
-                if (!orig_pkg.empty() && !rep_pkg.empty()) {
-                    metadata.replaces[orig_pkg] = rep_pkg;
-                }
-            }
-            continue;
-        }
+        if (current_section == Section::None) continue;
 
-        if (in_packages) {
-            size_t pos = trimmed.find('=');
-            if (pos == string::npos) continue;
-            string pkg = trim_copy(trimmed.substr(0, pos));
-            string rest = trim_copy(trimmed.substr(pos + 1));
-            string file_name, hash;
+        size_t colon = trimmed.find(':');
+        if (colon == string::npos) continue;
 
-            size_t rep_pos = rest.find("replaces=");
-            if (rep_pos != string::npos) {
-                string rep_str = rest.substr(rep_pos + 9);
-                size_t rep_end = rep_str.find_first_of(" \t");
-                if (rep_end != string::npos) {
-                    rep_str = rep_str.substr(0, rep_end);
-                }
-                stringstream rep_ss(rep_str);
-                string rep_item;
-                while (getline(rep_ss, rep_item, ',')) {
-                    string clean_item = trim_copy(rep_item);
-                    if (!clean_item.empty()) {
-                        metadata.replaces[clean_item] = pkg;
-                    }
-                }
-                size_t remove_len = (rep_end != string::npos) ? (9 + rep_end) : string::npos;
-                rest = trim_copy(rest.substr(0, rep_pos) + " " + (remove_len != string::npos ? rest.substr(rep_pos + remove_len) : ""));
-            }
+        string key = trim_copy(trimmed.substr(0, colon));
+        string value = strip_quotes(trim_copy(trimmed.substr(colon + 1)));
 
-            size_t sha_pos = rest.find("sha256=");
-            if (sha_pos != string::npos) {
-                string sha_str = rest.substr(sha_pos + 7);
-                size_t sha_end = sha_str.find_first_of(" \t");
-                if (sha_end != string::npos) {
-                    hash = trim_copy(sha_str.substr(0, sha_end));
-                } else {
-                    hash = trim_copy(sha_str);
-                }
-                file_name = trim_copy(rest.substr(0, sha_pos));
-            } else {
-                file_name = rest;
-            }
-            if (!pkg.empty() && !file_name.empty())
-                metadata.packages[pkg] = {file_name, hash};
+        if (current_section == Section::RepoInfo) {
+            if (!has_pending_repo) continue;
+            if (key == "name") cur_repo_name = value;
+            else if (key == "maintainer") cur_repo_maintainer = value;
+        } else if (current_section == Section::Packages) {
+            if (!has_pending_pkg) continue;
+            if (key == "name") pending_pkg.name = value;
+            else if (key == "description") pending_pkg.description = value;
+            else if (key == "sha256") pending_pkg.sha256 = value;
+            else if (key == "deb") pending_pkg.deb = value;
+        } else if (current_section == Section::Replaces) {
+            if (!has_pending_rep) continue;
+            if (key == "name") pending_rep.name = value;
+            else if (key == "replaces") pending_rep.replaces = value;
+        } else if (current_section == Section::Required) {
+            if (!has_pending_req) continue;
+            if (key == "name") pending_req.name = value;
         }
     }
-    return !metadata.release.empty();
+
+    if (!seen_repoinfo) {
+        error_out = "missing [repoinfo_st]/[repoinfo_fn] section";
+        return false;
+    }
+    if (!seen_pkgs) {
+        error_out = "missing [pkgs_st]/[pkgs_fn] section";
+        return false;
+    }
+    if (!seen_replaces) {
+        error_out = "missing [replaces_st]/[replaces_fn] section";
+        return false;
+    }
+    if (!seen_required) {
+        error_out = "missing [required_st]/[required_fn] section";
+        return false;
+    }
+    if (metadata.name.empty() || metadata.maintainer.empty()) {
+        error_out = "repoinfo record missing required fields (name, maintainer)";
+        return false;
+    }
+    return true;
 }
+
+constexpr size_t WELD_MAX_METADATA_SIZE = 8 * 1024 * 1024;
+constexpr size_t WELD_MAX_DOWNLOAD_SIZE = 1024ULL * 1024 * 1024;
+
+struct CurlStringCtx {
+    string* dest;
+    size_t max_size;
+    bool overflow = false;
+};
 
 size_t curl_string_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     size_t total = size * nmemb;
-    static_cast<string*>(userdata)->append(ptr, total);
+    CurlStringCtx* ctx = static_cast<CurlStringCtx*>(userdata);
+    if (ctx->dest->size() + total > ctx->max_size) {
+        ctx->overflow = true;
+        return 0;
+    }
+    ctx->dest->append(ptr, total);
     return total;
 }
 
-string curl_fetch_string(const string& url, const string& user_agent = "", long timeout_sec = 30) {
+string curl_fetch_string(const string& url, const string& user_agent = "", long timeout_sec = 30,
+                          size_t max_size = WELD_MAX_METADATA_SIZE) {
     if (url.empty()) return "";
     size_t start = url.find_first_not_of(" \n\r\t");
     string norm_url = (start == string::npos) ? "" : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
     if (norm_url.empty() || norm_url.front() == '-') return "";
+    if (norm_url.find("https://") != 0) return "";
+    if (norm_url.size() > 4096) return "";
 
     CURL* curl = curl_easy_init();
     if (!curl) return "";
 
     string response;
+    CurlStringCtx ctx{&response, max_size, false};
     curl_easy_setopt(curl, CURLOPT_URL, norm_url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_string_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_PIPEWAIT, 0L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.1");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.2");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -1290,6 +2058,7 @@ string curl_fetch_string(const string& url, const string& user_agent = "", long 
     curl_easy_cleanup(curl);
 
     if (res != CURLE_OK || response_code != 200) return "";
+    if (ctx.overflow) return "";
     return response;
 }
 
@@ -1300,6 +2069,7 @@ size_t curl_file_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) 
 
 bool curl_download_file(const string& url, const string& dest_path, const string& user_agent = "") {
     if (url.empty() || dest_path.empty()) return false;
+    if (url.find("https://") != 0) return false;
 
     FILE* fp = fopen(dest_path.c_str(), "wb");
     if (!fp) return false;
@@ -1315,15 +2085,17 @@ bool curl_download_file(const string& url, const string& dest_path, const string
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_file_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.1");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.2");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -1355,19 +2127,50 @@ bool sync_weld_metadata() {
     if (sources.empty()) return true;
 
     exec_argv_devnull_out({"mkdir", "-p", WELD_ETC_DIR});
+    exec_argv_devnull_out({"mkdir", "-p", WELD_TRUSTED_KEYS_DIR});
+
+    vector<MinisignPublicKey> trusted_keys = load_trusted_minisign_keys();
+    if (trusted_keys.empty()) {
+        cout << "E: No trusted minisign keys found in " << WELD_TRUSTED_KEYS_DIR << ".\n";
+        cout << "E: Weld refuses to operate without a configured trust anchor.\n";
+        return false;
+    }
 
     vector<future<bool>> futures;
     futures.reserve(sources.size());
 
     for (const auto& source : sources) {
         futures.push_back(std::async(std::launch::async, [source]() -> bool {
-            print_weld_repo_warning(source.base_url);
-            string url = source.base_url + "/releases/" + source.release + "/repo-metadata";
-            string metadata = curl_fetch_string(url);
+            string meta_url = source.base_url + "/releases/" + source.release + "/repo-metadata";
+            string sig_url  = meta_url + ".minisig";
+
+            safe_log("Fetching metadata: ", meta_url, "\n");
+            string metadata = curl_fetch_string(meta_url);
             if (metadata.empty()) {
-                safe_log("Failed to fetch metadata: ", url, "\n");
+                safe_log("E: Failed to fetch metadata from ", meta_url, "\n");
                 return false;
             }
+
+            safe_log("Fetching signature: ", sig_url, "\n");
+            string signature = curl_fetch_string(sig_url);
+            if (signature.empty()) {
+                safe_log("E: Repository ", source.base_url,
+                         " is missing its minisign signature at ", sig_url, "\n");
+                safe_log("E: Weld refuses to trust unsigned repository metadata.\n");
+                return false;
+            }
+
+            string trusted_comment;
+            string verify_err;
+            if (!verify_repo_metadata_signature(metadata, signature, trusted_comment, verify_err)) {
+                safe_log("E: Signature verification failed for ", source.base_url,
+                         ": ", verify_err, "\n");
+                safe_log("E: Weld refuses to use this repository.\n");
+                return false;
+            }
+
+            safe_log("Signature verified for ", source.base_url, " (", trusted_comment, ")\n");
+
             string safe_release = sanitize_filename(source.release);
             string release_dir = WELD_ETC_DIR + "/" + safe_release;
             if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) {
@@ -1379,7 +2182,13 @@ bool sync_weld_metadata() {
                 safe_log("Failed to write metadata: ", output_path, "\n");
                 return false;
             }
-            safe_log("Synced metadata for ", source.release, " (", format_bytes(metadata.size()), ") from ", source.base_url, "\n");
+            string sig_output_path = release_dir + "/repo-metadata.minisig";
+            if (!write_text_file(sig_output_path, signature)) {
+                safe_log("Failed to write signature: ", sig_output_path, "\n");
+                return false;
+            }
+            safe_log("Synced metadata for ", source.release, " (",
+                     format_bytes(metadata.size()), ") from ", source.base_url, "\n");
             return true;
         }));
     }
@@ -1632,14 +2441,40 @@ vector<WeldRepoMetadata> load_cached_weld_metadata() {
 #else
     vector<WeldRepoMetadata> repos;
     vector<WeldSource> sources = load_weld_sources();
+    vector<MinisignPublicKey> trusted_keys = load_trusted_minisign_keys();
+    if (trusted_keys.empty()) return repos;
+
     for (const auto& source : sources) {
         string path = WELD_ETC_DIR + "/" + sanitize_filename(source.release) + "/repo-metadata";
         string content;
         if (!read_text_file(path, content)) continue;
+
+        string sig_path = WELD_ETC_DIR + "/" + sanitize_filename(source.release) + "/repo-metadata.minisig";
+        string sig_content;
+        if (!read_text_file(sig_path, sig_content)) {
+            cout << "E: Repository " << source.base_url
+                 << " is missing its minisign signature file. Refusing to load.\n";
+            continue;
+        }
+
+        string trusted_comment;
+        string verify_err;
+        if (!verify_repo_metadata_signature(content, sig_content, trusted_comment, verify_err)) {
+            cout << "E: Cached signature for " << source.base_url
+                 << " is invalid: " << verify_err << ". Refusing to load.\n";
+            continue;
+        }
+
         WeldRepoMetadata metadata;
         metadata.base_url = source.base_url;
         metadata.release = source.release;
-        if (!parse_weld_repo_metadata(content, metadata)) continue;
+        metadata.trusted_comment = trusted_comment;
+        string parse_err;
+        if (!parse_weld_repo_metadata_v2(content, metadata, parse_err)) {
+            cout << "E: Metadata for " << source.base_url
+                 << " is malformed: " << parse_err << ". Refusing to load.\n";
+            continue;
+        }
         if (metadata.release.empty()) metadata.release = source.release;
         repos.push_back(metadata);
     }
@@ -1707,6 +2542,7 @@ WeldPackageCandidate find_best_weld_candidate(const vector<WeldRepoMetadata>& re
         candidate.actual_pkg_name = pkg_name;
         candidate.original_query_name = pkg_name;
         candidate.is_replacement = false;
+        candidate.description = repo.descriptions.count(pkg_name) ? repo.descriptions.at(pkg_name) : "";
         candidate.version = extract_weld_version(pkg_name, candidate.file_name);
         if (!best.found || compare_versions(candidate.version, best.version) > 0)
             best = candidate;
@@ -1730,6 +2566,7 @@ WeldPackageCandidate find_best_weld_candidate(const vector<WeldRepoMetadata>& re
         candidate.actual_pkg_name = target_weld_pkg;
         candidate.original_query_name = pkg_name;
         candidate.is_replacement = true;
+        candidate.description = repo.descriptions.count(target_weld_pkg) ? repo.descriptions.at(target_weld_pkg) : "";
         candidate.version = extract_weld_version(target_weld_pkg, candidate.file_name);
         if (!best.found || compare_versions(candidate.version, best.version) > 0)
             best = candidate;
@@ -1741,30 +2578,67 @@ WeldPackageCandidate find_best_weld_candidate(const vector<WeldRepoMetadata>& re
 string build_weld_download_url(const WeldPackageCandidate& candidate) {
     string file_name = trim_copy(candidate.file_name);
     while (!file_name.empty() && file_name.front() == '/') file_name.erase(file_name.begin());
+    size_t pos = 0;
+    while ((pos = file_name.find("..", pos)) != string::npos) {
+        file_name.erase(pos, 2);
+    }
+    while (!file_name.empty() && file_name.front() == '/') file_name.erase(file_name.begin());
     return candidate.base_url + "/releases/" + candidate.release + "/" + file_name;
 }
 
 bool cache_weld_package(const WeldPackageCandidate& candidate, string& local_path) {
 #ifndef allow_weld_repositories
-    (void)candidate; (void)local_path;
+    (void)candidate;
+    (void)local_path;
     return false;
 #else
     string safe_release = sanitize_filename(candidate.release);
     string safe_file = sanitize_filename(candidate.file_name);
+    if (safe_release.empty() || safe_file.empty()) return false;
     string release_dir = WELD_CACHE_DIR + "/" + safe_release;
     if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) return false;
     local_path = release_dir + "/" + safe_file;
     string url = build_weld_download_url(candidate);
     if (url.empty() || url.front() == '-') return false;
+    if (url.find("https://") != 0) return false;
     return curl_download_file(url, local_path);
 #endif
 }
 
 string calculate_sha256(const string& file_path) {
-    string out = exec_argv_capture({"sha256sum", file_path});
-    size_t space_pos = out.find(' ');
-    if (space_pos != string::npos) return out.substr(0, space_pos);
-    return trim_copy(out);
+    ifstream in(file_path, ios::binary);
+    if (!in) return "";
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return "";
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return "";
+    }
+
+    char buf[65536];
+    bool failed = false;
+    while (in) {
+        in.read(buf, sizeof(buf));
+        streamsize got = in.gcount();
+        if (got > 0) {
+            if (EVP_DigestUpdate(ctx, buf, static_cast<size_t>(got)) != 1) {
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    string result;
+    if (!failed) {
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int hash_len = 0;
+        if (EVP_DigestFinal_ex(ctx, hash, &hash_len) == 1 && hash_len > 0) {
+            result = hex_encode(hash, hash_len);
+        }
+    }
+    EVP_MD_CTX_free(ctx);
+    return result;
 }
 
 struct PendingWeldDownload {
@@ -1784,7 +2658,6 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
 
     for (size_t t = 0; t < num_threads; ++t) {
         workers.emplace_back([&]() {
-            curl_global_init(CURL_GLOBAL_DEFAULT);
             while (true) {
                 size_t idx = current_index.fetch_add(1);
                 if (idx >= pending_weld_downloads.size()) break;
@@ -1835,7 +2708,6 @@ static bool download_weld_packages(vector<PendingWeldDownload>& pending_weld_dow
                 }
                 pending.success = true;
             }
-            curl_global_cleanup();
         });
     }
 
@@ -1913,7 +2785,6 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
         }
 
         if (use_weld) {
-            print_weld_repo_warning(weld_candidate.base_url);
             AptPackageState target_apt_state = (weld_candidate.is_replacement)
                 ? get_apt_package_state(cache_file, weld_candidate.actual_pkg_name)
                 : apt_state;
@@ -2100,13 +2971,23 @@ void do_nflinux_upgrade(bool apply_host, const string& arv_version) {
         if (comma != string::npos) {
             string weld_code = trim_copy(codenames.substr(0, comma));
             string debian_code = trim_copy(codenames.substr(comma + 1));
-            string base_repo_url = "https://nextferretdur.github.io/repo-nflinux-" + repo_number_str;
+            string base_repo_url = "https://thearvorindex.github.io/repo-arvorlinux--" + repo_number_str;
             string meta_url = base_repo_url + "/releases/" + weld_code + "/repo-metadata";
-            if (!curl_fetch_string(meta_url).empty()) {
-                weld_sources = "deb " + base_repo_url + " " + weld_code + "\n";
-                apt_sources = "deb http://deb.debian.org/debian " + debian_code + " main contrib non-free non-free-firmware\n";
-                apt_sources += "deb http://deb.debian.org/debian-security " + debian_code + "-security main contrib non-free non-free-firmware\n";
-                apt_sources += "deb http://deb.debian.org/debian " + debian_code + "-updates main contrib non-free non-free-firmware\n";
+            string sig_url  = meta_url + ".minisig";
+            string meta = curl_fetch_string(meta_url);
+            string sig  = curl_fetch_string(sig_url);
+            if (!meta.empty() && !sig.empty()) {
+                string tc;
+                string err;
+                if (verify_repo_metadata_signature(meta, sig, tc, err)) {
+                    weld_sources = "deb " + base_repo_url + " " + weld_code + "\n";
+                    apt_sources = "deb http://deb.debian.org/debian " + debian_code + " main contrib non-free non-free-firmware\n";
+                    apt_sources += "deb http://deb.debian.org/debian-security " + debian_code + "-security main contrib non-free non-free-firmware\n";
+                    apt_sources += "deb http://deb.debian.org/debian " + debian_code + "-updates main contrib non-free non-free-firmware\n";
+                } else {
+                    cout << "E: Refusing to switch to release " << weld_code
+                         << " because its signature could not be verified: " << err << "\n";
+                }
             }
         }
     }
@@ -2177,6 +3058,26 @@ void perform_transaction_argv(const string& action, const vector<string>& target
         cerr.flush();
         pid_t pid = fork();
         if (pid == 0) {
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+                if (have_err) {
+                    const char* msg = "prctl NO_NEW_PRIVS failed\n";
+                    ssize_t written = write(err_pipe[1], msg, strlen(msg));
+                    (void)written;
+                }
+                _exit(1);
+            }
+
+            if (unshare(CLONE_NEWNS) != 0) {
+                if (have_err) {
+                    const char* msg = "unshare mount namespace failed\n";
+                    ssize_t written = write(err_pipe[1], msg, strlen(msg));
+                    (void)written;
+                }
+                _exit(1);
+            }
+
+            drop_all_capabilities();
+
             if (chroot(TREE_ROOT.c_str()) != 0 || chdir("/") != 0) {
                 if (have_err) {
                     const char* msg = "chroot/chdir failed\n";
@@ -2185,6 +3086,10 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                 }
                 _exit(1);
             }
+
+            drop_all_capabilities();
+
+            apply_strict_resource_limits();
 
             {
                 string seccomp_err;
@@ -2648,6 +3553,7 @@ int show_package_info(const string& pkg_name) {
 
     string cyan_bold = "\033[1;36m";
     string green = "\033[1;32m";
+    string dim = "\033[2m";
     string reset = "\033[0m";
 
     cout << cyan_bold << "Package Information: " << pkg_name << reset << "\n";
@@ -2663,6 +3569,17 @@ int show_package_info(const string& pkg_name) {
         cout << "Source:       " << weld_cand.base_url << " (" << weld_cand.release << ")\n";
         cout << "Version:      " << weld_cand.version << "\n";
         cout << "SHA256:       " << (weld_cand.sha256.empty() ? "None" : weld_cand.sha256) << "\n";
+        if (!weld_cand.description.empty()) {
+            cout << "Description: " << weld_cand.description << "\n";
+        }
+        for (const auto& repo : repos) {
+            if (repo.base_url == weld_cand.base_url && repo.release == weld_cand.release) {
+                if (!repo.name.empty()) cout << "Repo Name:   " << repo.name << "\n";
+                if (!repo.maintainer.empty()) cout << "Maintainer:  " << repo.maintainer << "\n";
+                if (!repo.trusted_comment.empty()) cout << "Signature:   " << dim << "verified" << reset << " (" << repo.trusted_comment << ")\n";
+                break;
+            }
+        }
     } else if (apt_state.found && !apt_state.candidate_version.empty()) {
         cout << "Version:      " << apt_state.candidate_version << "\n";
     }
@@ -2829,6 +3746,8 @@ void do_transaction_rollback() {
 int main(int argc, char** argv) {
     setup_safety_handlers();
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    ERR_load_crypto_strings();
+    OpenSSL_add_all_digests();
     pkgInitConfig(*_config);
     pkgInitSystem(*_config, _system);
     string command;
@@ -2882,7 +3801,8 @@ int main(int argc, char** argv) {
             _error->DumpErrors();
         }
         bool weld_ok = sync_weld_metadata();
-        return (apt_ok && weld_ok) ? 0 : 1;
+        if (!apt_ok || !weld_ok) return 1;
+        return 0;
     } else if (command == "clean") {
         return clean_weld_cache() ? 0 : 1;
     } else if (command == "autoclean") {
@@ -2912,5 +3832,7 @@ int main(int argc, char** argv) {
     }
 
     curl_global_cleanup();
+    EVP_cleanup();
+    ERR_free_strings();
     return 0;
 }
