@@ -135,6 +135,12 @@
 #ifndef CLONE_NEWNS
 #define CLONE_NEWNS 0x00020000
 #endif
+#ifndef CLONE_NEWUTS
+#define CLONE_NEWUTS 0x04000000
+#endif
+#ifndef CLONE_NEWIPC
+#define CLONE_NEWIPC 0x08000000
+#endif
 
 #ifdef arvor_version
 #define ARVOR_VERSION arvor_version
@@ -155,6 +161,8 @@ const string WELD_SOURCES_DIR         = "/etc/weld/sources.list.d";
 const string WELD_CACHE_DIR           = "/etc/weld/cache";
 const string WELD_TRUSTED_KEYS_DIR     = "/etc/weld/trusted_keys";
 
+static const size_t WELD_MIN_MEM_MB = 256;
+
 static bool assume_yes = false;
 static std::atomic<bool> sandbox_created_and_mounted(false);
 
@@ -163,6 +171,7 @@ static string get_root_fstype();
 static string get_vg_name(const string& lv_path);
 static bool is_lv_thin(const string& lv_path);
 static double get_vg_free_gb(const string& vg_name);
+static long do_pivot_root(const char* new_root, const char* put_old);
 
 namespace {
 
@@ -187,10 +196,7 @@ bool compute_blake2b512(const unsigned char* data, size_t len, unsigned char out
     if (!ctx) return false;
     bool ok = false;
     const EVP_MD* md = EVP_blake2b512();
-    if (!md) {
-        EVP_MD_CTX_free(ctx);
-        return false;
-    }
+    if (!md) { EVP_MD_CTX_free(ctx); return false; }
     if (EVP_DigestInit_ex(ctx, md, NULL) == 1) {
         if (EVP_DigestUpdate(ctx, data, len) == 1) {
             unsigned int out_len = 0;
@@ -441,9 +447,6 @@ public:
 #endif
 #ifdef __NR_ioprio_set
             __NR_ioprio_set,
-#endif
-#ifdef __NR_nfsservctl
-            __NR_nfsservctl,
 #endif
         };
 
@@ -785,7 +788,6 @@ static bool wait_for_child(pid_t pid, int& status) {
 
 static bool is_safe_argument(const string& arg) {
     if (arg.empty()) return false;
-    if (arg[0] == '-') return false;
     if (arg.find('\0') != string::npos) return false;
     if (arg.find('\n') != string::npos) return false;
     if (arg.find('\r') != string::npos) return false;
@@ -842,8 +844,8 @@ static int exec_argv(const vector<string>& args, int stdout_fd = -1, int stderr_
             dup2(stdout_fd, STDOUT_FILENO);
         if (stderr_fd >= 0 && stderr_fd != STDERR_FILENO)
             dup2(stderr_fd, STDERR_FILENO);
-        if (extra_fd >= 0 && extra_fd != 3) {
-            dup2(extra_fd, 3);
+        if (extra_fd >= 0) {
+            if (extra_fd != 3) dup2(extra_fd, 3);
             fcntl(3, F_SETFD, 0);
         }
 
@@ -953,6 +955,9 @@ bool create_snapshot(const string& name) {
     string vg_name = get_vg_name(root_dev);
     if (!root_dev.empty() && !vg_name.empty() && is_safe_device_path(root_dev)) {
         string snap_name = name + "_" + to_string(time(nullptr));
+        if (is_lv_thin(root_dev)) {
+            return exec_argv_devnull_out_checked({"lvcreate", "-s", "-k", "n", "--name", snap_name, root_dev}) == 0;
+        }
         return exec_argv_devnull_out_checked({"lvcreate", "-s", "--name", snap_name, "-k", "n", root_dev}) == 0;
     }
     return false;
@@ -1148,6 +1153,31 @@ static void drop_all_capabilities() {
     syscall(__NR_capset, &hdr, data);
 }
 
+static long do_pivot_root(const char* new_root, const char* put_old) {
+    return syscall(__NR_pivot_root, new_root, put_old);
+}
+
+static bool check_system_memory(size_t min_mb) {
+    ifstream f("/proc/meminfo");
+    if (!f) return true;
+    string line;
+    while (getline(f, line)) {
+        if (line.rfind("MemAvailable:", 0) != 0) continue;
+        istringstream iss(line.substr(13));
+        unsigned long kb = 0;
+        iss >> kb;
+        unsigned long mb = kb / 1024;
+        if (mb < min_mb) {
+            cout << "W: Insufficient system memory. Available: " << mb
+                 << " MB, minimum required: " << min_mb << " MB.\n";
+            cout << "W: Transaction aborted to prevent system instability.\n";
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
 static void apply_strict_resource_limits() {
     struct rlimit rl;
 
@@ -1191,11 +1221,14 @@ bool manage_sandbox(const string& action) {
         bool thin = is_lv_thin(root_dev);
         int rc;
         if (thin) {
-            rc = exec_argv_devnull_out_checked({"lvcreate", "-s", "--name", snap_lv_name, "-k", "n", root_dev});
+            rc = exec_argv_devnull_out_checked({"lvcreate", "-s", "-k", "n", "--name", snap_lv_name, root_dev});
         } else {
+            cout << "W: Root logical volume is not thin-provisioned.\n";
+            cout << "W: Falling back to thick snapshot. Free VG space will be consumed.\n";
             double free_gb = get_vg_free_gb(vg_name);
             if (free_gb < 1.0) {
-                cout << "E: Insufficient free space in volume group: 1 GB required, " << free_gb << " GB available.\n";
+                cout << "E: Insufficient free space in volume group: 1 GB required, "
+                     << free_gb << " GB available.\n";
                 return false;
             }
             string snap_size = "1G";
@@ -1247,7 +1280,7 @@ bool manage_sandbox(const string& action) {
 
         struct stat st;
         if (stat(TREE_ROOT.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-            cout << "E: Chroot root " << TREE_ROOT << " was not created.\n";
+            cout << "E: Sandbox root " << TREE_ROOT << " was not created.\n";
             return false;
         }
 
@@ -1387,6 +1420,25 @@ bool ends_with(const string& value, const string& suffix) {
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+string render_sync_progress(int percentage, const string& label) {
+    if (percentage < 0) percentage = 0;
+    if (percentage > 100) percentage = 100;
+    const int total_width = 60;
+    string prefix = label + " ";
+    string pct = to_string(percentage) + "%";
+    while (pct.size() < 4) pct = " " + pct;
+    int bar_width = total_width - static_cast<int>(prefix.size()) - static_cast<int>(pct.size()) - 1;
+    if (bar_width < 1) bar_width = 1;
+    int filled = (percentage * bar_width) / 100;
+    string bar;
+    bar.reserve(bar_width);
+    for (int i = 0; i < filled; ++i) bar += '-';
+    for (int i = filled; i < bar_width; ++i) bar += ' ';
+    ostringstream oss;
+    oss << "\r" << prefix << bar << " " << pct;
+    return oss.str();
+}
+
 class WeldAcquireStatus final : public pkgAcquireStatus {
     int fd;
     bool show_host;
@@ -1404,7 +1456,7 @@ public:
             ssize_t written = write(fd, line.c_str(), line.size());
             (void)written;
         } else if (show_host && pct != last_shown) {
-            cout << "\rDownloading " << label << ": " << pct << "%   " << flush;
+            cout << render_sync_progress(pct, label) << flush;
             last_shown = pct;
         }
         return true;
@@ -1412,6 +1464,27 @@ public:
     void Stop() override {
         pkgAcquireStatus::Stop();
         if (fd < 0 && show_host) cout << "\n";
+    }
+};
+
+class WeldSyncStatus final : public pkgAcquireStatus {
+    string label;
+    int last_pct = -1;
+public:
+    explicit WeldSyncStatus(string label_) : label(std::move(label_)) {}
+    bool MediaChange(string, string) override { return false; }
+    bool Pulse(pkgAcquire* owner) override {
+        pkgAcquireStatus::Pulse(owner);
+        int pct = static_cast<int>(Percent);
+        if (pct != last_pct) {
+            cout << render_sync_progress(pct, label) << flush;
+            last_pct = pct;
+        }
+        return true;
+    }
+    void Stop() override {
+        pkgAcquireStatus::Stop();
+        cout << render_sync_progress(100, label) << "\n";
     }
 };
 
@@ -1448,6 +1521,7 @@ bool run_libapt_transaction(const string& action, const vector<string>& targets,
                              int status_fd, bool quiet) {
     if (status_fd >= 0) _config->Set("APT::Status-Fd", status_fd);
     _config->Set("Dpkg::Use-Pty", "false");
+    _config->Set("APT::Sandbox::User", "root");
 
     pkgCacheFile cache_file;
     pkgSourceList* src_list = cache_file.GetSourceList();
@@ -2132,63 +2206,78 @@ bool sync_weld_metadata() {
     vector<MinisignPublicKey> trusted_keys = load_trusted_minisign_keys();
     if (trusted_keys.empty()) {
         cout << "E: No trusted minisign keys found in " << WELD_TRUSTED_KEYS_DIR << ".\n";
-        cout << "E: Weld refuses to operate without a configured trust anchor.\n";
+        cout << "E: To enable Weld repositories, install a valid '*.pub' keyring and run 'weld sync' again.\n";
         return false;
     }
+
+    atomic<int> completed(0);
+    int total = static_cast<int>(sources.size());
+    safe_log(render_sync_progress(0, "Syncing Weld Repositories"));
 
     vector<future<bool>> futures;
     futures.reserve(sources.size());
 
     for (const auto& source : sources) {
-        futures.push_back(std::async(std::launch::async, [source]() -> bool {
+        futures.push_back(std::async(std::launch::async, [source, &completed, total]() -> bool {
             string meta_url = source.base_url + "/releases/" + source.release + "/repo-metadata";
             string sig_url  = meta_url + ".minisig";
 
-            safe_log("Fetching metadata: ", meta_url, "\n");
             string metadata = curl_fetch_string(meta_url);
             if (metadata.empty()) {
-                safe_log("E: Failed to fetch metadata from ", meta_url, "\n");
+                safe_log("\nE: Failed to fetch repository metadata from ", meta_url, "\n");
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
                 return false;
             }
 
-            safe_log("Fetching signature: ", sig_url, "\n");
             string signature = curl_fetch_string(sig_url);
             if (signature.empty()) {
-                safe_log("E: Repository ", source.base_url,
-                         " is missing its minisign signature at ", sig_url, "\n");
+                safe_log("\nE: Repository ", source.base_url, " is missing its minisign signature.\n");
+                safe_log("E: Expected signature file: ", sig_url, "\n");
                 safe_log("E: Weld refuses to trust unsigned repository metadata.\n");
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
                 return false;
             }
 
             string trusted_comment;
             string verify_err;
             if (!verify_repo_metadata_signature(metadata, signature, trusted_comment, verify_err)) {
-                safe_log("E: Signature verification failed for ", source.base_url,
-                         ": ", verify_err, "\n");
+                safe_log("\nE: Signature verification failed for ", source.base_url, ": ", verify_err, "\n");
                 safe_log("E: Weld refuses to use this repository.\n");
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
                 return false;
             }
-
-            safe_log("Signature verified for ", source.base_url, " (", trusted_comment, ")\n");
 
             string safe_release = sanitize_filename(source.release);
             string release_dir = WELD_ETC_DIR + "/" + safe_release;
             if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) {
-                safe_log("Failed to create metadata directory: ", release_dir, "\n");
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
                 return false;
             }
             string output_path = release_dir + "/repo-metadata";
             if (!write_text_file(output_path, metadata)) {
-                safe_log("Failed to write metadata: ", output_path, "\n");
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
                 return false;
             }
             string sig_output_path = release_dir + "/repo-metadata.minisig";
             if (!write_text_file(sig_output_path, signature)) {
-                safe_log("Failed to write signature: ", sig_output_path, "\n");
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
                 return false;
             }
-            safe_log("Synced metadata for ", source.release, " (",
-                     format_bytes(metadata.size()), ") from ", source.base_url, "\n");
+            int done = completed.fetch_add(1) + 1;
+            int pct = (done * 100) / total;
+            safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
             return true;
         }));
     }
@@ -2197,6 +2286,7 @@ bool sync_weld_metadata() {
     for (auto& fut : futures) {
         if (!fut.get()) ok = false;
     }
+    safe_log(render_sync_progress(100, "Syncing Weld Repositories"), "\n");
     return ok;
 #endif
 }
@@ -3041,9 +3131,11 @@ void unbind_local_deb_dirs(const vector<string>& mounted) {
 }
 
 void perform_transaction_argv(const string& action, const vector<string>& targets, bool apply_host) {
+    if (!check_system_memory(WELD_MIN_MEM_MB)) return;
+
     if (!apply_host) {
         if (!manage_sandbox("create")) {
-            cout << "Aborting transaction: chroot could not be created.\n";
+            cout << "Aborting transaction: sandbox could not be created.\n";
             return;
         }
         mount_fs();
@@ -3067,27 +3159,40 @@ void perform_transaction_argv(const string& action, const vector<string>& target
                 _exit(1);
             }
 
-            if (unshare(CLONE_NEWNS) != 0) {
+            if (unshare(CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC) != 0) {
                 if (have_err) {
-                    const char* msg = "unshare mount namespace failed\n";
+                    const char* msg = "unshare namespace failed\n";
                     ssize_t written = write(err_pipe[1], msg, strlen(msg));
                     (void)written;
                 }
                 _exit(1);
             }
 
-            drop_all_capabilities();
-
-            if (chroot(TREE_ROOT.c_str()) != 0 || chdir("/") != 0) {
-                if (have_err) {
-                    const char* msg = "chroot/chdir failed\n";
-                    ssize_t written = write(err_pipe[1], msg, strlen(msg));
-                    (void)written;
+            string put_old_path = string(TREE_ROOT) + "/.old_root";
+            bool pivoted = false;
+            if (mkdir(put_old_path.c_str(), 0755) == 0) {
+                if (mount("", TREE_ROOT.c_str(), "", MS_PRIVATE | MS_REC, nullptr) == 0) {
+                    if (do_pivot_root(TREE_ROOT.c_str(), put_old_path.c_str()) == 0) {
+                        pivoted = true;
+                    }
                 }
-                _exit(1);
             }
 
-            drop_all_capabilities();
+            if (pivoted) {
+                chdir("/");
+                umount2("/.old_root", MNT_DETACH);
+                rmdir("/.old_root");
+            } else {
+                rmdir(put_old_path.c_str());
+                if (chroot(TREE_ROOT.c_str()) != 0 || chdir("/") != 0) {
+                    if (have_err) {
+                        const char* msg = "pivot_root and chroot fallback both failed\n";
+                        ssize_t written = write(err_pipe[1], msg, strlen(msg));
+                        (void)written;
+                    }
+                    _exit(1);
+                }
+            }
 
             apply_strict_resource_limits();
 
@@ -3201,14 +3306,14 @@ void perform_transaction_argv(const string& action, const vector<string>& target
 
             if (!waited) {
                 global_config_backup.restore_orig();
-                cout << "\n\033[1;31mE:\033[0m Chroot verification interrupted.\n";
+                cout << "\n\033[1;31mE:\033[0m Sandbox verification interrupted.\n";
                 return;
             }
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
                 global_config_backup.restore_orig();
-                cout << "\n\033[1;31mE:\033[0m Chroot verification failed.\n";
+                cout << "\n\033[1;31mE:\033[0m Sandbox verification failed.\n";
                 if (!child_stderr_output.empty()) {
-                    cout << "---- chroot error output ----\n" << child_stderr_output;
+                    cout << "---- sandbox error output ----\n" << child_stderr_output;
                     if (child_stderr_output.back() != '\n') cout << '\n';
                     cout << "------------------------------\n";
                 }
@@ -3232,7 +3337,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
         } else {
             if (have_pipe) { close(apt_pipe[0]); close(apt_pipe[1]); }
             if (have_err)  { close(err_pipe[0]); close(err_pipe[1]); }
-            cout << "\033[1;31mE:\033[0m Unable to fork process for chroot verification.\n";
+            cout << "\033[1;31mE:\033[0m Unable to fork process for sandbox verification.\n";
             return;
         }
     }
@@ -3743,6 +3848,29 @@ void do_transaction_rollback() {
     }
 }
 
+void report_upgradeable_packages() {
+    pkgCacheFile cache_file;
+    pkgCache* cache = cache_file.GetPkgCache();
+    pkgDepCache* dep_cache = cache_file.GetDepCache();
+    if (cache == nullptr || dep_cache == nullptr) return;
+
+    long count = 0;
+    for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
+        if (pkg->CurrentVer == 0) continue;
+        pkgCache::VerIterator cand = dep_cache->GetCandidateVersion(pkg);
+        if (cand.end() || cand == pkg.CurrentVer()) continue;
+        ++count;
+    }
+
+    if (count <= 0) return;
+
+    if (count == 1) {
+        cout << "W: 1 package can be upgraded. Run 'weld upgrade' to upgrade it.\n";
+    } else {
+        cout << "W: " << count << " packages can be upgraded. Run 'weld upgrade' to upgrade them.\n";
+    }
+}
+
 int main(int argc, char** argv) {
     setup_safety_handlers();
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -3790,19 +3918,24 @@ int main(int argc, char** argv) {
     if (!check_system_locks()) return 1;
 
     if (command == "sync") {
-        pkgCacheFile cache_file;
-        pkgSourceList* src_list = cache_file.GetSourceList();
         bool apt_ok = false;
-        if (src_list != nullptr) {
-            WeldAcquireStatus status(-1, true, "metadata");
-            apt_ok = ListUpdate(status, *src_list);
-            if (!apt_ok) _error->DumpErrors();
-        } else {
-            _error->DumpErrors();
+        {
+            pkgCacheFile cache_file;
+            pkgSourceList* src_list = cache_file.GetSourceList();
+            if (src_list != nullptr) {
+                WeldSyncStatus status("Syncing Debian Repositories");
+                apt_ok = ListUpdate(status, *src_list);
+                if (!apt_ok) _error->DumpErrors();
+            } else {
+                _error->DumpErrors();
+            }
         }
         bool weld_ok = sync_weld_metadata();
-        if (!apt_ok || !weld_ok) return 1;
-        return 0;
+        if (apt_ok && weld_ok) {
+            report_upgradeable_packages();
+            return 0;
+        }
+        return 1;
     } else if (command == "clean") {
         return clean_weld_cache() ? 0 : 1;
     } else if (command == "autoclean") {
