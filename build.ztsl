@@ -6,7 +6,7 @@ ztsl.start # start
 func "nsm" 
 sys.exec # compiles nsm
 ```shell
-gcc -o nsm ./usr/bin/nsm.c
+gcc -o ./usr/bin/nsm ./usr/bin/nsm.c
 ```
 }
 func "weld"
@@ -17,15 +17,21 @@ sys.exec # compiles weld
     -Dallow_weld_repositories \
     -Dnflinux \
     -Darvor_version=\"8.1\" \
-    usr/bin/weld.cpp -o weld \
+    usr/bin/weld.cpp -o ./usr/bin/weld \
     -lapt-pkg -lcurl
 
+```
+}
+func "arvor_sys_info" # compiles arvor_sys_info
+sys.exec
+```
+gcc -o usr/bin/arvor_sys_info  # notice that no build code is defined here,because it is made for our discord https://discord.gg/zQaGrHNgxB for specific bug reports. 
 ```
 }
 func "lxsm"
 sys.exec # compiles lxsm
 ```shell
-g++ -std=c++23 -O2 ./usr/bin/lxsm.cpp -o lxsm -ldl
+g++ -std=c++23 -O2 ./usr/bin/lxsm.cpp -o ./usr/bin/lxsm -ldl
 ```
 }
 func "debootstrap"
@@ -73,7 +79,7 @@ sudo chroot "$TARGET_DIR" env DEBIAN_FRONTEND=noninteractive apt-get install -y 
 func "install_codes" # install the codes
 sys.exec
 ```
-sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/napt./usr/bin/,./usr/bin/lxsm,./usr/bin/arvor*,./usr/bin/nsmd_start} ./arvor/usr/bin
+sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/napt./usr/bin/,./usr/bin/lxsm,./usr/bin/arvor*,./usr/bin/arvor_sys_info,./usr/bin/nsmd_start} ./arvor/usr/bin
 ```
 }
 func "chroot"
