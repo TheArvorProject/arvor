@@ -6,11 +6,13 @@
 #include <sys/utsname.h>
 
 #ifndef CODE_NAME
-#define CODE_NAME ""
+#define CODE_NAME "2026.09.6-arvorlinux-0"
 #endif
 
+#define DEFAULT_BUILD_CODE "59FF03AD8C168C3A9F443A95287EF208F3E775F8793BCA549100927F96F42A15"
+
 #ifndef BUILD_CODE
-#define BUILD_CODE "59FF03AD8C168C3A9F443A95287EF208F3E775F8793BCA549100927F96F42A15"
+#define BUILD_CODE DEFAULT_BUILD_CODE
 #endif
 
 static char *trim(char *s) {
@@ -264,6 +266,9 @@ static int get_support_type(void) {
     if (get_root_fs(fs, sizeof(fs)) != 0 || strcmp(fs, "xfs") != 0) {
         unsupported = 0x1;
     }
+    if (strcmp(BUILD_CODE, DEFAULT_BUILD_CODE) == 0) {
+        unsupported = 0x1;
+    }
     return unsupported;
 }
 
@@ -282,8 +287,6 @@ static void print_help(void) {
         {"get.sys.build-code",     "build code"}
     };
     size_t n = sizeof(rows) / sizeof(rows[0]);
-    printf("arvor_sys_info: query system debug info from a running Arvor install\n\n");
-    printf("usage: arvor_sys_info <command>\n\n");
     printf("system info commands:\n");
     for (size_t i = 0; i < n; i++) {
         printf(" %-22s %s\n", rows[i][0], rows[i][1]);
