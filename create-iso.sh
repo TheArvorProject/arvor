@@ -5,12 +5,13 @@ set -e
 mkdir -p /tmp/rootfs_staging /tmp/iso_build/live /tmp/iso_build/boot/grub
 
 rsync -aAXv / /tmp/rootfs_staging/ \
-  --exclude={/dev/*,/proc/*,/sys/*,/tmp/*,/run/*,/mnt/*,/media/*,/*.iso,/nextferret-plymouth-theme,/build_iso.sh,/*sha256}
+  --exclude={/dev/*,/etc/nfinst,/proc/*,/sys/*,/tmp/*,/run/*,/mnt/*,/media/*,/*.iso,/nextferret-plymouth-theme,/build_iso.sh,/*sha256}
 
 mkdir -p /tmp/rootfs_staging/{dev,proc,sys,tmp,run,mnt,media}
 chmod 1777 /tmp/rootfs_staging/tmp
 
-mksquashfs /tmp/rootfs_staging /tmp/iso_build/live/filesystem.squashfs -comp xz -noappend -processors 16
+mksquashfs /tmp/rootfs_staging /tmp/iso_build/live/filesystem.squashfs \
+  -comp xz -b 1M -Xbcj x86 -noappend -processors 8
 
 KERNEL_VERSION="6.12.86+deb13-amd64"
 
@@ -25,7 +26,7 @@ insmod ext2
 set default=0
 set timeout=5
 
-menuentry "Arvor Linux 7.1 (Sable) Live" {
+menuentry "Arvor Linux 8.1 (The Edge Artifacts) Live" {
     search --no-floppy --set=root --file /live/vmlinuz
     linux /live/vmlinuz boot=live components quiet splash
     initrd /live/initrd.img
@@ -37,7 +38,7 @@ menuentry "UEFI Firmware Settings" {
 
 EOF
 
-grub-mkrescue -o /arvorlinux-x86_64-sable.iso /tmp/iso_build
+grub-mkrescue -o /arvorlinux-x86_64-edge.iso /tmp/iso_build
 
 
-sha256sum /arvorlinux-x86_64-sable.iso > /arvorlinux-x86_64-sable.iso.sha256
+sha256sum /arvorlinux-x86_64-edge.iso > /arvorlinux-x86_64-edge.iso.sha256
