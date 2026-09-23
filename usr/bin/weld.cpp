@@ -966,6 +966,30 @@ bool create_snapshot(const string& name) {
 enum class PrecheckResult { Proceed, NoChanges, Failed };
 
 PrecheckResult precheck_transaction(const string& action, const vector<string>& pkgs, bool quiet) {
+    if (action == "upgrade" || action == "dist-upgrade") {
+        pkgCacheFile probe_cache_file;
+        pkgCache* probe_cache = probe_cache_file.GetPkgCache();
+        pkgDepCache* probe_dep_cache = probe_cache_file.GetDepCache();
+        if (probe_cache == nullptr || probe_dep_cache == nullptr)
+            return PrecheckResult::Proceed;
+
+        bool upgrade_ok = (action == "upgrade")
+            ? APT::Upgrade::Upgrade(*probe_dep_cache,
+                  APT::Upgrade::FORBID_REMOVE_PACKAGES | APT::Upgrade::FORBID_INSTALL_NEW_PACKAGES)
+            : APT::Upgrade::Upgrade(*probe_dep_cache, APT::Upgrade::ALLOW_EVERYTHING);
+
+        if (!upgrade_ok) {
+            _error->DumpErrors();
+            return PrecheckResult::Proceed;
+        }
+
+        if (probe_dep_cache->InstCount() == 0 && probe_dep_cache->DelCount() == 0) {
+            if (!quiet) cout << "No packages to upgrade. Your system is up to date.\n";
+            return PrecheckResult::NoChanges;
+        }
+        return PrecheckResult::Proceed;
+    }
+
     if (action != "install" && action != "remove" && action != "purge")
         return PrecheckResult::Proceed;
 
@@ -3195,6 +3219,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
             }
 
             apply_strict_resource_limits();
+            drop_all_capabilities();
 
             {
                 string seccomp_err;
@@ -3431,7 +3456,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
         });
 
         wait_for_child(host_pid, host_status);
-        if (have_host_pipe) host_reader.join();
+        host_reader.join();
         host_ok = WIFEXITED(host_status) && WEXITSTATUS(host_status) == 0;
     }
 
