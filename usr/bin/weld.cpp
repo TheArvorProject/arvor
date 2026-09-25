@@ -1168,12 +1168,64 @@ struct weld_cap_data {
     uint32_t inheritable;
 };
 
-static void drop_all_capabilities() {
+#ifndef CAP_CHOWN
+#define CAP_CHOWN 0
+#endif
+#ifndef CAP_DAC_OVERRIDE
+#define CAP_DAC_OVERRIDE 1
+#endif
+#ifndef CAP_FOWNER
+#define CAP_FOWNER 3
+#endif
+#ifndef CAP_FSETID
+#define CAP_FSETID 4
+#endif
+#ifndef CAP_KILL
+#define CAP_KILL 5
+#endif
+#ifndef CAP_SETGID
+#define CAP_SETGID 6
+#endif
+#ifndef CAP_SETUID
+#define CAP_SETUID 7
+#endif
+#ifndef CAP_SETPCAP
+#define CAP_SETPCAP 8
+#endif
+#ifndef CAP_NET_BIND_SERVICE
+#define CAP_NET_BIND_SERVICE 10
+#endif
+#ifndef CAP_NET_RAW
+#define CAP_NET_RAW 13
+#endif
+#ifndef CAP_SYS_CHROOT
+#define CAP_SYS_CHROOT 18
+#endif
+#ifndef CAP_MKNOD
+#define CAP_MKNOD 27
+#endif
+#ifndef CAP_AUDIT_WRITE
+#define CAP_AUDIT_WRITE 29
+#endif
+#ifndef CAP_SETFCAP
+#define CAP_SETFCAP 31
+#endif
+
+static void restrict_capabilities() {
     struct weld_cap_header hdr;
     hdr.version = _LINUX_CAPABILITY_VERSION_3;
     hdr.pid = 0;
     struct weld_cap_data data[2];
     memset(&data, 0, sizeof(data));
+    uint32_t keep_mask =
+        (1u << CAP_CHOWN) | (1u << CAP_DAC_OVERRIDE) | (1u << CAP_FOWNER) |
+        (1u << CAP_FSETID) | (1u << CAP_KILL) | (1u << CAP_SETGID) |
+        (1u << CAP_SETUID) | (1u << CAP_SETPCAP) | (1u << CAP_NET_BIND_SERVICE) |
+        (1u << CAP_NET_RAW) | (1u << CAP_SYS_CHROOT) | (1u << CAP_MKNOD) |
+        (1u << CAP_AUDIT_WRITE) | (1u << CAP_SETFCAP);
+    data[0].effective = keep_mask;
+    data[0].permitted = keep_mask;
+    data[0].inheritable = 0;
     syscall(__NR_capset, &hdr, data);
 }
 
@@ -1232,9 +1284,20 @@ bool manage_sandbox(const string& action) {
 
     if (action == "create") {
         umount_fs();
-        exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT});
-        if (!snap_dev.empty() && is_safe_device_path(snap_dev))
-            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (exec_argv_devnull_out_checked({"umount", TREE_ROOT}) == 0) break;
+            usleep(200000);
+        }
+        for (int i = 0; i < 20; ++i) {
+            if (exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT}) != 0) break;
+        }
+        exec_argv_devnull_out_checked({"udevadm", "settle"});
+        if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) == 0) break;
+                usleep(200000);
+            }
+        }
         exec_argv_devnull_out_checked({"mkdir", "-p", "/nsm/weld"});
 
         if (root_dev.empty() || vg_name.empty() || !is_safe_device_path(root_dev)) {
@@ -1286,10 +1349,23 @@ bool manage_sandbox(const string& action) {
 
         exec_argv_devnull_out_checked({"mkdir", "-p", TREE_ROOT});
 
-        string fstype = get_root_fstype();
+        exec_argv_devnull_out_checked({"udevadm", "settle"});
+        string fstype = trim_str(exec_argv_capture({"blkid", "-s", "TYPE", "-o", "value", snap_dev}));
+        if (fstype.empty()) fstype = get_root_fstype();
+
         int mount_rc;
         if (fstype == "xfs") {
             mount_rc = exec_argv_devnull_out_checked({"mount", "-t", "xfs", "-o", "nouuid", snap_dev, TREE_ROOT});
+        } else if (fstype == "ext4" || fstype == "ext3" || fstype == "ext2") {
+            mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, TREE_ROOT});
+            if (mount_rc != 0 && thin) {
+                for (int i = 0; i < 20; ++i) {
+                    if (exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT}) != 0) break;
+                }
+                exec_argv_devnull_out_checked({"udevadm", "settle"});
+                usleep(200000);
+                mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, TREE_ROOT});
+            }
         } else if (!fstype.empty() && fstype.find(',') == string::npos) {
             mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, TREE_ROOT});
         } else {
@@ -1315,9 +1391,19 @@ bool manage_sandbox(const string& action) {
 
     } else if (action == "delete") {
         umount_fs();
-        exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT});
-        if (!snap_dev.empty() && is_safe_device_path(snap_dev))
-            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
+        bool root_unmounted = false;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (exec_argv_devnull_out_checked({"umount", TREE_ROOT}) == 0) { root_unmounted = true; break; }
+            usleep(200000);
+        }
+        if (!root_unmounted) exec_argv_devnull_out_checked({"umount", "-l", TREE_ROOT});
+        exec_argv_devnull_out_checked({"udevadm", "settle"});
+        if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) == 0) break;
+                usleep(200000);
+            }
+        }
         sandbox_created_and_mounted.store(false);
         return true;
     }
@@ -3219,7 +3305,7 @@ void perform_transaction_argv(const string& action, const vector<string>& target
             }
 
             apply_strict_resource_limits();
-            drop_all_capabilities();
+            restrict_capabilities();
 
             {
                 string seccomp_err;
