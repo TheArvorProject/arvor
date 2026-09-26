@@ -50,7 +50,9 @@ FILES = [
     "/etc/weld/sources.list",
     "/usr/bin/lxsm",
     "/usr/bin/nsmd_start",
-    "/etc/motd"
+    "/etc/motd",
+    "/usr/bin/arvor_sys_info",
+    "/etc/weld/trusted_keys/nextferret-keyring.pub"
 ]
 
 STYLES = """
@@ -113,13 +115,9 @@ QCheckBox::indicator:checked{border-color:#4a78ff;background-color:#4a78ff;image
 """
 
 ARVOR_LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
-  <!-- Top Tier -->
   <polygon points="50,6 70,34 50,26 30,34" fill="#ffffff" />
-  <!-- Middle Tier -->
   <polygon points="50,26 82,60 50,52 18,60" fill="#ffffff" />
-  <!-- Bottom Tier -->
   <polygon points="50,52 94,84 50,76 6,84" fill="#ffffff" />
-  <!-- Trunk -->
   <polygon points="41,78 59,78 61,98 39,98" fill="#ffffff" />
 </svg>"""
 
@@ -356,7 +354,6 @@ class InstallWorker(QThread):
         self.run_cmd(f"parted -s {d} mkpart ESP fat32 1MiB 513MiB")
         self.run_cmd(f"parted -s {d} set 1 esp on")
         self.run_cmd(f"parted -s {d} mkpart BOOT ext4 513MiB 1537MiB")
-        # Recovery Mode has been moved to 8.1
         self.run_cmd(f"parted -s {d} mkpart LVM 1537MiB 100%")
         
         self.run_cmd(f"partprobe {d}")
@@ -366,7 +363,6 @@ class InstallWorker(QThread):
         self.progress.emit(15)
 
         sep = "p" if "nvme" in d else ""
-        # Recovery Mode has been moved to 8.1 (no dedicated RECOVERY partition; LVM is now p3)
         p1, p2, p3 = f"{d}{sep}1", f"{d}{sep}2", f"{d}{sep}3"
 
         if self.conf["luks"]:
@@ -406,8 +402,13 @@ class InstallWorker(QThread):
 
         self.run_cmd(f"mkfs.vfat -F32 {p1}")
         self.run_cmd(f"mkfs.ext4 -F {p2}")
-        # Recovery Mode has been moved to 8.1 (ARVOR_RECOVERY partition no longer created here)
-        self.run_cmd(f"mkfs.xfs -f {root_dev}")
+        
+        if self.conf.get("use_ext4"):
+            self.run_cmd(f"mkfs.ext4 -F {root_dev}")
+            root_fs_type = "ext4"
+        else:
+            self.run_cmd(f"mkfs.xfs -f {root_dev}")
+            root_fs_type = "xfs"
               
         self.run_cmd("udevadm settle")
         time.sleep(2)
@@ -505,7 +506,7 @@ class InstallWorker(QThread):
 
         fstab_sh = f"""
 cat << EOF > /etc/fstab
-{f_root} /               xfs     defaults        0       0
+{f_root} /               {root_fs_type}     defaults        0       0
 {f_boot} /boot           ext4    defaults        0       2
 {f_efi}  /boot/efi       vfat    defaults        0       1
 EOF
@@ -551,6 +552,9 @@ mkswap /swapfile
 echo "/swapfile none swap sw 0 0" >> /etc/fstab
 """
 
+        root_fs_pkgs = ""
+        if not self.conf.get("use_ext4"):
+            root_fs_pkgs = " xfsprogs"
 
         script = f"""#!/bin/bash
 set -e
@@ -699,10 +703,6 @@ exit 0
             return
         self.progress.emit(90)
 
-        # Recovery Mode has been moved to 8.1
-        # (dedicated Arvor Recovery partition setup, debootstrap, credentials,
-        #  arvor-recovery binaries, autologin, fstab, kernel copy and GRUB
-        #  configuration previously populated p3 here)
         self.progress.emit(95)
 
         for m in ["/run", "/sys", "/proc", "/dev/pts", "/dev"]:
@@ -756,7 +756,7 @@ class InstallerGUI(QMainWindow):
             "keymap": auto_keymap if auto_keymap in self.list_of_keymaps else default_keymap,
             "timezone": auto_tz if auto_tz in self.list_of_timezones else default_tz,
             "de_name": "None", "de_pkgs": "", "extra_pkgs": "", "driver_pkgs": "",
-            "swap_mode": "zram"
+            "swap_mode": "zram", "use_ext4": False
         }
         self.user_manually_edited = False
         self.desktops = [
@@ -1051,6 +1051,8 @@ class InstallerGUI(QMainWindow):
         if hasattr(self, 'lbl_disk'): self.lbl_disk.setText(self.t("disk"))
         if hasattr(self, 'chk_luks'): self.chk_luks.setText(self.t("luks"))
         if hasattr(self, 'lbl_luks_p'): self.lbl_luks_p.setText(self.t("luks_p"))
+        if hasattr(self, 'chk_ext4'): self.chk_ext4.setText(self.t("use_ext4"))
+        if hasattr(self, 'lbl_ext4_hint'): self.lbl_ext4_hint.setText(self.t("use_ext4_hint"))
         if hasattr(self, 'lbl_host'): self.lbl_host.setText(self.t("host"))
         if hasattr(self, 'lbl_display_name'): self.lbl_display_name.setText(self.t("display_name"))
         if hasattr(self, 'lbl_user'): self.lbl_user.setText(self.t("user_name"))
@@ -1076,6 +1078,9 @@ class InstallerGUI(QMainWindow):
             if idx == 7: self.btn_next.setText(self.t("install"))
             elif idx == 9: self.btn_next.setText(self.t("quit"))
             else: self.btn_next.setText(self.t("next"))
+
+        if hasattr(self, 'update_disk_preview'):
+            self.update_disk_preview()
 
         for i in range(self.stack.count()):
             page = self.stack.widget(i)
@@ -1383,7 +1388,6 @@ class InstallerGUI(QMainWindow):
         seg_boot.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.seg_thin = QLabel("Arvor Root (~78%)")
-        self.seg_thin.setToolTip("LVM Thin Pool para o Sistema Arvor OS (XFS ~78%)")
         self.seg_thin.setStyleSheet("background: #10b981; color: white; border-radius: 8px; padding: 10px 4px; font-size: 11px; font-weight: bold;")
         self.seg_thin.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -1442,29 +1446,27 @@ class InstallerGUI(QMainWindow):
         cl.addWidget(self.lbl_luks_p)
         cl.addWidget(self.luks_p_wrapper)
 
+        cl.addSpacing(15)
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.Shape.HLine)
+        line2.setStyleSheet("background-color: #e2e8f0; height: 1px;")
+        cl.addWidget(line2)
+        cl.addSpacing(15)
+
+        self.chk_ext4 = QCheckBox(self.t("use_ext4"))
+        self.chk_ext4.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_ext4_hint = QLabel(self.t("use_ext4_hint"))
+        self.lbl_ext4_hint.setStyleSheet("color:#94a3b8;font-size:12px;margin-bottom:8px;")
+        self.lbl_ext4_hint.setWordWrap(True)
+        self.chk_ext4.toggled.connect(lambda checked: self.update_disk_preview())
+
+        cl.addWidget(self.chk_ext4)
+        cl.addWidget(self.lbl_ext4_hint)
+
         l.addWidget(card)
         l.addStretch()
         scroll.setWidget(w)
         return scroll
-
-    def update_swap_options(self):
-        if not hasattr(self, 'c_swap'): return
-        curr_mode = self.conf.get("swap_mode", "zram")
-        self.c_swap.blockSignals(True)
-        self.c_swap.clear()
-        selected_idx = 0
-        for idx, (mode, label_key) in enumerate(self.swap_modes):
-            self.c_swap.addItem(self.t(label_key), mode)
-            if mode == curr_mode:
-                selected_idx = idx
-        self.c_swap.setCurrentIndex(selected_idx)
-        self.c_swap.blockSignals(False)
-
-    def on_swap_mode_changed(self, idx):
-        if hasattr(self, 'c_swap'):
-            mode = self.c_swap.currentData()
-            if mode:
-                self.conf["swap_mode"] = mode
 
     def update_disk_preview(self):
         idx = self.c_disk.currentIndex()
@@ -1473,11 +1475,15 @@ class InstallerGUI(QMainWindow):
             size_str = d.get('size', '')
             name = d.get('name', 'sda')
             model = d.get('model', 'Disk')
+            use_ext4 = hasattr(self, 'chk_ext4') and self.chk_ext4.isChecked()
+            fs_type = "EXT4" if use_ext4 else "XFS"
+            if hasattr(self, 'seg_thin'):
+                self.seg_thin.setToolTip(f"LVM Thin Pool para o Sistema Arvor OS ({fs_type} ~78%)")
             self.lbl_disk_legend.setText(
                 f"<b>Dispositivo Selecionado:</b> /dev/{name} ({model} - {size_str}) | <b>Tabela:</b> GPT<br>"
                 f"<span style='color:#3b82f6; font-weight:bold;'>[ESP]</span> 512 MiB (FAT32, /boot/efi) &nbsp;&nbsp;&nbsp;&nbsp; "
                 f"<span style='color:#6366f1; font-weight:bold;'>[Boot]</span> 1024 MiB (EXT4, /boot)<br>"
-                f"<span style='color:#10b981; font-weight:bold;'>[Arvor OS Root]</span> ~78% (XFS Thin Pool) &nbsp;&nbsp;&nbsp;&nbsp; "
+                f"<span style='color:#10b981; font-weight:bold;'>[Arvor OS Root]</span> ~78% ({fs_type} Thin Pool) &nbsp;&nbsp;&nbsp;&nbsp; "
                 f"<span style='color:#8b5cf6; font-weight:bold;'>[Snapshots NSM]</span> ~22% (VG Free)"
             )
 
@@ -1655,6 +1661,7 @@ class InstallerGUI(QMainWindow):
         hw_info = self.detect_hardware_info()
         swap_label_key = next((lk for m, lk in self.swap_modes if m == self.conf.get("swap_mode", "zram")), "swap_zram")
         swap_desc = self.t(swap_label_key)
+        fs_type = "ext4" if self.conf.get("use_ext4") else "xfs"
         html = f"""
         <style>
             h3 {{ color: #0f172a; margin-bottom: 8px; font-size: 16px; font-family: -apple-system, sans-serif; font-weight: 700; }}
@@ -1665,7 +1672,7 @@ class InstallerGUI(QMainWindow):
         <h3>{self.t("step_location")}</h3><p>{self.sys_locale} • {self.conf['timezone']}</p><hr>
         <h3>{self.t("step_keyboard")}</h3><p>{self.conf['keymap']}</p><hr>
         <h3>{self.t("step_desktop")}</h3><p>{self.conf['de_name']}{extra_str}</p><hr>
-        <h3>{self.t("step_partitions")}</h3><p>{self.conf['disk']} <br>LUKS: {'Activado' if self.conf['luks'] else 'Desactivado'}<br><b>Memória & Swap:</b> {swap_desc}</p><hr>
+        <h3>{self.t("step_partitions")}</h3><p>{self.conf['disk']} <br>LUKS: {'Activado' if self.conf['luks'] else 'Desactivado'}<br><b>Filesystem Root:</b> {fs_type}<br><b>Memória & Swap:</b> {swap_desc}</p><hr>
         <h3>{self.t("step_users")}</h3><p>{user_info} @ {self.conf['hostname']}</p>
         """
         self.lbl_sum_text.setHtml(html)
@@ -1709,7 +1716,6 @@ class InstallerGUI(QMainWindow):
         l.addWidget(self.create_title("step_install"))
 
         self.slide_svgs = [
-            # Slide 1: Geometric Snapshot Shield & Arvor Wireframe
             """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 350 280" width="300" height="240">
               <defs>
                 <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1729,7 +1735,6 @@ class InstallerGUI(QMainWindow):
               <circle cx="150" cy="225" r="2.5" fill="#38bdf8" opacity="0.4"/>
             </svg>""",
 
-            # Slide 2: Polygonal Cyber Security Matrix
             """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 350 280" width="300" height="240">
               <defs>
                 <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1746,7 +1751,6 @@ class InstallerGUI(QMainWindow):
               <circle cx="150" cy="135" r="3" fill="#34d399"/>
             </svg>""",
 
-            # Slide 3: Atomic Lifecycle Core
             """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 350 280" width="300" height="240">
               <defs>
                 <linearGradient id="g3" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1764,7 +1768,6 @@ class InstallerGUI(QMainWindow):
               <circle cx="185" cy="175" r="3.5" fill="#c4b5fd"/>
             </svg>""",
 
-            # Slide 4: Low-Poly Faceted Arvor Pine Tree
             """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 350 280" width="300" height="240">
               <defs>
                 <linearGradient id="treeGrad1" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1813,7 +1816,6 @@ class InstallerGUI(QMainWindow):
                   <stop offset="100%" stop-color="#4f46e5"/>
                 </linearGradient>
               </defs>
-              <!-- Left: Exact Complete Official Debian Logo (debian.org) -->
               <g transform="translate(18, 20) scale(1.18)">
                 <g fill="url(#debRed)">
                   <path d="M60.969,47.645c-1.494,0.02,0.281,0.768,2.232,1.069 c0.541-0.422,1.027-0.846,1.463-1.26C63.451,47.751,62.215,47.758,60.969,47.645"/>
@@ -1830,7 +1832,6 @@ class InstallerGUI(QMainWindow):
                   <path d="M17.739,29.282c0.469-1.437,0.553-2.299,0.732-3.132 C17.178,27.804,17.875,28.157,17.739,29.282"/>
                   <path d="M66.926,111.533l-3.838,3.836l-3.836-3.836l3.836-3.836L66.926,111.533"/>
                 </g>
-                <!-- debian Official Typography Wordmark -->
                 <g fill="#f1f5f9">
                   <path d="M13.437,125.506c-0.045,0.047-0.045,7.506-0.138,9.453c-0.092,1.574-0.232,4.957-3.568,4.957 c-3.429,0-4.263-3.939-4.541-5.652c-0.324-1.9-0.324-3.477-0.324-4.17c0-2.225,0.139-8.436,5.375-8.436 c1.576,0,2.456,0.465,3.151,0.834L13.437,125.506z M0,130.975c0,13.066,6.951,13.066,7.97,13.066 c2.873,0,4.727-1.576,5.514-4.309l0.093,4.123c0.881-0.047,1.761-0.139,3.197-0.139c0.51,0,0.926,0,1.298,0.047 c0.371,0,0.741,0.045,1.158,0.092c-0.741-1.482-1.297-4.818-1.297-12.049c0-7.043,0-18.951,0.602-22.566 c-1.667,0.789-3.105,1.299-6.256,1.576c1.251,1.344,1.251,2.039,1.251,8.154c-0.879-0.277-1.992-0.602-3.892-0.602 C1.344,118.369,0,125.598,0,130.975"/>
                   <path d="M25.13,128.609c0.047-3.846,0.835-7.275,4.124-7.275c3.615,0,3.891,3.984,3.799,7.275H25.13z M37.64,129.074c0-5.422-1.065-10.752-7.923-10.752c-9.452,0-9.452,10.475-9.452,12.697c0,9.406,4.216,13.113,11.306,13.113 c3.149,0,4.68-0.461,5.514-0.695c-0.046-1.668,0.185-2.734,0.465-4.17c-0.975,0.604-2.226,1.391-5.006,1.391 c-7.229,0-7.322-6.582-7.322-8.852H37.55L37.64,129.074"/>
@@ -1840,9 +1841,7 @@ class InstallerGUI(QMainWindow):
                   <path d="M108.063,139.268c0.047,1.576,0.047,3.244,0.695,4.588c-1.021-0.092-1.623-0.232-3.521-0.232 c-1.113,0-1.715,0.094-2.596,0.232c0.184-0.602,0.279-0.834,0.371-1.623c0.139-1.064,0.232-4.633,0.232-5.885v-5.004 c0-2.178,0-5.33-0.141-6.441c-0.092-0.787-0.322-2.918-3.012-2.918c-2.641,0-3.521,1.945-3.846,3.521 c-0.369,1.621-0.369,3.383-0.369,10.24c0.045,5.932,0.045,6.486,0.508,8.109c-0.787-0.092-1.76-0.184-3.15-0.184 c-1.113,0-1.854,0.045-2.779,0.184c0.324-0.742,0.51-1.113,0.602-3.707c0.094-2.549,0.279-15.061-0.141-18.025 c-0.23-1.809-0.695-2.225-1.203-2.688c3.754-0.186,4.957-0.789,6.117-1.389v4.91c0.555-1.438,1.713-4.635,6.348-4.635 c5.793,0,5.838,4.217,5.885,6.996V139.268"/>
                 </g>
               </g>
-              <!-- Center: Clean Minimalist Plus (+) -->
               <text x="175" y="105" text-anchor="middle" fill="#64748b" font-size="34" font-family="-apple-system, sans-serif" font-weight="300">+</text>
-              <!-- Right: Arvor Pine Tree & Stylized Wordmark -->
               <g transform="translate(225, 20)">
                 <polygon points="45,10 70,48 45,40" fill="url(#arvT1)" opacity="0.95"/>
                 <polygon points="45,10 20,48 45,40" fill="url(#arvT1)" opacity="0.75"/>
@@ -1856,7 +1855,6 @@ class InstallerGUI(QMainWindow):
             </svg>"""
         ]
 
-        # Ubuntu-style Dark Hero Showcase Banner
         self.slide_card = QFrame()
         self.slide_card.setStyleSheet("""
             QFrame#showcase_banner {
@@ -1874,7 +1872,6 @@ class InstallerGUI(QMainWindow):
         center_h_layout = QHBoxLayout()
         center_h_layout.setSpacing(12)
 
-        # Left Nav Arrow Button
         self.btn_slide_prev = QPushButton("❮")
         self.btn_slide_prev.setFixedSize(36, 36)
         self.btn_slide_prev.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1897,7 +1894,6 @@ class InstallerGUI(QMainWindow):
         self.btn_slide_prev.clicked.connect(self.prev_slide)
         center_h_layout.addWidget(self.btn_slide_prev, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # Left Text Layout
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(15, 10, 10, 10)
         text_layout.setSpacing(10)
@@ -1916,13 +1912,11 @@ class InstallerGUI(QMainWindow):
 
         center_h_layout.addLayout(text_layout, 6)
 
-        # Right Hero Graphic
         self.lbl_slide_art = QLabel()
         self.lbl_slide_art.setFixedSize(300, 240)
         self.lbl_slide_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
         center_h_layout.addWidget(self.lbl_slide_art, 5, Qt.AlignmentFlag.AlignVCenter)
 
-        # Right Nav Arrow Button
         self.btn_slide_next = QPushButton("❯")
         self.btn_slide_next.setFixedSize(36, 36)
         self.btn_slide_next.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1947,7 +1941,6 @@ class InstallerGUI(QMainWindow):
 
         banner_main_layout.addLayout(center_h_layout, 1)
 
-        # Bottom Dot Indicator
         dots_layout = QHBoxLayout()
         dots_layout.setSpacing(8)
         dots_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2076,6 +2069,7 @@ class InstallerGUI(QMainWindow):
             self.conf["disk"] = self.c_disk.currentData()
             self.conf["luks"] = self.chk_luks.isChecked()
             self.conf["luks_pass"] = self.i_luks_p.text()
+            self.conf["use_ext4"] = self.chk_ext4.isChecked()
         elif idx == 6:
             display_name = self.i_display_name.text().strip()
             user = self.i_user.text().strip()
