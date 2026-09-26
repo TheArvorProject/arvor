@@ -42,19 +42,29 @@ arvorctl mark-ok
 - Running kernel modules preservation (caches `/lib/modules/$(uname -r)` during kernel updates to prevent running driver failures before reboot).
 - Strict SHA256 checksum enforcement and path traversal protection.
 - Strict Minisign Obligation for Repositories Based on Weld.
+- Verify Transactions Using a pivot_root before the host 
 
 **Common Commands:**
 ```
-weld sync            # Refresh repository metadata
-weld install <pkg>  # Install packages (chroot-verified before host application)
-weld upgrade        # Upgrade installed packages transactionally
-weld rollback        # Revert the last package operation using pre-transaction snapshot
-weld info <pkg>     # Display repository origin, version, SHA256, and replacement rules
-weld why <pkg>      # Explain why a package is installed (reverse dependency tree)
-weld depends <pkg>  # List forward dependencies
-weld list           # List all installed packages
-weld clean          # Clear the entire package cache
-weld autoclean      # Remove obsolete cached package files
+  install       <pkgs...>   Install packages or local .deb archives 
+  remove        <pkgs...>   Remove packages from the system
+  purge         <pkgs...>   Remove packages along with their configuration files
+  upgrade       [pkgs...]   Upgrade all packages, or only those specified
+  dist-upgrade               Perform a full system release upgrade
+  rollback                   Revert the last transaction using its pre-transaction snapshot
+  search        <term>      Search the package index (supports -p <page>)
+  info          <pkg>       Show package origin, version and SHA256
+  why           <pkg>       Show why a package is installed (reverse dependencies)
+  depends       <pkg>       List a package's direct dependencies
+  list                      List all installed packages
+  sync                      Refresh repository metadata (APT + Weld)
+  clean                     Clear the APT and Weld package caches
+  autoclean                 Remove obsolete packages from the APT and Weld caches
+  --apply-host              Skip sandbox verification and apply directly to the host
+  -y, --yes                 Assume yes to all confirmation prompts
+  --vb                      Enable verbose transaction logging
+  -h, --help                Show this help message
+  -v, --version             Show the Weld version
 ```
 
 ---
