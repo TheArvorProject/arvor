@@ -719,7 +719,7 @@ static string weld_arch() {
 }
 
 static string weld_version_str() {
-    return string("Weld 4.2 (") + weld_arch() + ")";
+    return string("Weld 4.3 (") + weld_arch() + ")";
 }
 
 void show_help() {
@@ -2233,7 +2233,7 @@ string curl_fetch_string(const string& url, const string& user_agent = "", long 
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.2");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.3");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -2279,7 +2279,7 @@ bool curl_download_file(const string& url, const string& dest_path, const string
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.2");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.3");
     }
 
     CURLcode res = curl_easy_perform(curl);
