@@ -721,7 +721,7 @@ static string weld_arch() {
 }
 
 static string weld_version_str() {
-    return string("Weld 4.2 (") + weld_arch() + ")";
+    return string("Weld 4.4 (") + weld_arch() + ")";
 }
 
 void show_help() {
