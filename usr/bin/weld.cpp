@@ -164,6 +164,8 @@ const string WELD_TRUSTED_KEYS_DIR     = "/etc/weld/trusted_keys";
 static const size_t WELD_MIN_MEM_MB = 256;
 
 static bool assume_yes = false;
+static bool force_reinstall = false;
+static bool simulate_mode = false;
 static std::atomic<bool> sandbox_created_and_mounted(false);
 
 static string get_root_device();
@@ -719,7 +721,7 @@ static string weld_arch() {
 }
 
 static string weld_version_str() {
-    return string("Weld 4.3 (") + weld_arch() + ")";
+    return string("Weld 4.2 (") + weld_arch() + ")";
 }
 
 void show_help() {
@@ -770,6 +772,8 @@ void show_help() {
 
     cout << hdr << "Options:" << reset << "\n";
     cout << "  " << dim << "--apply-host" << reset << "              Skip sandbox verification and apply directly to the host\n";
+    cout << "  " << dim << "--reinstall" << reset << "               Reinstall packages even if already at the same version\n";
+    cout << "  " << dim << "-s, --simulate, --dry-run" << reset << " Show what would be done without changing anything\n";
     cout << "  " << dim << "-y, --yes" << reset << "                 Assume yes to all confirmation prompts\n";
     cout << "  " << dim << "--vb" << reset << "                      Enable verbose transaction logging\n";
     cout << "  " << dim << "-h, --help" << reset << "                Show this help message\n";
@@ -1656,6 +1660,7 @@ bool run_libapt_transaction(const string& action, const vector<string>& targets,
             }
             fixer.Clear(pkg);
             fixer.Protect(pkg);
+            if (force_reinstall) dep_cache->SetReInstall(pkg, true);
             dep_cache->MarkInstall(pkg, true);
             if (!(*dep_cache)[pkg].Install()) {
                 if (!quiet) cout << "Unable to mark " << pkg_name << " for installation.\n";
@@ -2233,7 +2238,7 @@ string curl_fetch_string(const string& url, const string& user_agent = "", long 
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.3");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.2");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -2279,7 +2284,7 @@ bool curl_download_file(const string& url, const string& dest_path, const string
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.3");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.2");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -2989,7 +2994,7 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
                 ? get_apt_package_state(cache_file, weld_candidate.actual_pkg_name)
                 : apt_state;
 
-            if (target_apt_state.installed && compare_versions(target_apt_state.installed_version, weld_candidate.version) >= 0) {
+            if (target_apt_state.installed && !force_reinstall && compare_versions(target_apt_state.installed_version, weld_candidate.version) >= 0) {
                 if (!quiet) print_install_already_present_message(weld_candidate.actual_pkg_name, is_upgrade);
                 continue;
             }
@@ -3003,7 +3008,7 @@ bool resolve_install_decisions(const vector<string>& pkgs, vector<InstallDecisio
             continue;
         }
 
-        if (apt_state.installed && compare_versions(apt_state.installed_version, apt_state.candidate_version) >= 0) {
+        if (apt_state.installed && !force_reinstall && compare_versions(apt_state.installed_version, apt_state.candidate_version) >= 0) {
             if (!quiet) print_install_already_present_message(pkg_name, is_upgrade);
             continue;
         }
@@ -3982,6 +3987,140 @@ void report_upgradeable_packages() {
     }
 }
 
+void simulate_transaction(const string& action, const vector<string>& pkgs) {
+    pkgCacheFile cache_file;
+    pkgCache* cache = cache_file.GetPkgCache();
+    pkgDepCache* dep_cache = cache_file.GetDepCache();
+    if (cache == nullptr || dep_cache == nullptr) {
+        _error->DumpErrors();
+        cout << "E: Unable to open package cache.\n";
+        return;
+    }
+
+    vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
+    vector<string> extra_lines;
+    bool had_error = false;
+
+    if (action == "upgrade" || action == "dist-upgrade") {
+        bool ok = (action == "upgrade")
+            ? APT::Upgrade::Upgrade(*dep_cache, APT::Upgrade::FORBID_REMOVE_PACKAGES | APT::Upgrade::FORBID_INSTALL_NEW_PACKAGES)
+            : APT::Upgrade::Upgrade(*dep_cache, APT::Upgrade::ALLOW_EVERYTHING);
+        if (!ok) {
+            _error->DumpErrors();
+            cout << "E: Unable to resolve upgrade.\n";
+            had_error = true;
+        }
+    } else if (action == "install") {
+        pkgProblemResolver fixer(dep_cache);
+        for (const auto& pkg_name : pkgs) {
+            if (ends_with(pkg_name, ".deb")) {
+                if (!path_is_regular_file(pkg_name)) {
+                    cout << "E: Unable to locate local package file: " << pkg_name << ".\n";
+                    had_error = true;
+                    continue;
+                }
+                extra_lines.push_back("Inst " + pkg_name + " (local .deb file)");
+                continue;
+            }
+
+            AptPackageState apt_state = get_apt_package_state(cache_file, pkg_name);
+            WeldPackageCandidate weld_candidate = find_best_weld_candidate(repos, pkg_name);
+
+            if (!apt_state.found && !weld_candidate.found) {
+                cout << "E: Unable to locate package " << pkg_name << ".\n";
+                had_error = true;
+                continue;
+            }
+
+            bool use_weld = false;
+            if (weld_candidate.found) {
+                if (weld_candidate.is_replacement) use_weld = true;
+                else if (!apt_state.found || apt_state.candidate_version.empty()) use_weld = true;
+                else if (compare_versions(weld_candidate.version, apt_state.candidate_version) > 0) use_weld = true;
+            }
+
+            if (use_weld) {
+                AptPackageState target_apt_state = (weld_candidate.is_replacement)
+                    ? get_apt_package_state(cache_file, weld_candidate.actual_pkg_name)
+                    : apt_state;
+                if (target_apt_state.installed && !force_reinstall && compare_versions(target_apt_state.installed_version, weld_candidate.version) >= 0) {
+                    extra_lines.push_back(weld_candidate.actual_pkg_name + " is already up to date (" + weld_candidate.version + ") via Weld.");
+                    continue;
+                }
+                string line = "Inst " + weld_candidate.actual_pkg_name + " (";
+                if (target_apt_state.installed) line += target_apt_state.installed_version + " => ";
+                line += weld_candidate.version + ") from Weld repository " + weld_candidate.base_url;
+                extra_lines.push_back(line);
+                continue;
+            }
+
+            if (!apt_state.found || apt_state.candidate_version.empty()) {
+                cout << "E: Unable to locate package " << pkg_name << ".\n";
+                had_error = true;
+                continue;
+            }
+
+            if (apt_state.installed && !force_reinstall && compare_versions(apt_state.installed_version, apt_state.candidate_version) >= 0) {
+                extra_lines.push_back(pkg_name + " is already the newest version (" + apt_state.installed_version + ").");
+                continue;
+            }
+
+            pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
+            fixer.Clear(pkg);
+            fixer.Protect(pkg);
+            if (force_reinstall) dep_cache->SetReInstall(pkg, true);
+            dep_cache->MarkInstall(pkg, true);
+        }
+        if (!fixer.Resolve(true) || _error->PendingError()) {
+            cout << "E: Unable to resolve dependencies for this simulation.\n";
+            _error->DumpErrors();
+            had_error = true;
+        }
+    } else if (action == "remove" || action == "purge") {
+        bool purge = (action == "purge");
+        pkgProblemResolver fixer(dep_cache);
+        for (const auto& pkg_name : pkgs) {
+            pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
+            if (pkg.end()) {
+                cout << "E: Unable to locate package " << pkg_name << ".\n";
+                had_error = true;
+                continue;
+            }
+            fixer.Clear(pkg);
+            fixer.Protect(pkg);
+            dep_cache->MarkDelete(pkg, purge);
+        }
+        if (!fixer.Resolve(true) || _error->PendingError()) {
+            cout << "E: Unable to resolve dependencies for this simulation.\n";
+            _error->DumpErrors();
+            had_error = true;
+        }
+    }
+
+    for (const auto& l : extra_lines) cout << l << "\n";
+
+    bool any = !extra_lines.empty();
+    for (pkgCache::PkgIterator p = cache->PkgBegin(); !p.end(); ++p) {
+        pkgDepCache::StateCache& state = (*dep_cache)[p];
+        if (state.NewInstall() || state.Upgrade() || state.Downgrade() || (state.Install() && state.ReInstall())) {
+            string old_ver = (p->CurrentVer != 0) ? p.CurrentVer().VerStr() : "";
+            pkgCache::VerIterator cand = dep_cache->GetCandidateVersion(p);
+            string new_ver = cand.end() ? "" : cand.VerStr();
+            cout << "Inst " << p.Name();
+            if (!old_ver.empty()) cout << " (" << old_ver << " => " << new_ver << ")";
+            else if (!new_ver.empty()) cout << " (" << new_ver << ")";
+            cout << "\n";
+            any = true;
+        } else if (state.Delete()) {
+            cout << "Remv " << p.Name() << "\n";
+            any = true;
+        }
+    }
+
+    if (!any && !had_error) cout << "No changes would be made.\n";
+    cout << "Simulation only - no packages were actually changed, downloaded, or installed.\n";
+}
+
 int main(int argc, char** argv) {
     setup_safety_handlers();
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -4002,6 +4141,8 @@ int main(int argc, char** argv) {
         else if (arg == "--vb") { _config->Set("Debug::pkgAcquire", "true"); }
         else if (arg == "--apply-host") { apply_host = true; }
         else if (arg == "-y" || arg == "--yes" || arg == "--assume-yes") { assume_yes = true; }
+        else if (arg == "--reinstall") { force_reinstall = true; }
+        else if (arg == "-s" || arg == "--simulate" || arg == "--dry-run" || arg == "--just-print") { simulate_mode = true; }
         else if (arg == "-p" && i + 1 < argc) { search_page = atoi(argv[++i]); }
         else if (command.empty() && arg[0] != '-') { command = arg; }
         else if (arg[0] != '-') { pkgs.push_back(arg); }
@@ -4022,6 +4163,17 @@ int main(int argc, char** argv) {
         return list_installed_packages();
     } else if (command == "search") {
         return run_search(pkgs, search_page);
+    }
+
+    if (simulate_mode) {
+        if (command == "install") { simulate_transaction("install", pkgs); return 0; }
+        if (command == "upgrade") {
+            if (pkgs.empty()) simulate_transaction("upgrade", pkgs);
+            else simulate_transaction("install", pkgs);
+            return 0;
+        }
+        if (command == "dist-upgrade") { simulate_transaction("dist-upgrade", pkgs); return 0; }
+        if (command == "remove" || command == "purge") { simulate_transaction(command, pkgs); return 0; }
     }
 
     if (geteuid() != 0) { cout << "Root privileges required.\n"; return 1; }
