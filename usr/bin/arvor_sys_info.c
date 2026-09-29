@@ -1,9 +1,13 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <sys/utsname.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 
 #ifndef CODE_NAME
 #define CODE_NAME "00000000000000000000000000000000000000000000"
@@ -14,6 +18,23 @@
 #ifndef BUILD_CODE
 #define BUILD_CODE DEFAULT_BUILD_CODE
 #endif
+
+#define BUILD_CODE_LEN 64
+
+static const char k_build_code[] = BUILD_CODE;
+static const char k_default_code[] = DEFAULT_BUILD_CODE;
+
+static void die(void) {
+    _exit(111);
+}
+
+static int ct_equal(const char *a, const char *b, size_t n) {
+    volatile unsigned char diff = 0;
+    for (size_t i = 0; i < n; i++) {
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    }
+    return diff == 0;
+}
 
 static char *trim(char *s) {
     if (!s) return s;
@@ -55,6 +76,51 @@ static int read_first_line(const char *path, char *out, size_t outsz) {
     fclose(f);
     if (!ok) out[0] = '\0';
     return ok ? 0 : -1;
+}
+
+static int has_tracer(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 1;
+    char line[256];
+    int traced = 0;
+    while (fgets(line, sizeof(line), f)) {
+        long pid;
+        if (sscanf(line, "TracerPid: %ld", &pid) == 1) {
+            traced = (pid != 0);
+            break;
+        }
+    }
+    fclose(f);
+    return traced;
+}
+
+static int has_rwx_mapping(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 1;
+    char line[1024];
+    int bad = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char perms[8];
+        if (sscanf(line, "%*s %7s", perms) == 1) {
+            if (perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
+                bad = 1;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return bad;
+}
+
+static void harden_process(void) {
+    struct rlimit rl = {0, 0};
+    if (setrlimit(RLIMIT_CORE, &rl) != 0) die();
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) die();
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) die();
+    if (getenv("LD_PRELOAD") || getenv("LD_AUDIT") ||
+        getenv("LD_LIBRARY_PATH") || getenv("LD_DEBUG")) die();
+    if (has_tracer()) die();
+    if (has_rwx_mapping()) die();
 }
 
 static int get_os_name(char *out, size_t outsz) {
@@ -110,7 +176,6 @@ static int get_root_fs(char *out, size_t outsz) {
             if (strcmp(mnt, "/") == 0) {
                 snprintf(out, outsz, "%s", type);
                 found = 1;
-                break;
             }
         }
     }
@@ -256,20 +321,43 @@ static int get_secure_boot_status(void) {
     return status ? 0 : 1;
 }
 
-static int get_support_type(void) {
-    int unsupported = 0x0;
+static int build_code_valid(void) {
+    if (strlen(k_build_code) != BUILD_CODE_LEN) return 0;
+    int all_zero = 1;
+    for (size_t i = 0; i < BUILD_CODE_LEN; i++) {
+        if (!isxdigit((unsigned char)k_build_code[i])) return 0;
+        if (k_build_code[i] != '0') all_zero = 0;
+    }
+    if (all_zero) return 0;
+    if (strlen(k_default_code) == BUILD_CODE_LEN &&
+        ct_equal(k_build_code, k_default_code, BUILD_CODE_LEN)) return 0;
+    return 1;
+}
+
+static int name_valid(void) {
     char name[128];
+    if (get_os_name(name, sizeof(name)) != 0) return 0;
+    return strcmp(name, "Arvor Linux") == 0;
+}
+
+static int fs_valid(void) {
     char fs[64];
-    if (get_os_name(name, sizeof(name)) != 0 || strcmp(name, "Arvor Linux") != 0) {
-        unsupported = 0x1;
-    }
-    if (get_root_fs(fs, sizeof(fs)) != 0 || strcmp(fs, "xfs") != 0) {
-        unsupported = 0x1;
-    }
-    if (strcmp(BUILD_CODE, DEFAULT_BUILD_CODE) == 0) {
-        unsupported = 0x1;
-    }
-    return unsupported;
+    if (get_root_fs(fs, sizeof(fs)) != 0) return 0;
+    return strcmp(fs, "xfs") == 0 || strcmp(fs, "ext4") == 0;
+}
+
+static int support_once(void) {
+    int a = build_code_valid();
+    int b = name_valid();
+    int c = fs_valid();
+    return (a & b & c) ? 0x0 : 0x1;
+}
+
+static int get_support_type(void) {
+    int r1 = support_once();
+    int r2 = support_once();
+    if (r1 != r2) die();
+    return r1;
 }
 
 static void print_help(void) {
@@ -279,7 +367,7 @@ static void print_help(void) {
         {"get.sys.kernel",         "kernel release"},
         {"get.sys.support.type",   "support status (0x0 supported / 0x1 unsupported)"},
         {"get.sys.sbstatus",       "secure boot state (1 disabled / 0 enabled)"},
-        {"get.sys.manufucturer",   "hardware manufacturer"},
+        {"get.sys.manufacturer",   "hardware manufacturer"},
         {"get.sys.cpu",            "CPU model"},
         {"get.sys.fs",             "root filesystem type"},
         {"get.sys.memory",         "total RAM, includes swap/zram"},
@@ -295,6 +383,8 @@ static void print_help(void) {
 }
 
 int main(int argc, char **argv) {
+    harden_process();
+
     if (argc < 2 ||
         strcmp(argv[1], "--help") == 0 ||
         strcmp(argv[1], "-h") == 0 ||
@@ -318,7 +408,7 @@ int main(int argc, char **argv) {
         printf("0x%x\n", get_support_type());
     } else if (strcmp(cmd, "get.sys.sbstatus") == 0) {
         printf("%d\n", get_secure_boot_status());
-    } else if (strcmp(cmd, "get.sys.manufucturer") == 0) {
+    } else if (strcmp(cmd, "get.sys.manufacturer") == 0) {
         get_manufacturer(buf, sizeof(buf));
         printf("%s\n", buf);
     } else if (strcmp(cmd, "get.sys.cpu") == 0) {
@@ -346,7 +436,7 @@ int main(int argc, char **argv) {
             printf("%ld GB\n", rounded);
         }
     } else if (strcmp(cmd, "get.sys.build-code") == 0) {
-        printf("%s\n", BUILD_CODE);
+        printf("%s\n", k_build_code);
     } else {
         fprintf(stderr, "Unknown command: %s\n\n", cmd);
         print_help();
