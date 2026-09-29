@@ -1,3 +1,4 @@
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +20,7 @@
 #define BUILD_CODE DEFAULT_BUILD_CODE
 #endif
 
-#define BUILD_CODE_LEN 64
+#define BUILD_CODE_LEN 128
 
 static const char k_build_code[] = BUILD_CODE;
 static const char k_default_code[] = DEFAULT_BUILD_CODE;
