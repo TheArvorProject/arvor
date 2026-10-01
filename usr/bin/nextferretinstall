@@ -17,7 +17,7 @@ try:
                                  QLineEdit, QCheckBox, QStackedWidget, QMessageBox,
                                  QTextEdit, QListWidget, QListWidgetItem, QFrame,
                                  QGraphicsDropShadowEffect, QProgressBar, QListView,
-                                 QGridLayout, QScrollArea)
+                                 QGridLayout, QScrollArea, QRadioButton, QButtonGroup)
     from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer, QByteArray
     from PyQt6.QtSvg import QSvgRenderer
@@ -27,7 +27,7 @@ except ImportError:
                                  QLineEdit, QCheckBox, QStackedWidget, QMessageBox,
                                  QTextEdit, QListWidget, QListWidgetItem, QFrame,
                                  QGraphicsDropShadowEffect, QProgressBar, QListView,
-                                 QGridLayout, QScrollArea)
+                                 QGridLayout, QScrollArea, QRadioButton, QButtonGroup)
     from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
     from PySide6.QtCore import Qt, QThread, Signal as pyqtSignal, QEvent, QTimer, QByteArray
     from PySide6.QtSvg import QSvgRenderer
@@ -1051,8 +1051,8 @@ class InstallerGUI(QMainWindow):
         if hasattr(self, 'lbl_disk'): self.lbl_disk.setText(self.t("disk"))
         if hasattr(self, 'chk_luks'): self.chk_luks.setText(self.t("luks"))
         if hasattr(self, 'lbl_luks_p'): self.lbl_luks_p.setText(self.t("luks_p"))
-        if hasattr(self, 'chk_ext4'): self.chk_ext4.setText(self.t("use_ext4"))
-        if hasattr(self, 'lbl_ext4_hint'): self.lbl_ext4_hint.setText(self.t("use_ext4_hint"))
+        if hasattr(self, 'lbl_luks_hint'): self.lbl_luks_hint.setText(self.t("luks_hint"))
+        if hasattr(self, 'i_luks_p'): self.i_luks_p.setPlaceholderText(self.t("luks_placeholder"))
         if hasattr(self, 'lbl_host'): self.lbl_host.setText(self.t("host"))
         if hasattr(self, 'lbl_display_name'): self.lbl_display_name.setText(self.t("display_name"))
         if hasattr(self, 'lbl_user'): self.lbl_user.setText(self.t("user_name"))
@@ -1346,6 +1346,60 @@ class InstallerGUI(QMainWindow):
         h.addWidget(btn)
         return wrapper, field
 
+    def _section_header(self, number, text_key):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 8, 0, 4)
+        h.setSpacing(10)
+        badge = QLabel(str(number))
+        badge.setFixedSize(24, 24)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setStyleSheet("background:#4a78ff;color:#fff;border-radius:12px;font-size:12px;font-weight:700;")
+        title = QLabel(self.t(text_key))
+        title.setProperty("text_key", text_key)
+        title.setStyleSheet("font-size:15px;font-weight:700;color:#1e293b;")
+        h.addWidget(badge)
+        h.addWidget(title)
+        h.addStretch()
+        return row
+
+    def _make_fs_card(self, radio, title_text, desc_key, badge_key=None):
+        card = QFrame()
+        card.setObjectName("fs_card")
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        radio.setText(title_text)
+        radio.setStyleSheet("QRadioButton{font-size:16px;font-weight:700;color:#1e293b;spacing:10px;background:transparent;}")
+        top.addWidget(radio)
+        if badge_key:
+            badge = QLabel(self.t(badge_key))
+            badge.setProperty("text_key", badge_key)
+            badge.setStyleSheet("background:#dcfce7;color:#166534;border-radius:8px;padding:2px 8px;font-size:11px;font-weight:700;")
+            top.addWidget(badge)
+        top.addStretch()
+        v.addLayout(top)
+
+        desc = QLabel(self.t(desc_key))
+        desc.setProperty("text_key", desc_key)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#475569;font-size:12px;background:transparent;")
+        v.addWidget(desc)
+
+        def refresh(checked=None):
+            if radio.isChecked():
+                card.setStyleSheet("QFrame#fs_card{background:#f0f5ff;border:2px solid #4a78ff;border-radius:14px;}")
+            else:
+                card.setStyleSheet("QFrame#fs_card{background:#ffffff;border:1.5px solid #d9e1eb;border-radius:14px;} QFrame#fs_card:hover{border-color:#4a78ff;}")
+        radio.toggled.connect(refresh)
+        card.mousePressEvent = lambda e: radio.setChecked(True)
+        refresh()
+        return card
+
     def create_partitions_page(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1357,19 +1411,43 @@ class InstallerGUI(QMainWindow):
         l.setContentsMargins(0, 0, 8, 0)
         l.addWidget(self.create_title("step_partitions"))
         card, cl = self._create_card()
+        cl.setSpacing(8)
 
-        self.lbl_disk = self._create_label("disk")
+        # ---- 1. Target drive ----
+        cl.addWidget(self._section_header(1, "sec_disk"))
         self.c_disk = self._make_combo()
         self.disks_info = Sys.list_disks()
         for d in self.disks_info:
             self.c_disk.addItem(f"{d['model']} ({d['size']}) - /dev/{d['name']}", f"/dev/{d['name']}")
-
-        cl.addWidget(self.lbl_disk)
         cl.addWidget(self.c_disk)
-        cl.addSpacing(15)
 
-        self.lbl_disk_preview = self._create_label("lbl_disk_layout")
-        cl.addWidget(self.lbl_disk_preview)
+        warn = self._create_alert("disk_warn", "danger")
+        warn_lbl = warn.findChild(QLabel)
+        if warn_lbl:
+            warn_lbl.setProperty("text_key", "disk_warn")
+            warn_lbl.setWordWrap(True)
+        cl.addWidget(warn)
+        cl.addSpacing(10)
+
+        # ---- 2. Root filesystem: XFS / Ext4 ----
+        cl.addWidget(self._section_header(2, "sec_fs"))
+        self.rb_xfs = QRadioButton()
+        self.rb_ext4 = QRadioButton()
+        self.rb_xfs.setChecked(True)
+        self.fs_group = QButtonGroup(self)
+        self.fs_group.addButton(self.rb_xfs)
+        self.fs_group.addButton(self.rb_ext4)
+
+        fs_row = QHBoxLayout()
+        fs_row.setSpacing(14)
+        fs_row.addWidget(self._make_fs_card(self.rb_xfs, "XFS", "fs_xfs_desc", "fs_default_badge"), 1)
+        fs_row.addWidget(self._make_fs_card(self.rb_ext4, "Ext4", "fs_ext4_desc"), 1)
+        cl.addLayout(fs_row)
+        self.rb_xfs.toggled.connect(lambda checked: self.update_disk_preview())
+        cl.addSpacing(10)
+
+        # ---- 3. Layout preview ----
+        cl.addWidget(self._section_header(3, "sec_layout"))
 
         preview_frame = QFrame()
         preview_frame.setStyleSheet("background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 6px;")
@@ -1404,7 +1482,7 @@ class InstallerGUI(QMainWindow):
         cl.addWidget(preview_frame)
 
         legend_box = QFrame()
-        legend_box.setStyleSheet("background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; margin-top: 10px;")
+        legend_box.setStyleSheet("background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; margin-top: 4px;")
         legend_layout = QVBoxLayout(legend_box)
         legend_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -1416,21 +1494,18 @@ class InstallerGUI(QMainWindow):
 
         self.c_disk.currentIndexChanged.connect(self.update_disk_preview)
         self.update_disk_preview()
+        cl.addSpacing(10)
 
-        cl.addSpacing(15)
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("background-color: #e2e8f0; height: 1px;")
-        cl.addWidget(line)
-        cl.addSpacing(15)
-
+        # ---- 4. Encryption ----
+        cl.addWidget(self._section_header(4, "sec_encrypt"))
         self.chk_luks = QCheckBox(self.t("luks"))
         self.chk_luks.setCursor(Qt.CursorShape.PointingHandCursor)
-        lbl_luks_hint = QLabel("Clique na caixa para ativar a encriptação do disco")
-        lbl_luks_hint.setStyleSheet("color:#94a3b8;font-size:12px;margin-bottom:8px;")
+        self.lbl_luks_hint = QLabel(self.t("luks_hint"))
+        self.lbl_luks_hint.setStyleSheet("color:#94a3b8;font-size:12px;margin-bottom:8px;")
+        self.lbl_luks_hint.setWordWrap(True)
         self.lbl_luks_p = self._create_label("luks_p", "font-weight: 600; color: #64748b; margin-top: 10px; margin-bottom: 5px;")
         self.luks_p_wrapper, self.i_luks_p = self._make_password_field(enabled=False)
-        self.i_luks_p.setPlaceholderText("Senha de encriptação do disco")
+        self.i_luks_p.setPlaceholderText(self.t("luks_placeholder"))
         def on_luks_toggle(checked):
             self.luks_p_wrapper.setEnabled(checked)
             self.i_luks_p.setEnabled(checked)
@@ -1442,26 +1517,9 @@ class InstallerGUI(QMainWindow):
         self.chk_luks.toggled.connect(on_luks_toggle)
 
         cl.addWidget(self.chk_luks)
-        cl.addWidget(lbl_luks_hint)
+        cl.addWidget(self.lbl_luks_hint)
         cl.addWidget(self.lbl_luks_p)
         cl.addWidget(self.luks_p_wrapper)
-
-        cl.addSpacing(15)
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.Shape.HLine)
-        line2.setStyleSheet("background-color: #e2e8f0; height: 1px;")
-        cl.addWidget(line2)
-        cl.addSpacing(15)
-
-        self.chk_ext4 = QCheckBox(self.t("use_ext4"))
-        self.chk_ext4.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.lbl_ext4_hint = QLabel(self.t("use_ext4_hint"))
-        self.lbl_ext4_hint.setStyleSheet("color:#94a3b8;font-size:12px;margin-bottom:8px;")
-        self.lbl_ext4_hint.setWordWrap(True)
-        self.chk_ext4.toggled.connect(lambda checked: self.update_disk_preview())
-
-        cl.addWidget(self.chk_ext4)
-        cl.addWidget(self.lbl_ext4_hint)
 
         l.addWidget(card)
         l.addStretch()
@@ -1469,16 +1527,18 @@ class InstallerGUI(QMainWindow):
         return scroll
 
     def update_disk_preview(self):
+        if not hasattr(self, 'lbl_disk_legend') or not hasattr(self, 'rb_ext4'):
+            return
         idx = self.c_disk.currentIndex()
         if idx >= 0 and idx < len(self.disks_info):
             d = self.disks_info[idx]
             size_str = d.get('size', '')
             name = d.get('name', 'sda')
             model = d.get('model', 'Disk')
-            use_ext4 = hasattr(self, 'chk_ext4') and self.chk_ext4.isChecked()
-            fs_type = "EXT4" if use_ext4 else "XFS"
+            fs_type = "EXT4" if self.rb_ext4.isChecked() else "XFS"
             if hasattr(self, 'seg_thin'):
                 self.seg_thin.setToolTip(f"LVM Thin Pool para o Sistema Arvor OS ({fs_type} ~78%)")
+                self.seg_thin.setText(f"Arvor Root {fs_type} (~78%)")
             self.lbl_disk_legend.setText(
                 f"<b>Dispositivo Selecionado:</b> /dev/{name} ({model} - {size_str}) | <b>Tabela:</b> GPT<br>"
                 f"<span style='color:#3b82f6; font-weight:bold;'>[ESP]</span> 512 MiB (FAT32, /boot/efi) &nbsp;&nbsp;&nbsp;&nbsp; "
@@ -2069,7 +2129,7 @@ class InstallerGUI(QMainWindow):
             self.conf["disk"] = self.c_disk.currentData()
             self.conf["luks"] = self.chk_luks.isChecked()
             self.conf["luks_pass"] = self.i_luks_p.text()
-            self.conf["use_ext4"] = self.chk_ext4.isChecked()
+            self.conf["use_ext4"] = self.rb_ext4.isChecked()
         elif idx == 6:
             display_name = self.i_display_name.text().strip()
             user = self.i_user.text().strip()
@@ -2193,5 +2253,5 @@ if __name__ == "__main__":
 
     gui = InstallerGUI()
     gui.apply_styles()
-    gui.show()
+    gui.showMaximized()
     sys.exit(app.exec())
