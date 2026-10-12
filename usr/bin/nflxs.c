@@ -4314,20 +4314,18 @@ struct create_args {
     const char *file;
 };
 
+/* EDIT: Always create the image as sparse via ftruncate, without calling
+ * fallocate. Since the file is designed to be sparse, simply truncating
+ * (setting the logical size without physically allocating blocks) is
+ * sufficient and preserves the required sparse behavior.
+ */
 static void alloc_image(const struct sandbox *sb, uint64_t size)
 {
     int fd = open(sb->img, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0)
         die_errno("create %s", sb->img);
-    if (fallocate(fd, 0, 0, (off_t)size) < 0) {
-        if (errno == EOPNOTSUPP || errno == ENOSYS) {
-            warnx_("the filesystem does not support fallocate; creating a sparse image");
-            if (ftruncate(fd, (off_t)size) < 0)
-                die_errno("ftruncate %s", sb->img);
-        } else {
-            die_errno("fallocate %llu bytes for %s", (unsigned long long)size, sb->img);
-        }
-    }
+    if (ftruncate(fd, (off_t)size) < 0)
+        die_errno("ftruncate %s", sb->img);
     if (close(fd) < 0)
         die_errno("close %s", sb->img);
 }
