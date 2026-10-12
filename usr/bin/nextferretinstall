@@ -52,7 +52,7 @@ FILES = [
     "/usr/share/nextferret/credits",
     "/usr/bin/apt-nf-tree",
     "/etc/weld/sources.list",
-    "/usr/bin/lxsm",
+    "/usr/bin/nflxs",
     "/usr/bin/nsmd_start",
     "/etc/motd",
     "/usr/bin/arvor_sys_info",
