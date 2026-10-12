@@ -11,6 +11,8 @@ import tempfile
 import urllib.request
 import time
 import base64
+import math
+from html import escape as esc
 try:
     from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                  QHBoxLayout, QLabel, QPushButton, QComboBox,
@@ -18,8 +20,9 @@ try:
                                  QTextEdit, QListWidget, QListWidgetItem, QFrame,
                                  QGraphicsDropShadowEffect, QProgressBar, QListView,
                                  QGridLayout, QScrollArea, QRadioButton, QButtonGroup)
-    from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer, QByteArray
+    from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase
+    from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QEvent, QTimer, QByteArray, QRectF, QSize,
+                              QPropertyAnimation, QEasingCurve)
     from PyQt6.QtSvg import QSvgRenderer
 except ImportError:
     from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -28,8 +31,9 @@ except ImportError:
                                  QTextEdit, QListWidget, QListWidgetItem, QFrame,
                                  QGraphicsDropShadowEffect, QProgressBar, QListView,
                                  QGridLayout, QScrollArea, QRadioButton, QButtonGroup)
-    from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter
-    from PySide6.QtCore import Qt, QThread, Signal as pyqtSignal, QEvent, QTimer, QByteArray
+    from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase
+    from PySide6.QtCore import (Qt, QThread, Signal as pyqtSignal, QEvent, QTimer, QByteArray, QRectF, QSize,
+                                QPropertyAnimation, QEasingCurve)
     from PySide6.QtSvg import QSvgRenderer
 
 class _ComboFixer:
@@ -57,21 +61,21 @@ FILES = [
 
 STYLES = """
 QMainWindow{background:#f5f7fb;}
-QWidget{font:14px "Segoe UI",sans-serif;color:#243042;}
-
-QListWidget{background:#162033;border:none;padding:28px 0;}
-QListWidget::item{padding:15px 22px;color:#8e9db4;border-left:3px solid transparent;}
-QListWidget::item:hover{background:#202c42;color:#eef4ff;}
-QListWidget::item:selected{background:#27344d;color:#fff;border-left:3px solid #4a78ff;}
+QWidget{font-size:14px;color:#243042;}
 
 QLabel{color:#243042;}
-QLabel[heading="true"]{font-size:33px;font-weight:600;color:#172033;}
-QLabel[subheading="true"]{font-size:16px;color:#66758d;}
+QLabel[heading="true"]{font-size:28px;font-weight:700;color:#172033;}
+QLabel[subheading="true"]{font-size:15px;color:#66758d;}
 
-QPushButton{background:#fff;border:1px solid #d9e1eb;border-radius:12px;padding:11px 24px;color:#314056;}
+QPushButton{background:#fff;border:1px solid #d9e1eb;border-radius:12px;padding:11px 24px;color:#314056;font-weight:600;}
 QPushButton:hover{background:#f8faff;border-color:#4a78ff;}
+QPushButton:disabled{background:#f1f4f9;color:#a3afc2;border-color:#e5ebf3;}
 QPushButton[primary="true"]{background:#4a78ff;color:#fff;border:none;}
 QPushButton[primary="true"]:hover{background:#3868ef;}
+QPushButton[primary="true"]:pressed{background:#2d58d6;}
+QPushButton[ghost="true"]{background:transparent;border:none;color:#66758d;padding:11px 14px;}
+QPushButton[ghost="true"]:hover{background:#fff1f1;color:#b02b2b;}
+QFrame#navbar{background:transparent;border:none;border-top:1px solid #e3e9f2;}
 
 QLineEdit,QComboBox{background:#fff;border:1px solid #d9e1eb;border-radius:12px;padding:0 14px;min-height:42px;max-height:44px;color:#243042;selection-background-color:#4a78ff;font-size:14px;}
 QLineEdit:focus,QComboBox:focus{border:1.5px solid #4a78ff;background:#fbfcff;}
@@ -91,10 +95,10 @@ QLabel[alert-text="warning"]{color:#8c5a0b;}
 QFrame[alert="danger"]{background:#fff1f1;border:1px solid #f3b7b7;border-radius:10px;}
 QLabel[alert-text="danger"]{color:#b02b2b;}
 
-QTextEdit[log="true"]{background:#131d2d;color:#68d391;border:none;border-radius:12px;padding:14px;font:13px Consolas;}
+QTextEdit[log="true"]{background:#0f1726;color:#7ee0a3;border:none;border-radius:12px;padding:14px;font-size:12px;}
 
 QProgressBar{background:#e4eaf2;border:none;border-radius:6px;height:12px;text-align:center;}
-QProgressBar::chunk{border-radius:6px;background:#4a78ff;}
+QProgressBar::chunk{border-radius:6px;background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #4a78ff,stop:1 #7aa2ff);}
 
 QMessageBox{background-color:#ffffff;border:1px solid #d9e1eb;border-radius:16px;}
 QMessageBox QLabel{color:#1e293b;font-size:14px;font-weight:500;}
@@ -144,6 +148,367 @@ def load_translations():
     return {"en": {"title": "Arvor Linux Installer"}}
 
 TEXT = load_translations()
+
+
+ICONS_SVG = {
+    "smile": '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/>',
+    "map-pin": '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
+    "grid": '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>',
+    "package": '<line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>',
+    "zap": '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+    "hard-drive": '<line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/>',
+    "users": '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    "file-text": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>',
+    "download-cloud": '<polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/>',
+    "check-circle": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+    "arrow-right": '<line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>',
+    "arrow-left": '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
+    "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+    "check": '<polyline points="20 6 9 17 4 12"/>',
+    "rotate-cw": '<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>',
+    "eye": '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+    "eye-off": '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
+    "monitor": '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>',
+    "chevron-down": '<polyline points="6 9 12 15 18 9"/>',
+    "chevron-up": '<polyline points="18 15 12 9 6 15"/>',
+    "terminal": '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
+    "x-circle": '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
+    "alert-triangle": '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+}
+
+
+def svg_pixmap(name, color="#ffffff", size=24, stroke=2.0):
+    inner = ICONS_SVG.get(name)
+    if not inner:
+        return QPixmap()
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+           f'stroke="{color}" stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">{inner}</svg>')
+    scale = 2
+    pm = QPixmap(size * scale, size * scale)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    QSvgRenderer(QByteArray(svg.encode("utf-8"))).render(painter)
+    painter.end()
+    pm.setDevicePixelRatio(scale)
+    return pm
+
+
+def svg_icon(name, color="#ffffff", size=18, stroke=2.0):
+    return QIcon(svg_pixmap(name, color, size, stroke))
+
+
+def load_logo(size=100):
+    for sys_path in [
+        "/usr/share/icons/hicolor/4000x4000/distributor-logo.png",
+        "/usr/share/icons/hicolor/scalable/apps/distributor-logo.svg",
+        "/usr/share/pixmaps/arvor.png",
+    ]:
+        if os.path.exists(sys_path):
+            pm = QPixmap(sys_path)
+            if not pm.isNull():
+                return pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+    try:
+        renderer = QSvgRenderer(QByteArray(ARVOR_LOGO_SVG.encode("utf-8")))
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        renderer.render(painter)
+        painter.end()
+        return pm
+    except Exception:
+        return QPixmap()
+
+
+_LANGS = ("en", "pt", "es", "fr", "de", "gl")
+_EXTRA_RAW = {
+    "ui_step_of": ("Step {n} of {total}", "Etapa {n} de {total}", "Paso {n} de {total}", "Étape {n} sur {total}", "Schritt {n} von {total}", "Paso {n} de {total}"),
+    "ui_cancel": ("Cancel", "Cancelar", "Cancelar", "Annuler", "Abbrechen", "Cancelar"),
+    "ui_quit_title": ("Quit installer?", "Sair do instalador?", "¿Salir del instalador?", "Quitter l'installateur ?", "Installer beenden?", "Saír do instalador?"),
+    "ui_quit_msg": ("Nothing has been changed on your disks yet. Do you really want to quit?",
+                    "Nada foi alterado nos seus discos ainda. Deseja realmente sair?",
+                    "Aún no se ha modificado nada en sus discos. ¿Realmente desea salir?",
+                    "Rien n'a encore été modifié sur vos disques. Voulez-vous vraiment quitter ?",
+                    "Auf Ihren Datenträgern wurde noch nichts geändert. Wirklich beenden?",
+                    "Aínda non se modificou nada nos seus discos. Realmente quere saír?"),
+    "ui_retry": ("Try again", "Tentar novamente", "Reintentar", "Réessayer", "Erneut versuchen", "Tentar de novo"),
+    "ui_elapsed": ("Elapsed", "Decorrido", "Transcurrido", "Écoulé", "Verstrichen", "Transcorrido"),
+    "ui_install_wait": ("This may take several minutes. Keep your computer plugged in and do not turn it off.",
+                        "Isso pode levar vários minutos. Mantenha o computador na tomada e não o desligue.",
+                        "Esto puede tardar varios minutos. Mantenga el equipo enchufado y no lo apague.",
+                        "Cela peut prendre plusieurs minutes. Gardez l'ordinateur branché et ne l'éteignez pas.",
+                        "Das kann mehrere Minuten dauern. Lassen Sie den Computer angeschlossen und schalten Sie ihn nicht aus.",
+                        "Isto pode levar varios minutos. Manteña o ordenador enchufado e non o apague."),
+    "ui_phase_disk": ("Preparing disk", "Preparando o disco", "Preparando el disco", "Préparation du disque", "Datenträger vorbereiten", "Preparando o disco"),
+    "ui_phase_format": ("Creating volumes", "Criando volumes", "Creando volúmenes", "Création des volumes", "Volumes erstellen", "Creando volumes"),
+    "ui_phase_base": ("Installing base system", "Instalando o sistema base", "Instalando el sistema base", "Installation du système de base", "Basissystem installieren", "Instalando o sistema base"),
+    "ui_phase_config": ("Configuring system and packages", "Configurando sistema e pacotes", "Configurando sistema y paquetes", "Configuration du système et des paquets", "System und Pakete konfigurieren", "Configurando sistema e paquetes"),
+    "ui_phase_finish": ("Finishing up", "Finalizando", "Finalizando", "Finalisation", "Abschließen", "Rematando"),
+    "ui_failed": ("Installation failed", "A instalação falhou", "La instalación falló", "L'installation a échoué", "Installation fehlgeschlagen", "A instalación fallou"),
+    "ui_failed_hint": ("Check the log below for details. You can go back to change your settings or try again.",
+                       "Veja o log abaixo para detalhes. Você pode voltar para alterar as configurações ou tentar novamente.",
+                       "Consulte el registro de abajo para más detalles. Puede volver para cambiar la configuración o reintentar.",
+                       "Consultez le journal ci-dessous. Vous pouvez revenir modifier vos réglages ou réessayer.",
+                       "Details stehen im Protokoll unten. Sie können zurückgehen und Einstellungen ändern oder es erneut versuchen.",
+                       "Consulte o rexistro de abaixo. Pode volver para cambiar a configuración ou tentar de novo."),
+    "ui_installer": ("Installer", "Instalador", "Instalador", "Installateur", "Installer", "Instalador"),
+    "ui_starting": ("Starting installer…", "Iniciando o instalador…", "Iniciando el instalador…", "Démarrage de l'installateur…", "Installer wird gestartet…", "Iniciando o instalador…"),
+    "ui_checking_net": ("Checking network connection…", "Verificando a conexão de rede…", "Comprobando la conexión de red…", "Vérification de la connexion réseau…", "Netzwerkverbindung wird geprüft…", "Comprobando a conexión de rede…"),
+    "ui_detecting": ("Detecting hardware and disks…", "Detectando hardware e discos…", "Detectando hardware y discos…", "Détection du matériel et des disques…", "Hardware und Datenträger werden erkannt…", "Detectando hardware e discos…"),
+    "ui_finish_hint": ("Your system is ready. Remove the installation media and restart to start using Arvor Linux.",
+                       "Seu sistema está pronto. Remova a mídia de instalação e reinicie para começar a usar o Arvor Linux.",
+                       "Su sistema está listo. Retire el medio de instalación y reinicie para empezar a usar Arvor Linux.",
+                       "Votre système est prêt. Retirez le support d'installation et redémarrez pour utiliser Arvor Linux.",
+                       "Ihr System ist bereit. Entfernen Sie das Installationsmedium und starten Sie neu, um Arvor Linux zu nutzen.",
+                       "O seu sistema está listo. Retire o medio de instalación e reinicie para comezar a usar Arvor Linux."),
+    "ui_sub_location": ("Choose your language region and time zone.", "Escolha a região de idioma e o fuso horário.", "Elija la región de idioma y la zona horaria.", "Choisissez la région linguistique et le fuseau horaire.", "Wählen Sie Sprachregion und Zeitzone.", "Escolla a rexión de idioma e o fuso horario."),
+    "ui_sub_keyboard": ("Pick your keyboard layout and test it below.", "Escolha o layout do teclado e teste abaixo.", "Elija la distribución del teclado y pruébela abajo.", "Choisissez la disposition du clavier et testez-la ci-dessous.", "Wählen Sie das Tastaturlayout und testen Sie es unten.", "Escolla a disposición do teclado e próbea embaixo."),
+    "ui_sub_desktop": ("Choose a desktop environment and the apps you want.", "Escolha o ambiente de desktop e os aplicativos desejados.", "Elija el entorno de escritorio y las aplicaciones que desee.", "Choisissez l'environnement de bureau et les applications souhaitées.", "Wählen Sie die Desktop-Umgebung und gewünschte Apps.", "Escolla o contorno de escritorio e as aplicacións que desexe."),
+    "ui_sub_partitions": ("Select the target disk. All data on it will be erased.", "Selecione o disco de destino. Todos os dados nele serão apagados.", "Seleccione el disco de destino. Se borrarán todos sus datos.", "Sélectionnez le disque cible. Toutes ses données seront effacées.", "Wählen Sie den Zieldatenträger. Alle Daten darauf werden gelöscht.", "Seleccione o disco de destino. Borraranse todos os seus datos."),
+    "ui_sub_users": ("Create your account and name this computer.", "Crie sua conta e dê um nome a este computador.", "Cree su cuenta y dé un nombre a este equipo.", "Créez votre compte et nommez cet ordinateur.", "Erstellen Sie Ihr Konto und benennen Sie diesen Computer.", "Cree a súa conta e dea un nome a este ordenador."),
+    "ui_sub_summary": ("Review your choices. Nothing is written to disk until you click Install.", "Revise suas escolhas. Nada é gravado no disco até você clicar em Instalar.", "Revise sus elecciones. No se escribe nada en el disco hasta que pulse Instalar.", "Vérifiez vos choix. Rien n'est écrit sur le disque avant de cliquer sur Installer.", "Prüfen Sie Ihre Auswahl. Erst beim Klick auf Installieren wird etwas geschrieben.", "Revise as súas escollas. Non se escribe nada no disco ata premer Instalar."),
+    "ui_sub_install": ("Sit back while Arvor Linux is being installed.", "Relaxe enquanto o Arvor Linux é instalado.", "Relájese mientras se instala Arvor Linux.", "Détendez-vous pendant l'installation d'Arvor Linux.", "Lehnen Sie sich zurück, während Arvor Linux installiert wird.", "Relaxe mentres se instala Arvor Linux."),
+    "ui_sum_hw": ("System & hardware", "Sistema e hardware", "Sistema y hardware", "Système et matériel", "System & Hardware", "Sistema e hardware"),
+    "ui_sum_cpu": ("Processor", "Processador", "Procesador", "Processeur", "Prozessor", "Procesador"),
+    "ui_sum_ram": ("Memory", "Memória", "Memoria", "Mémoire", "Arbeitsspeicher", "Memoria"),
+    "ui_sum_enc": ("Disk encryption", "Criptografia de disco", "Cifrado de disco", "Chiffrement du disque", "Datenträgerverschlüsselung", "Cifrado de disco"),
+    "ui_sum_on": ("Enabled", "Ativada", "Activado", "Activé", "Aktiviert", "Activado"),
+    "ui_sum_off": ("Disabled", "Desativada", "Desactivado", "Désactivé", "Deaktiviert", "Desactivado"),
+    "ui_sum_fs": ("Root filesystem", "Sistema de arquivos raiz", "Sistema de archivos raíz", "Système de fichiers racine", "Root-Dateisystem", "Sistema de ficheiros raíz"),
+    "ui_sum_swap": ("Memory & swap", "Memória e swap", "Memoria y swap", "Mémoire et swap", "Speicher & Swap", "Memoria e swap"),
+    "ui_sum_disk": ("Target disk", "Disco de destino", "Disco de destino", "Disque cible", "Zieldatenträger", "Disco de destino"),
+    "ui_sum_user": ("User", "Usuário", "Usuario", "Utilisateur", "Benutzer", "Usuario"),
+    "ui_sum_host": ("Computer name", "Nome do computador", "Nombre del equipo", "Nom de l'ordinateur", "Computername", "Nome do ordenador"),
+    "ui_sum_apps": ("Extra software", "Software extra", "Software adicional", "Logiciels supplémentaires", "Zusätzliche Software", "Software adicional"),
+    "ui_part_esp": ("EFI System Partition", "Partição EFI (boot UEFI)", "Partición EFI (arranque UEFI)", "Partition système EFI", "EFI-Systempartition", "Partición EFI (arranque UEFI)"),
+    "ui_part_boot": ("Boot partition", "Partição de boot", "Partición de arranque", "Partition de démarrage", "Boot-Partition", "Partición de arranque"),
+    "ui_part_root": ("Arvor system", "Sistema Arvor", "Sistema Arvor", "Système Arvor", "Arvor-System", "Sistema Arvor"),
+    "ui_part_snap": ("Snapshot reserve", "Reserva para snapshots", "Reserva para snapshots", "Réserve de snapshots", "Snapshot-Reserve", "Reserva para snapshots"),
+    "ui_part_snap_d": ("free space kept in LVM for restore points", "espaço livre no LVM para pontos de restauração", "espacio libre en LVM para puntos de restauración", "espace libre LVM pour les points de restauration", "freier LVM-Platz für Wiederherstellungspunkte", "espazo libre no LVM para puntos de restauración"),
+    "ui_disk_small": ("This disk is too small. At least {min} GiB is required.", "Este disco é pequeno demais. São necessários pelo menos {min} GiB.", "Este disco es demasiado pequeño. Se requieren al menos {min} GiB.", "Ce disque est trop petit. Il faut au moins {min} GiB.", "Dieser Datenträger ist zu klein. Mindestens {min} GiB erforderlich.", "Este disco é demasiado pequeno. Fan falta polo menos {min} GiB."),
+    "ui_disk_erase": ("Everything on {disk} will be permanently erased.", "Tudo em {disk} será apagado permanentemente.", "Todo en {disk} se borrará permanentemente.", "Tout sur {disk} sera effacé définitivement.", "Alles auf {disk} wird dauerhaft gelöscht.", "Todo en {disk} borrarase permanentemente."),
+    "ui_advanced": ("Advanced options (filesystem, encryption)", "Opções avançadas (sistema de arquivos, criptografia)", "Opciones avanzadas (sistema de archivos, cifrado)", "Options avancées (système de fichiers, chiffrement)", "Erweiterte Optionen (Dateisystem, Verschlüsselung)", "Opcións avanzadas (sistema de ficheiros, cifrado)"),
+    "ui_part_bootfiles": ("Boot files", "Arquivos de boot", "Archivos de arranque", "Fichiers de démarrage", "Startdateien", "Ficheiros de arranque"),
+    "ui_sec_result": ("What will be created", "O que será criado", "Qué se creará", "Ce qui sera créé", "Was erstellt wird", "O que se creará"),
+    "ui_disk_none": ("No disks detected.", "Nenhum disco detectado.", "No se detectaron discos.", "Aucun disque détecté.", "Keine Datenträger gefunden.", "Non se detectaron discos."),
+    "ui_sum_none": ("None", "Nenhum", "Ninguno", "Aucun", "Keine", "Ningún"),
+}
+EXTRA_TEXT = {lg: {k: v[i] for k, v in _EXTRA_RAW.items()} for i, lg in enumerate(_LANGS)}
+
+
+def tr(lang, key):
+    """translations.json first, then built-in extras, then English, then the key itself."""
+    for table in (TEXT.get(lang, {}), EXTRA_TEXT.get(lang, {}), TEXT.get("en", {}), EXTRA_TEXT.get("en", {})):
+        if key in table:
+            return table[key]
+    return key
+
+
+def guess_ui_lang():
+    env = (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower()
+    for code in ("pt", "es", "fr", "de", "gl"):
+        if env.startswith(code):
+            return code
+    return "en"
+
+
+TITLE_ICONS = {
+    "welcome_msg": "smile", "step_location": "map-pin", "step_keyboard": "grid",
+    "step_desktop": "package", "zram_title": "zap", "step_partitions": "hard-drive",
+    "step_users": "users", "step_summary": "file-text", "step_install": "download-cloud",
+}
+AUTO_SUB = {
+    "step_location": "ui_sub_location", "step_keyboard": "ui_sub_keyboard",
+    "step_desktop": "ui_sub_desktop", "step_partitions": "ui_sub_partitions",
+    "step_users": "ui_sub_users", "step_summary": "ui_sub_summary", "step_install": "ui_sub_install",
+}
+MIN_DISK_GIB = 20
+PHASE_THRESHOLDS = (0, 15, 25, 55, 90)
+PHASE_KEYS = ("ui_phase_disk", "ui_phase_format", "ui_phase_base", "ui_phase_config", "ui_phase_finish")
+
+
+class Spinner(QWidget):
+    """Animated loading spinner (arc that grows/shrinks while rotating)."""
+
+    def __init__(self, size=28, color="#4a78ff", track="#dbe4f5", thickness=3, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self._color = QColor(color)
+        self._track = QColor(track)
+        self._thick = thickness
+        self.setFixedSize(size, size)
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.update()
+
+    def _tick(self):
+        self._angle = (self._angle + 6) % 720
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        m = self._thick / 2 + 1
+        rect = QRectF(m, m, self.width() - 2 * m, self.height() - 2 * m)
+        pen = QPen(self._track, self._thick)
+        p.setPen(pen)
+        p.drawEllipse(rect)
+        if not self._timer.isActive():
+            return
+        pen = QPen(self._color, self._thick)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        span = 50 + 190 * (0.5 + 0.5 * math.sin(math.radians(self._angle)))
+        start = -(self._angle * 2) + 90
+        p.drawArc(rect, int(start * 16), int(-span * 16))
+
+
+class StepItem(QWidget):
+    """One row of the sidebar: numbered / icon / check badge + label."""
+
+    def __init__(self, number, text, icon_name, parent=None):
+        super().__init__(parent)
+        self.number = number
+        self.icon_name = icon_name
+        self._state = None
+        self.setObjectName("step_item")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(46)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(22, 0, 18, 0)
+        h.setSpacing(14)
+        self.badge = QLabel()
+        self.badge.setFixedSize(26, 26)
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label = QLabel(text)
+        h.addWidget(self.badge)
+        h.addWidget(self.label, 1)
+        self.set_state("pending")
+
+    def set_text(self, text):
+        self.label.setText(text)
+
+    def set_state(self, state):
+        if state == self._state:
+            return
+        self._state = state
+        self.badge.clear()
+        if state == "done":
+            self.setStyleSheet("QWidget#step_item{background:transparent;border-left:3px solid transparent;}")
+            self.badge.setStyleSheet("background:#22c55e;border-radius:13px;")
+            self.badge.setPixmap(svg_pixmap("check", "#ffffff", 14, 3))
+            self.label.setStyleSheet("color:#b6c3d8;font-size:14px;background:transparent;")
+        elif state == "current":
+            self.setStyleSheet("QWidget#step_item{background:#27344d;border-left:3px solid #4a78ff;}")
+            self.badge.setStyleSheet("background:#4a78ff;border-radius:13px;")
+            self.badge.setPixmap(svg_pixmap(self.icon_name, "#ffffff", 14, 2.2))
+            self.label.setStyleSheet("color:#ffffff;font-size:14px;font-weight:600;background:transparent;")
+        else:
+            self.setStyleSheet("QWidget#step_item{background:transparent;border-left:3px solid transparent;}")
+            self.badge.setStyleSheet("background:transparent;border:1.5px solid #3b4a66;border-radius:13px;"
+                                     "color:#7d8ca6;font-size:11px;font-weight:700;")
+            self.badge.setText(str(self.number))
+            self.label.setStyleSheet("color:#7d8ca6;font-size:14px;background:transparent;")
+
+
+class PhaseChip(QFrame):
+    """One install phase: pending (number) -> active (spinner) -> done (check)."""
+
+    def __init__(self, number, text, parent=None):
+        super().__init__(parent)
+        self.number = number
+        self._state = None
+        self.setObjectName("phase_chip")
+        self.setMinimumHeight(48)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(10, 8, 10, 8)
+        h.setSpacing(8)
+        self.holder = QStackedWidget()
+        self.holder.setFixedSize(22, 22)
+        self.badge = QLabel()
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spin = Spinner(22, "#4a78ff", "#cfdcff", 2)
+        self.holder.addWidget(self.badge)
+        self.holder.addWidget(self.spin)
+        self.label = QLabel(text)
+        self.label.setWordWrap(True)
+        h.addWidget(self.holder)
+        h.addWidget(self.label, 1)
+        self.set_state("pending")
+
+    def set_text(self, text):
+        self.label.setText(text)
+
+    def set_state(self, state):
+        if state == self._state:
+            return
+        self._state = state
+        self.badge.clear()
+        self.spin.stop()
+        if state == "active":
+            self.setStyleSheet("QFrame#phase_chip{background:#f0f5ff;border:1.5px solid #4a78ff;border-radius:12px;}")
+            self.holder.setCurrentWidget(self.spin)
+            self.spin.start()
+            self.label.setStyleSheet("color:#1e3a8a;font-size:12px;font-weight:700;background:transparent;")
+        elif state == "failed":
+            self.setStyleSheet("QFrame#phase_chip{background:#fff1f1;border:1.5px solid #f3b7b7;border-radius:12px;}")
+            self.holder.setCurrentWidget(self.badge)
+            self.badge.setStyleSheet("background:transparent;")
+            self.badge.setPixmap(svg_pixmap("x-circle", "#dc2626", 20, 2.2))
+            self.label.setStyleSheet("color:#b02b2b;font-size:12px;font-weight:700;background:transparent;")
+        elif state == "done":
+            self.setStyleSheet("QFrame#phase_chip{background:#effaf3;border:1px solid #bbf0cf;border-radius:12px;}")
+            self.holder.setCurrentWidget(self.badge)
+            self.badge.setStyleSheet("background:#22c55e;border-radius:11px;")
+            self.badge.setPixmap(svg_pixmap("check", "#ffffff", 13, 3))
+            self.label.setStyleSheet("color:#166534;font-size:12px;font-weight:600;background:transparent;")
+        else:
+            self.setStyleSheet("QFrame#phase_chip{background:#f5f7fb;border:1px solid #e5ebf3;border-radius:12px;}")
+            self.holder.setCurrentWidget(self.badge)
+            self.badge.setStyleSheet("background:transparent;border:1.5px solid #cbd5e1;border-radius:11px;"
+                                     "color:#94a3b8;font-size:11px;font-weight:700;")
+            self.badge.setText(str(self.number))
+            self.label.setStyleSheet("color:#94a3b8;font-size:12px;background:transparent;")
+
+
+class NetCheckWorker(QThread):
+    result = pyqtSignal(bool)
+
+    def run(self):
+        self.result.emit(NetUtils.check_connection())
+
+
+class LoadingOverlay(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("overlay")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("QWidget#overlay{background:rgba(245,247,251,225);}")
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spinner = Spinner(46, "#4a78ff", "#dbe4f5", 4)
+        lay.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignCenter)
+        self.hide()
+
+    def begin(self):
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+        self.spinner.start()
+
+    def end(self):
+        self.spinner.stop()
+        self.hide()
+
 
 class NetUtils:
     @staticmethod
@@ -690,6 +1055,8 @@ efibootmgr -c -d {self.conf["disk"]} -p 1 -L "Arvor Linux" -l "\\EFI\\arvor-linu
 update-grub
 
 weld sync
+weld upgrade --apply-host
+weld clean
 apt-get clean
 rm /s.sh
 exit 0
@@ -719,7 +1086,7 @@ exit 0
 
 
 class InstallerGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, boot=None):
         super().__init__()
         self.swap_modes = [
             ("zram", "swap_zram"),
@@ -730,11 +1097,18 @@ class InstallerGUI(QMainWindow):
             ("none", "swap_none")
         ]
 
-        self.list_of_locales = Sys.list_locales()
-        self.list_of_keymaps = Sys.list_keymaps()
-        self.list_of_timezones = Sys.list_timezones()
+        if boot is None:
+            boot = {
+                "locales": Sys.list_locales(),
+                "keymaps": Sys.list_keymaps(),
+                "timezones": Sys.list_timezones(),
+                "defaults": Sys.detect_system_defaults(),
+            }
+        self.list_of_locales = boot["locales"]
+        self.list_of_keymaps = boot["keymaps"]
+        self.list_of_timezones = boot["timezones"]
 
-        auto_lang_idx, auto_locale, auto_keymap, auto_tz = Sys.detect_system_defaults()
+        auto_lang_idx, auto_locale, auto_keymap, auto_tz = boot["defaults"]
         self.initial_lang_idx = auto_lang_idx
 
         self.lang_map = {
@@ -775,26 +1149,21 @@ class InstallerGUI(QMainWindow):
         self.init_ui()
 
     def t(self, key):
-        return TEXT[self.ui_lang].get(key, key)
+        return tr(self.ui_lang, key)
 
     def preload_icons(self):
-        sidebar_icons = {"welcome": "smile", "location": "map-pin", "keyboard": "grid", "software": "package", "zram": "zap", "disk": "hard-drive", "users": "users", "summary": "file-text", "install": "download-cloud", "finish": "check-circle"}
-        for k, v in sidebar_icons.items():
-            data = NetUtils.get_svg_data(v, to_white=True)
-            if data:
-                pm = QPixmap()
-                pm.loadFromData(data)
-                self.sidebar_icon_cache[k] = QIcon(pm)
+        self.sidebar_icon_names = {"welcome": "smile", "location": "map-pin", "keyboard": "grid", "software": "package",
+                                   "zram": "zap", "disk": "hard-drive", "users": "users", "summary": "file-text",
+                                   "install": "download-cloud", "finish": "check-circle"}
+        self.icon_cache = {
+            "next": svg_icon("arrow-right", "#ffffff", 18),
+            "back": svg_icon("arrow-left", "#475569", 18),
+            "install_btn": svg_icon("download", "#ffffff", 18),
+            "check_btn": svg_icon("check", "#ffffff", 18),
+            "retry": svg_icon("rotate-cw", "#ffffff", 18),
+        }
 
-        nav_icons = {"next": "arrow-right", "back": "arrow-left", "install_btn": "download", "check_btn": "check"}
-        for k, v in nav_icons.items():
-            data = NetUtils.get_svg_data(v, to_white=False)
-            if data:
-                pm = QPixmap()
-                pm.loadFromData(data)
-                self.icon_cache[k] = QIcon(pm)
-
-    def get_sidebar_icon(self, name): return self.sidebar_icon_cache.get(name, QIcon())
+    def get_sidebar_icon(self, name): return svg_icon(self.sidebar_icon_names.get(name, ""), "#ffffff", 18)
     def get_nav_icon(self, name): return self.icon_cache.get(name, QIcon())
 
     def init_ui(self):
@@ -802,94 +1171,90 @@ class InstallerGUI(QMainWindow):
         self.setMinimumSize(1150, 750)
 
         main_widget = QWidget()
-        main_layout = QHBoxLayout()
+        main_layout = QHBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
         sidebar_panel = QWidget()
+        sidebar_panel.setObjectName("sidebar_panel")
         sidebar_panel.setFixedWidth(280)
-        sidebar_panel.setStyleSheet("background:#162033;")
-        sidebar_layout = QVBoxLayout()
+        sidebar_panel.setStyleSheet("QWidget#sidebar_panel{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #162033,stop:1 #0f1829);}")
+        sidebar_layout = QVBoxLayout(sidebar_panel)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(0)
-
+        
         logo_header = QWidget()
-        logo_header.setFixedHeight(145)
-        logo_header.setStyleSheet("background:#162033;")
-        logo_layout = QVBoxLayout(logo_header)
-        logo_layout.setContentsMargins(0, 12, 0, 12)
-        logo_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_header.setFixedHeight(170)
+        lh = QVBoxLayout(logo_header)
+        lh.setContentsMargins(0, 28, 0, 14)
+        lh.setSpacing(0)
+        lh.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.sidebar_logo = QLabel(logo_header)
-        self.sidebar_logo.setFixedSize(112, 112)
+        self.sidebar_logo = QLabel()
+        self.sidebar_logo.setFixedSize(110, 110)
         self.sidebar_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sidebar_logo.setStyleSheet("background:transparent; border:none; padding:0;")
+        self.sidebar_logo.setStyleSheet("background:transparent;border:none;padding:0;")
+        self.sidebar_logo.setPixmap(load_logo(100))
 
-        logo_loaded = False
-        for sys_path in [
-            "/usr/share/icons/hicolor/4000x4000/distributor-logo.png",
-            "/usr/share/icons/hicolor/scalable/apps/distributor-logo.svg",
-            "/usr/share/pixmaps/arvor.png"
-        ]:
-            if os.path.exists(sys_path):
-                pm = QPixmap(sys_path)
-                if not pm.isNull():
-                    self.sidebar_logo.setPixmap(
-                        pm.scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio,
-                                  Qt.TransformationMode.SmoothTransformation)
-                    )
-                    logo_loaded = True
-                    break
-
-        if not logo_loaded:
-            try:
-                renderer = QSvgRenderer(QByteArray(ARVOR_LOGO_SVG.encode('utf-8')))
-                pm = QPixmap(100, 100)
-                pm.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(pm)
-                renderer.render(painter)
-                painter.end()
-                if not pm.isNull():
-                    self.sidebar_logo.setPixmap(pm)
-            except Exception:
-                self.sidebar_logo.setText("")
-
-        logo_layout.addWidget(self.sidebar_logo, 0, Qt.AlignmentFlag.AlignCenter)
+        lh.addWidget(self.sidebar_logo, 0, Qt.AlignmentFlag.AlignCenter)
         sidebar_layout.addWidget(logo_header, 0)
+        
 
-        self.sidebar = QListWidget()
-        self.sidebar.setStyleSheet("QListWidget{background:#162033;border:none;padding:0;} QListWidget::item{padding:15px 22px;color:#8e9db4;border-left:3px solid transparent;} QListWidget::item:hover{background:#202c42;color:#eef4ff;} QListWidget::item:selected{background:#27344d;color:#fff;border-left:3px solid #4a78ff;}")
-        self.sidebar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.sidebar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
+        steps_wrap = QWidget()
+        sl = QVBoxLayout(steps_wrap)
+        sl.setContentsMargins(0, 6, 0, 6)
+        sl.setSpacing(2)
+        self.step_items = []
         for i, s in enumerate(self.steps):
-            item = QListWidgetItem(self.get_sidebar_icon(self.step_keys[i]), self.t(s))
-            self.sidebar.addItem(item)
+            it = StepItem(i + 1, self.t(s), self.sidebar_icon_names[self.step_keys[i]])
+            self.step_items.append(it)
+            sl.addWidget(it)
+        sl.addStretch()
+        sidebar_layout.addWidget(steps_wrap, 1)
 
-        sidebar_layout.addWidget(self.sidebar, 1)
-        sidebar_panel.setLayout(sidebar_layout)
+        if SIMULATE:
+            sim = QLabel("SIMULATION MODE")
+            sim.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sim.setStyleSheet("background:#3a2e0f;color:#fbbf24;border-radius:8px;margin:14px 40px;padding:6px;"
+                              "font-size:11px;font-weight:700;letter-spacing:1px;")
+            sidebar_layout.addWidget(sim)
+        else:
+            sidebar_layout.addSpacing(18)
+
         main_layout.addWidget(sidebar_panel)
 
         right_panel = QWidget()
-        right_layout = QVBoxLayout()
-        right_layout.setContentsMargins(50, 50, 50, 40)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(50, 34, 50, 28)
+        right_layout.setSpacing(0)
+
+        self.lbl_step = QLabel("")
+        self.lbl_step.setStyleSheet("color:#4a78ff;font-size:12px;font-weight:700;letter-spacing:1.5px;")
+        self.wizard_bar = QProgressBar()
+        self.wizard_bar.setRange(0, len(self.steps))
+        self.wizard_bar.setTextVisible(False)
+        self.wizard_bar.setFixedHeight(4)
+        self.wizard_bar.setStyleSheet("QProgressBar{background:#e4eaf2;border:none;border-radius:2px;}"
+                                      "QProgressBar::chunk{background:#4a78ff;border-radius:2px;}")
+        right_layout.addWidget(self.lbl_step)
+        right_layout.addSpacing(8)
+        right_layout.addWidget(self.wizard_bar)
+        right_layout.addSpacing(26)
 
         self.stack = QStackedWidget()
+        self.overlay = LoadingOverlay(self.stack)
         self.build_pages()
-        right_layout.addWidget(self.stack)
+        right_layout.addWidget(self.stack, 1)
 
         self.nav_container = self.create_nav_bar()
-        right_layout.addSpacing(25)
+        right_layout.addSpacing(14)
         right_layout.addWidget(self.nav_container)
 
-        right_panel.setLayout(right_layout)
-        main_layout.addWidget(right_panel)
-        main_widget.setLayout(main_layout)
+        main_layout.addWidget(right_panel, 1)
         self.setCentralWidget(main_widget)
 
-        self.update_sidebar()
-        self.btn_back.setEnabled(False)
         self.change_language(self.initial_lang_idx)
+        self.refresh_nav()
 
     def build_pages(self):
         self.stack.addWidget(self.create_welcome_page())
@@ -905,48 +1270,104 @@ class InstallerGUI(QMainWindow):
 
     def create_nav_bar(self):
         nav_frame = QFrame()
-        nav_frame.setProperty("card", "true")
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(30)
-        shadow.setColor(QColor(0, 0, 0, 20))
-        shadow.setOffset(0, 6)
-        nav_frame.setGraphicsEffect(shadow)
-        nav_layout = QHBoxLayout()
-        nav_layout.setContentsMargins(25, 20, 25, 20)
+        nav_frame.setObjectName("navbar")
+        nav_layout = QHBoxLayout(nav_frame)
+        nav_layout.setContentsMargins(0, 18, 0, 0)
+        nav_layout.setSpacing(12)
+
+        self.btn_quit = QPushButton(self.t("ui_cancel"))
+        self.btn_quit.setProperty("ghost", "true")
+        self.btn_quit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_quit.clicked.connect(self.confirm_quit)
+
         self.btn_back = QPushButton(self.get_nav_icon("back"), self.t("back"))
         self.btn_next = QPushButton(self.get_nav_icon("next"), self.t("next"))
         self.btn_next.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.btn_next.setProperty("primary", "true")
-        self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        for b in (self.btn_back, self.btn_next):
+            b.setMinimumHeight(46)
+            b.setIconSize(QSize(18, 18))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_back.setMinimumWidth(110)
+        self.btn_next.setMinimumWidth(150)
         self.btn_back.clicked.connect(self.go_back)
         self.btn_next.clicked.connect(self.go_next)
+
+        nav_layout.addWidget(self.btn_quit)
         nav_layout.addStretch()
         nav_layout.addWidget(self.btn_back)
-        nav_layout.addSpacing(15)
         nav_layout.addWidget(self.btn_next)
-        nav_frame.setLayout(nav_layout)
         return nav_frame
 
+    def confirm_quit(self):
+        r = QMessageBox.question(self, self.t("ui_quit_title"), self.t("ui_quit_msg"),
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                 QMessageBox.StandardButton.No)
+        if r == QMessageBox.StandardButton.Yes:
+            QApplication.instance().quit()
+
     def update_sidebar(self):
-        idx = self.stack.currentIndex()
-        for i in range(self.sidebar.count()):
-            self.sidebar.item(i).setSelected(i == idx)
+        if not hasattr(self, 'step_items'):
+            return
+        idx = max(0, self.stack.currentIndex())
+        for i, it in enumerate(self.step_items):
+            it.set_state("done" if i < idx else ("current" if i == idx else "pending"))
+        if hasattr(self, 'lbl_step'):
+            self.lbl_step.setText(self.t("ui_step_of").format(n=idx + 1, total=len(self.steps)).upper())
+            self.wizard_bar.setValue(idx + 1)
+
+    def refresh_nav(self):
+        """Single place that decides labels / visibility of the bottom buttons for the current page."""
+        if not hasattr(self, 'btn_next'):
+            return
+        idx = max(0, self.stack.currentIndex())
+        self.btn_back.setEnabled(idx > 0)
+        self.btn_back.setVisible(idx != 9)
+        self.btn_quit.setVisible(idx < 8)
+        self.btn_next.show()
+        if idx == 7:
+            self.btn_next.setText(self.t("install"))
+            self.btn_next.setIcon(self.get_nav_icon("install_btn"))
+        elif idx == 8:
+            self.btn_next.setText(self.t("ui_retry"))
+            self.btn_next.setIcon(self.get_nav_icon("retry"))
+        elif idx == 9:
+            self.btn_next.setText(self.t("quit"))
+            self.btn_next.setIcon(self.get_nav_icon("check_btn"))
+        else:
+            self.btn_next.setText(self.t("next"))
+            self.btn_next.setIcon(self.get_nav_icon("next"))
+        self.update_sidebar()
 
     def create_title(self, text_key, sub_key=None):
+        sub_key = sub_key or AUTO_SUB.get(text_key)
         container = QWidget()
-        l = QVBoxLayout()
-        l.setContentsMargins(0,0,0,25)
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 22)
+        h.setSpacing(16)
+
+        icon_name = TITLE_ICONS.get(text_key)
+        if icon_name:
+            badge = QLabel()
+            badge.setFixedSize(54, 54)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setPixmap(svg_pixmap(icon_name, "#ffffff", 26, 2))
+            badge.setStyleSheet("background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4a78ff,stop:1 #6f5bff);border-radius:16px;")
+            h.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+
+        v = QVBoxLayout()
+        v.setSpacing(3)
         lbl = QLabel(self.t(text_key))
         lbl.setProperty("text_key", text_key)
         lbl.setProperty("heading", "true")
-        l.addWidget(lbl)
+        v.addWidget(lbl)
         if sub_key:
             sub = QLabel(self.t(sub_key))
             sub.setProperty("text_key", sub_key)
             sub.setProperty("subheading", "true")
-            l.addWidget(sub)
-        container.setLayout(l)
+            sub.setWordWrap(True)
+            v.addWidget(sub)
+        h.addLayout(v, 1)
         return container
 
     def _create_card(self):
@@ -1039,7 +1460,8 @@ class InstallerGUI(QMainWindow):
         self.update_sidebar()
 
         for i, s in enumerate(self.steps):
-            self.sidebar.item(i).setText(self.t(s))
+            if hasattr(self, 'step_items'):
+                self.step_items[i].set_text(self.t(s))
 
         if hasattr(self, 'lbl_lang'): self.lbl_lang.setText(self.t("locale"))
         if hasattr(self, 'lbl_loc'): self.lbl_loc.setText(self.t("locale"))
@@ -1073,11 +1495,12 @@ class InstallerGUI(QMainWindow):
         if hasattr(self, 'chk_mediatek'): self.chk_mediatek.setText(self.t("drv_mediatek"))
 
         if hasattr(self, 'btn_back'): self.btn_back.setText(self.t("back"))
-        if hasattr(self, 'btn_next'):
-            idx = self.stack.currentIndex()
-            if idx == 7: self.btn_next.setText(self.t("install"))
-            elif idx == 9: self.btn_next.setText(self.t("quit"))
-            else: self.btn_next.setText(self.t("next"))
+        if hasattr(self, 'btn_quit'): self.btn_quit.setText(self.t("ui_cancel"))
+        if hasattr(self, 'lbl_brand_sub'): self.lbl_brand_sub.setText(self.t("ui_installer").upper())
+        if hasattr(self, 'phase_chips'):
+            for i, chip in enumerate(self.phase_chips):
+                chip.set_text(self.t(PHASE_KEYS[i]))
+        self.refresh_nav()
 
         if hasattr(self, 'update_disk_preview'):
             self.update_disk_preview()
@@ -1191,8 +1614,9 @@ class InstallerGUI(QMainWindow):
         self.c_de.currentIndexChanged.connect(self.update_de_desc)
         self.update_de_desc(0)
 
+        self.c_de.setCurrentIndex(next((i for i, d in enumerate(self.desktops) if d[0] == "XFCE"), 0))
         cl.addWidget(self.lbl_de)
-        cl.addWidget(self.c_de)
+        cl.addLayout(self._make_de_cards())
         cl.addWidget(de_info_box)
 
         self.lbl_apps_header = self._create_label("apps_header", "font-size: 14px; font-weight: 700; color: #1e293b; margin-top: 18px; margin-bottom: 6px;")
@@ -1233,6 +1657,47 @@ class InstallerGUI(QMainWindow):
         l.addStretch()
         scroll.setWidget(w)
         return scroll
+
+    def _make_de_cards(self):
+        """Clickable cards that drive the (hidden) self.c_de combo, so the rest of the logic is unchanged."""
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        self.de_cards = []
+        for i, (name, _pkgs) in enumerate(self.desktops):
+            card = QFrame()
+            card.setObjectName("de_card")
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.setMinimumHeight(96)
+            v = QVBoxLayout(card)
+            v.setContentsMargins(10, 14, 10, 12)
+            v.setSpacing(8)
+            ic = QLabel()
+            ic.setFixedSize(40, 40)
+            ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            nm = QLabel(name)
+            nm.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            nm.setStyleSheet("font-size:13px;font-weight:700;color:#1e293b;background:transparent;border:none;")
+            v.addWidget(ic, 0, Qt.AlignmentFlag.AlignHCenter)
+            v.addWidget(nm)
+            card.mousePressEvent = lambda e, idx=i: self.c_de.setCurrentIndex(idx)
+            self.de_cards.append((card, ic, "terminal" if i == 0 else "monitor"))
+            grid.addWidget(card, i // 4, i % 4)
+        self.c_de.currentIndexChanged.connect(self.refresh_de_cards)
+        self.refresh_de_cards()
+        return grid
+
+    def refresh_de_cards(self, *_):
+        cur = self.c_de.currentIndex()
+        for i, (card, ic, icon_name) in enumerate(self.de_cards):
+            if i == cur:
+                card.setStyleSheet("QFrame#de_card{background:#f0f5ff;border:2px solid #4a78ff;border-radius:14px;}")
+                ic.setStyleSheet("background:#4a78ff;border-radius:12px;border:none;")
+                ic.setPixmap(svg_pixmap(icon_name, "#ffffff", 20, 2))
+            else:
+                card.setStyleSheet("QFrame#de_card{background:#ffffff;border:1.5px solid #d9e1eb;border-radius:14px;}"
+                                   "QFrame#de_card:hover{border-color:#4a78ff;}")
+                ic.setStyleSheet("background:#eaf0ff;border-radius:12px;border:none;")
+                ic.setPixmap(svg_pixmap(icon_name, "#4a78ff", 20, 2))
 
     def create_zram_page(self):
         scroll = QScrollArea()
@@ -1326,21 +1791,22 @@ class InstallerGUI(QMainWindow):
         field.setEchoMode(QLineEdit.EchoMode.Password)
         field.setEnabled(enabled)
         field.setStyleSheet("border:none;background:transparent;padding:0;margin:0;min-height:38px;color:#243042;font-size:14px;")
-        btn = QPushButton("Mostrar")
-        btn.setFixedWidth(65)
+        btn = QPushButton()
+        btn.setIcon(svg_icon("eye", "#64748b", 18))
+        btn.setIconSize(QSize(18, 18))
+        btn.setFixedSize(34, 30)
         btn.setStyleSheet(
-            "QPushButton{border:none;background:transparent;color:#4a78ff;"
-            "font-size:12px;font-weight:600;padding:0;margin:0;}"
-            "QPushButton:hover{color:#3868ef;}"
+            "QPushButton{border:none;background:transparent;padding:0;margin:0;border-radius:8px;}"
+            "QPushButton:hover{background:#eef3ff;}"
         )
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         def toggle():
             if field.echoMode() == QLineEdit.EchoMode.Password:
                 field.setEchoMode(QLineEdit.EchoMode.Normal)
-                btn.setText("Ocultar")
+                btn.setIcon(svg_icon("eye-off", "#4a78ff", 18))
             else:
                 field.setEchoMode(QLineEdit.EchoMode.Password)
-                btn.setText("Mostrar")
+                btn.setIcon(svg_icon("eye", "#64748b", 18))
         btn.clicked.connect(toggle)
         h.addWidget(field)
         h.addWidget(btn)
@@ -1413,24 +1879,93 @@ class InstallerGUI(QMainWindow):
         card, cl = self._create_card()
         cl.setSpacing(8)
 
-        # ---- 1. Target drive ----
         cl.addWidget(self._section_header(1, "sec_disk"))
         self.c_disk = self._make_combo()
         self.disks_info = Sys.list_disks()
         for d in self.disks_info:
-            self.c_disk.addItem(f"{d['model']} ({d['size']}) - /dev/{d['name']}", f"/dev/{d['name']}")
-        cl.addWidget(self.c_disk)
+            self.c_disk.addItem(f"{d.get('model') or 'Disk'} ({d['size']}) - /dev/{d['name']}", f"/dev/{d['name']}")
+        cl.addLayout(self._make_disk_cards())
 
         warn = self._create_alert("disk_warn", "danger")
-        warn_lbl = warn.findChild(QLabel)
-        if warn_lbl:
-            warn_lbl.setProperty("text_key", "disk_warn")
-            warn_lbl.setWordWrap(True)
+        self.lbl_disk_warn = warn.findChild(QLabel)
+        if self.lbl_disk_warn:
+            self.lbl_disk_warn.setWordWrap(True)
+            self.lbl_disk_warn.setStyleSheet("font-weight:700;")
         cl.addWidget(warn)
-        cl.addSpacing(10)
+        self.lbl_disk_small = QLabel()
+        self.lbl_disk_small.setWordWrap(True)
+        self.lbl_disk_small.setStyleSheet("color:#b02b2b;font-size:13px;font-weight:700;")
+        self.lbl_disk_small.hide()
+        cl.addWidget(self.lbl_disk_small)
+        cl.addSpacing(12)
 
-        # ---- 2. Root filesystem: XFS / Ext4 ----
-        cl.addWidget(self._section_header(2, "sec_fs"))
+        cl.addWidget(self._section_header(2, "ui_sec_result"))
+        self.lbl_disk_legend = QLabel()
+        self.lbl_disk_legend.setStyleSheet("color:#64748b;font-size:13px;")
+        cl.addWidget(self.lbl_disk_legend)
+
+        self.bar_layout = QHBoxLayout()
+        self.bar_layout.setContentsMargins(0, 4, 0, 4)
+        self.bar_layout.setSpacing(4)
+        colors = ["#6366f1", "#10b981", "#8b5cf6"]
+        self.seg_labels = []
+        for c in colors:
+            seg = QLabel()
+            seg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            seg.setMinimumHeight(38)
+            seg.setStyleSheet(f"background:{c};color:white;border-radius:8px;font-size:11px;font-weight:700;")
+            self.seg_labels.append(seg)
+            self.bar_layout.addWidget(seg, 1)
+        cl.addLayout(self.bar_layout)
+
+        rows_box = QFrame()
+        rows_box.setStyleSheet("QFrame#part_rows{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;}")
+        rows_box.setObjectName("part_rows")
+        rv = QVBoxLayout(rows_box)
+        rv.setContentsMargins(16, 10, 16, 10)
+        rv.setSpacing(6)
+        self.preview_rows = []
+        for c in colors:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            dot = QLabel()
+            dot.setFixedSize(12, 12)
+            dot.setStyleSheet(f"background:{c};border-radius:6px;")
+            name = QLabel()
+            name.setStyleSheet("font-size:13px;font-weight:700;color:#1e293b;")
+            detail = QLabel()
+            detail.setStyleSheet("font-size:12px;color:#64748b;")
+            size = QLabel()
+            size.setStyleSheet("font-size:13px;font-weight:700;color:#1e293b;")
+            size.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(dot)
+            row.addWidget(name)
+            row.addWidget(detail, 1)
+            row.addWidget(size)
+            rv.addLayout(row)
+            self.preview_rows.append((name, detail, size))
+        cl.addWidget(rows_box)
+        cl.addSpacing(12)
+
+        self.adv_box = QWidget()
+        adv = QVBoxLayout(self.adv_box)
+        adv.setContentsMargins(0, 0, 0, 0)
+        adv.setSpacing(8)
+        self.adv_box.hide()
+        self.btn_adv = QPushButton(self.t("ui_advanced"))
+        self.btn_adv.setIcon(svg_icon("chevron-down", "#4a78ff", 16))
+        self.btn_adv.setIconSize(QSize(16, 16))
+        self.btn_adv.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_adv.setStyleSheet("QPushButton{border:none;background:transparent;color:#4a78ff;font-weight:700;font-size:13px;text-align:left;padding:6px 0;} QPushButton:hover{color:#3868ef;}")
+        def toggle_adv():
+            show = not self.adv_box.isVisible()
+            self.adv_box.setVisible(show)
+            self.btn_adv.setIcon(svg_icon("chevron-up" if show else "chevron-down", "#4a78ff", 16))
+        self.btn_adv.clicked.connect(toggle_adv)
+        cl.addWidget(self.btn_adv)
+        cl.addWidget(self.adv_box)
+
+        adv.addWidget(self._section_header(3, "sec_fs"))
         self.rb_xfs = QRadioButton()
         self.rb_ext4 = QRadioButton()
         self.rb_xfs.setChecked(True)
@@ -1442,62 +1977,13 @@ class InstallerGUI(QMainWindow):
         fs_row.setSpacing(14)
         fs_row.addWidget(self._make_fs_card(self.rb_xfs, "XFS", "fs_xfs_desc", "fs_default_badge"), 1)
         fs_row.addWidget(self._make_fs_card(self.rb_ext4, "Ext4", "fs_ext4_desc"), 1)
-        cl.addLayout(fs_row)
+        adv.addLayout(fs_row)
         self.rb_xfs.toggled.connect(lambda checked: self.update_disk_preview())
-        cl.addSpacing(10)
-
-        # ---- 3. Layout preview ----
-        cl.addWidget(self._section_header(3, "sec_layout"))
-
-        preview_frame = QFrame()
-        preview_frame.setStyleSheet("background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 6px;")
-        bar_layout = QHBoxLayout()
-        bar_layout.setContentsMargins(0, 0, 0, 0)
-        bar_layout.setSpacing(4)
-
-        seg_esp = QLabel("ESP (512M)")
-        seg_esp.setToolTip("EFI System Partition (/boot/efi - 512 MiB FAT32)")
-        seg_esp.setStyleSheet("background: #3b82f6; color: white; border-radius: 8px; padding: 10px 4px; font-size: 11px; font-weight: bold;")
-        seg_esp.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        seg_boot = QLabel("BOOT (1G)")
-        seg_boot.setToolTip("Partition /boot (1024 MiB EXT4)")
-        seg_boot.setStyleSheet("background: #6366f1; color: white; border-radius: 8px; padding: 10px 4px; font-size: 11px; font-weight: bold;")
-        seg_boot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.seg_thin = QLabel("Arvor Root (~78%)")
-        self.seg_thin.setStyleSheet("background: #10b981; color: white; border-radius: 8px; padding: 10px 4px; font-size: 11px; font-weight: bold;")
-        self.seg_thin.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.seg_free = QLabel("Snapshots (~22%)")
-        self.seg_free.setToolTip("Volume Group Reservado para Snapshots NSM (~22%)")
-        self.seg_free.setStyleSheet("background: #8b5cf6; color: white; border-radius: 8px; padding: 10px 4px; font-size: 11px; font-weight: bold;")
-        self.seg_free.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        bar_layout.addWidget(seg_esp, 1)
-        bar_layout.addWidget(seg_boot, 2)
-        bar_layout.addWidget(self.seg_thin, 78)
-        bar_layout.addWidget(self.seg_free, 22)
-        preview_frame.setLayout(bar_layout)
-        cl.addWidget(preview_frame)
-
-        legend_box = QFrame()
-        legend_box.setStyleSheet("background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; margin-top: 4px;")
-        legend_layout = QVBoxLayout(legend_box)
-        legend_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.lbl_disk_legend = QLabel()
-        self.lbl_disk_legend.setStyleSheet("color: #334155; font-size: 13px; line-height: 1.6;")
-        self.lbl_disk_legend.setWordWrap(True)
-        legend_layout.addWidget(self.lbl_disk_legend)
-        cl.addWidget(legend_box)
-
         self.c_disk.currentIndexChanged.connect(self.update_disk_preview)
         self.update_disk_preview()
-        cl.addSpacing(10)
+        adv.addSpacing(12)
 
-        # ---- 4. Encryption ----
-        cl.addWidget(self._section_header(4, "sec_encrypt"))
+        adv.addWidget(self._section_header(4, "sec_encrypt"))
         self.chk_luks = QCheckBox(self.t("luks"))
         self.chk_luks.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lbl_luks_hint = QLabel(self.t("luks_hint"))
@@ -1515,37 +2001,150 @@ class InstallerGUI(QMainWindow):
                 else "QFrame{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;}"
             )
         self.chk_luks.toggled.connect(on_luks_toggle)
+        self.chk_luks.toggled.connect(self.update_disk_preview)
 
-        cl.addWidget(self.chk_luks)
-        cl.addWidget(self.lbl_luks_hint)
-        cl.addWidget(self.lbl_luks_p)
-        cl.addWidget(self.luks_p_wrapper)
+        adv.addWidget(self.chk_luks)
+        adv.addWidget(self.lbl_luks_hint)
+        adv.addWidget(self.lbl_luks_p)
+        adv.addWidget(self.luks_p_wrapper)
 
         l.addWidget(card)
         l.addStretch()
         scroll.setWidget(w)
         return scroll
 
-    def update_disk_preview(self):
-        if not hasattr(self, 'lbl_disk_legend') or not hasattr(self, 'rb_ext4'):
-            return
+    @staticmethod
+    def parse_size(text):
+        units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40, "P": 1 << 50}
+        s = str(text or "").strip().replace(",", ".")
+        try:
+            if s and s[-1].upper() in units:
+                return int(float(s[:-1]) * units[s[-1].upper()])
+            return int(float(s))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def fmt_size(b):
+        for unit, div in (("TiB", 1 << 40), ("GiB", 1 << 30), ("MiB", 1 << 20)):
+            if b >= div:
+                v = b / div
+                return f"{v:.1f} {unit}" if v < 100 else f"{v:.0f} {unit}"
+        return f"{b} B"
+
+    def selected_disk_bytes(self):
         idx = self.c_disk.currentIndex()
-        if idx >= 0 and idx < len(self.disks_info):
+        if 0 <= idx < len(self.disks_info):
+            return self.parse_size(self.disks_info[idx].get("size"))
+        return 0
+
+    def disk_too_small(self):
+        return self.selected_disk_bytes() < MIN_DISK_GIB * (1 << 30)
+
+    def _make_disk_cards(self):
+        box = QVBoxLayout()
+        box.setSpacing(10)
+        self.disk_cards = []
+        for i, d in enumerate(self.disks_info):
+            card = QFrame()
+            card.setObjectName("disk_card")
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            h = QHBoxLayout(card)
+            h.setContentsMargins(16, 12, 16, 12)
+            h.setSpacing(14)
+            ic = QLabel()
+            ic.setFixedSize(42, 42)
+            ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v = QVBoxLayout()
+            v.setSpacing(2)
+            nm = QLabel(d.get("model") or "Disk")
+            nm.setStyleSheet("font-size:14px;font-weight:700;color:#1e293b;background:transparent;border:none;")
+            sub = QLabel(f"/dev/{d['name']}")
+            sub.setStyleSheet("font-size:12px;color:#64748b;background:transparent;border:none;")
+            v.addWidget(nm)
+            v.addWidget(sub)
+            sz = QLabel(self.fmt_size(self.parse_size(d.get("size"))))
+            sz.setStyleSheet("font-size:16px;font-weight:700;color:#4a78ff;background:transparent;border:none;")
+            h.addWidget(ic)
+            h.addLayout(v, 1)
+            h.addWidget(sz)
+            card.mousePressEvent = lambda e, idx=i: self.c_disk.setCurrentIndex(idx)
+            self.disk_cards.append((card, ic))
+            box.addWidget(card)
+        if not self.disks_info:
+            empty = QLabel(self.t("ui_disk_none"))
+            empty.setProperty("text_key", "ui_disk_none")
+            empty.setStyleSheet("color:#b02b2b;font-weight:700;")
+            box.addWidget(empty)
+        self.c_disk.currentIndexChanged.connect(self.refresh_disk_cards)
+        self.refresh_disk_cards()
+        return box
+
+    def refresh_disk_cards(self, *_):
+        cur = self.c_disk.currentIndex()
+        for i, (card, ic) in enumerate(self.disk_cards):
+            if i == cur:
+                card.setStyleSheet("QFrame#disk_card{background:#f0f5ff;border:2px solid #4a78ff;border-radius:14px;}")
+                ic.setStyleSheet("background:#4a78ff;border-radius:12px;border:none;")
+                ic.setPixmap(svg_pixmap("hard-drive", "#ffffff", 22, 2))
+            else:
+                card.setStyleSheet("QFrame#disk_card{background:#ffffff;border:1.5px solid #d9e1eb;border-radius:14px;}"
+                                   "QFrame#disk_card:hover{border-color:#4a78ff;}")
+                ic.setStyleSheet("background:#eaf0ff;border-radius:12px;border:none;")
+                ic.setPixmap(svg_pixmap("hard-drive", "#4a78ff", 22, 2))
+
+    def update_disk_preview(self, *_):
+        """Recalculate the layout from the selected disk and filesystem (same proportions the installer really uses)."""
+        if not hasattr(self, 'preview_rows') or not hasattr(self, 'rb_ext4'):
+            return
+        total = self.selected_disk_bytes()
+        idx = self.c_disk.currentIndex()
+        esp, boot = 512 << 20, 1024 << 20
+        rest = max(0, total - esp - boot)
+        root = int(rest * 0.78)
+        snap = rest - root
+        sizes = [esp + boot, root, snap]
+        fs = "ext4" if self.rb_ext4.isChecked() else "XFS"
+        enc = " · LUKS" if getattr(self, "chk_luks", None) is not None and self.chk_luks.isChecked() else ""
+        valid = 0 <= idx < len(self.disks_info) and total > 0
+
+        if hasattr(self, 'btn_adv'):
+            self.btn_adv.setText(self.t("ui_advanced"))
+        if valid:
             d = self.disks_info[idx]
-            size_str = d.get('size', '')
-            name = d.get('name', 'sda')
-            model = d.get('model', 'Disk')
-            fs_type = "EXT4" if self.rb_ext4.isChecked() else "XFS"
-            if hasattr(self, 'seg_thin'):
-                self.seg_thin.setToolTip(f"LVM Thin Pool para o Sistema Arvor OS ({fs_type} ~78%)")
-                self.seg_thin.setText(f"Arvor Root {fs_type} (~78%)")
-            self.lbl_disk_legend.setText(
-                f"<b>Dispositivo Selecionado:</b> /dev/{name} ({model} - {size_str}) | <b>Tabela:</b> GPT<br>"
-                f"<span style='color:#3b82f6; font-weight:bold;'>[ESP]</span> 512 MiB (FAT32, /boot/efi) &nbsp;&nbsp;&nbsp;&nbsp; "
-                f"<span style='color:#6366f1; font-weight:bold;'>[Boot]</span> 1024 MiB (EXT4, /boot)<br>"
-                f"<span style='color:#10b981; font-weight:bold;'>[Arvor OS Root]</span> ~78% ({fs_type} Thin Pool) &nbsp;&nbsp;&nbsp;&nbsp; "
-                f"<span style='color:#8b5cf6; font-weight:bold;'>[Snapshots NSM]</span> ~22% (VG Free)"
-            )
+            label = f"/dev/{d['name']} ({d.get('model') or 'Disk'}, {self.fmt_size(total)})"
+            self.lbl_disk_legend.setText(f"/dev/{d['name']} · {d.get('model') or 'Disk'} · {self.fmt_size(total)} · GPT")
+            if getattr(self, 'lbl_disk_warn', None):
+                self.lbl_disk_warn.setText(self.t("ui_disk_erase").format(disk=label))
+            weights = [max(s_, total * 0.06) for s_ in sizes]
+        else:
+            self.lbl_disk_legend.setText("")
+            if getattr(self, 'lbl_disk_warn', None):
+                self.lbl_disk_warn.setText(self.t("disk_warn"))
+            weights = [1, 1, 1]
+        tot_w = sum(weights) or 1
+        pct = [s_ / total * 100 if total else 0 for s_ in sizes]
+        names = [self.t("ui_part_bootfiles"), self.t("ui_part_root"), self.t("ui_part_snap")]
+        for i, seg in enumerate(self.seg_labels):
+            self.bar_layout.setStretch(i, max(1, int(weights[i] / tot_w * 1000)))
+            seg.setText(f"{self.fmt_size(sizes[i])}" if total else "")
+            seg.setToolTip(f"{names[i]} · {pct[i]:.0f}%")
+        details = [
+            "EFI (FAT32) + /boot (ext4)",
+            f"{fs} · /  (LVM thin){enc}",
+            self.t("ui_part_snap_d"),
+        ]
+        for i, (name, detail, size) in enumerate(self.preview_rows):
+            name.setText(names[i])
+            detail.setText(details[i])
+            size.setText(f"{self.fmt_size(sizes[i])}  ({'<1' if 0 < pct[i] < 1 else format(pct[i], '.0f')}%)" if total else "—")
+
+        if hasattr(self, 'lbl_disk_small'):
+            if total and self.disk_too_small():
+                self.lbl_disk_small.setText(self.t("ui_disk_small").format(min=MIN_DISK_GIB))
+                self.lbl_disk_small.show()
+            else:
+                self.lbl_disk_small.hide()
 
     def slugify_username(self, name):
         import unicodedata, re
@@ -1676,30 +2275,41 @@ class InstallerGUI(QMainWindow):
         l = QVBoxLayout()
         l.addWidget(self.create_title("step_summary"))
 
+        warn = QFrame()
+        warn.setProperty("alert", "danger")
+        hl = QHBoxLayout(warn)
+        hl.setContentsMargins(14, 12, 14, 12)
+        hl.setSpacing(12)
+        ic = QLabel()
+        ic.setFixedSize(24, 24)
+        ic.setPixmap(svg_pixmap("alert-triangle", "#b02b2b", 22, 2))
         self.lbl_sum_warn = QLabel(self.t("summary_warn"))
-        self.lbl_sum_warn.setStyleSheet("background-color: #fef2f2; color: #991b1b; padding: 20px; border-radius: 12px; font-weight: 600; border: 1px solid #fca5a5; font-size: 15px;")
+        self.lbl_sum_warn.setProperty("text_key", "summary_warn")
+        self.lbl_sum_warn.setProperty("alert-text", "danger")
+        self.lbl_sum_warn.setStyleSheet("font-weight:600;font-size:14px;")
         self.lbl_sum_warn.setWordWrap(True)
+        hl.addWidget(ic, 0, Qt.AlignmentFlag.AlignTop)
+        hl.addWidget(self.lbl_sum_warn, 1)
 
         self.lbl_sum_text = QTextEdit()
         self.lbl_sum_text.setReadOnly(True)
-        self.lbl_sum_text.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; background-color: white; font-size: 15px;")
+        self.lbl_sum_text.setStyleSheet("QTextEdit{border:1px solid #e5ebf3;border-radius:16px;padding:10px 22px;background-color:white;font-size:14px;}")
 
-        l.addWidget(self.lbl_sum_warn)
+        l.addWidget(warn)
         l.addSpacing(15)
         l.addWidget(self.lbl_sum_text)
         w.setLayout(l)
         return w
 
     def detect_hardware_info(self):
-        cpu = "Processador Otimizado (8 Cores x86_64)"
-        ram = "Memoria RAM: ~16 GB"
-        gpu = "Placa Grafica: Aceleracao de Hardware Ativa"
+        cpu = "Generic x86_64 processor"
+        ram = "16 GB"
         if not SIMULATE:
             try:
                 with open("/proc/cpuinfo", "r") as f:
                     for line in f:
                         if "model name" in line:
-                            cpu = f"Processador: {line.split(':')[1].strip()}"
+                            cpu = line.split(':')[1].strip()
                             break
             except Exception: pass
             try:
@@ -1707,35 +2317,43 @@ class InstallerGUI(QMainWindow):
                     for line in f:
                         if "MemTotal" in line:
                             kb = int(line.split()[1])
-                            gb = round(kb / (1024 * 1024), 1)
-                            ram = f"Memoria RAM: {gb} GB"
+                            ram = f"{round(kb / (1024 * 1024), 1)} GB"
                             break
             except Exception: pass
-        return f"{cpu}<br>{ram}<br>{gpu}"
+        return cpu, ram
+
+    def _sum_section(self, color, title, rows):
+        body = "".join(
+            f"<tr><td width='200' style='color:#64748b;padding:3px 0;'>{esc(str(k))}</td>"
+            f"<td style='color:#0f172a;font-weight:600;padding:3px 0;'>{esc(str(v))}</td></tr>"
+            for k, v in rows
+        )
+        return (f"<p style='margin:18px 0 4px 0;color:{color};font-size:12px;font-weight:700;'>{esc(title.upper())}</p>"
+                f"<table cellspacing='0' cellpadding='0' width='100%'>{body}</table>")
 
     def populate_summary(self):
         disp = self.conf.get('display_name', self.conf['user'])
         user_info = f"{disp} ({self.conf['user']})" if disp != self.conf['user'] else self.conf['user']
-        extras = self.conf.get('extra_pkgs', '')
-        extra_str = f" + Pacotes Opcionais ({extras})" if extras else ""
-        hw_info = self.detect_hardware_info()
+        extras = self.conf.get('extra_pkgs', '') or self.t("ui_sum_none")
+        cpu, ram = self.detect_hardware_info()
         swap_label_key = next((lk for m, lk in self.swap_modes if m == self.conf.get("swap_mode", "zram")), "swap_zram")
-        swap_desc = self.t(swap_label_key)
         fs_type = "ext4" if self.conf.get("use_ext4") else "xfs"
-        html = f"""
-        <style>
-            h3 {{ color: #0f172a; margin-bottom: 8px; font-size: 16px; font-family: -apple-system, sans-serif; font-weight: 700; }}
-            p {{ color: #475569; margin-top: 0; margin-bottom: 16px; font-family: -apple-system, sans-serif; font-size: 14px; line-height: 1.4; }}
-            hr {{ border: 0; border-top: 1px solid #f1f5f9; margin: 12px 0; }}
-        </style>
-        <h3>Especificações do Sistema & Hardware</h3><p>{hw_info}</p><hr>
-        <h3>{self.t("step_location")}</h3><p>{self.sys_locale} • {self.conf['timezone']}</p><hr>
-        <h3>{self.t("step_keyboard")}</h3><p>{self.conf['keymap']}</p><hr>
-        <h3>{self.t("step_desktop")}</h3><p>{self.conf['de_name']}{extra_str}</p><hr>
-        <h3>{self.t("step_partitions")}</h3><p>{self.conf['disk']} <br>LUKS: {'Activado' if self.conf['luks'] else 'Desactivado'}<br><b>Filesystem Root:</b> {fs_type}<br><b>Memória & Swap:</b> {swap_desc}</p><hr>
-        <h3>{self.t("step_users")}</h3><p>{user_info} @ {self.conf['hostname']}</p>
-        """
-        self.lbl_sum_text.setHtml(html)
+        on_off = self.t("ui_sum_on") if self.conf['luks'] else self.t("ui_sum_off")
+
+        sections = [
+            ("#64748b", self.t("ui_sum_hw"), [(self.t("ui_sum_cpu"), cpu), (self.t("ui_sum_ram"), ram)]),
+            ("#4a78ff", self.t("step_location"), [(self.t("locale"), self.sys_locale), (self.t("tz"), self.conf['timezone'])]),
+            ("#6366f1", self.t("step_keyboard"), [(self.t("keymap"), self.conf['keymap'])]),
+            ("#0ea5e9", self.t("step_desktop"), [(self.t("de"), self.conf['de_name']), (self.t("ui_sum_apps"), extras)]),
+            ("#10b981", self.t("step_partitions"), [
+                (self.t("ui_sum_disk"), self.c_disk.currentText() or self.conf['disk']),
+                (self.t("ui_sum_fs"), fs_type.upper()),
+                (self.t("ui_sum_enc"), on_off),
+                (self.t("ui_sum_swap"), self.t(swap_label_key)),
+            ]),
+            ("#8b5cf6", self.t("step_users"), [(self.t("ui_sum_user"), user_info), (self.t("ui_sum_host"), self.conf['hostname'])]),
+        ]
+        self.lbl_sum_text.setHtml("".join(self._sum_section(c, t, r) for c, t, r in sections))
 
     def update_slide_ui(self):
         s = self.slides[self.current_slide_idx]
@@ -2027,12 +2645,67 @@ class InstallerGUI(QMainWindow):
         self.slide_timer = QTimer(self)
         self.slide_timer.timeout.connect(self.next_slide)
 
-        self.lbl_status = QLabel(self.t("installing_prep"))
-        self.lbl_status.setStyleSheet("font-size:13px; color:#475569; font-weight:500; margin-top:10px;")
+        self.status_card, scl = self._create_card()
+        scl.setSpacing(14)
 
+        top = QHBoxLayout()
+        top.setSpacing(14)
+        self.install_spinner = Spinner(32, "#4a78ff", "#dbe4f5", 3)
+        self.install_ok = QLabel()
+        self.install_ok.setFixedSize(32, 32)
+        self.install_ok.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.install_ok.hide()
+        self.lbl_phase = QLabel(self.t(PHASE_KEYS[0]))
+        self.lbl_phase.setStyleSheet("font-size:18px;font-weight:700;color:#172033;")
+        self.lbl_elapsed = QLabel("")
+        self.lbl_elapsed.setStyleSheet("font-size:13px;color:#66758d;font-weight:600;")
+        top.addWidget(self.install_spinner)
+        top.addWidget(self.install_ok)
+        top.addWidget(self.lbl_phase, 1)
+        top.addWidget(self.lbl_elapsed)
+        scl.addLayout(top)
+
+        bar_row = QHBoxLayout()
+        bar_row.setSpacing(12)
         self.pbar = QProgressBar()
         self.pbar.setRange(0, 100)
         self.pbar.setValue(0)
+        self.pbar.setTextVisible(False)
+        self.pbar.setFixedHeight(12)
+        self.lbl_pct = QLabel("0%")
+        self.lbl_pct.setFixedWidth(46)
+        self.lbl_pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_pct.setStyleSheet("font-size:14px;font-weight:700;color:#4a78ff;")
+        self.pbar.valueChanged.connect(lambda v: self.lbl_pct.setText(f"{v}%"))
+        self.pbar_anim = QPropertyAnimation(self.pbar, b"value", self)
+        self.pbar_anim.setDuration(450)
+        self.pbar_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        bar_row.addWidget(self.pbar, 1)
+        bar_row.addWidget(self.lbl_pct)
+        scl.addLayout(bar_row)
+
+        self.lbl_status = QLabel(self.t("installing_prep"))
+        self.lbl_status.setStyleSheet("font-size:12px;color:#66758d;")
+        scl.addWidget(self.lbl_status)
+
+        chips_row = QHBoxLayout()
+        chips_row.setSpacing(10)
+        self.phase_chips = []
+        for i, key in enumerate(PHASE_KEYS):
+            chip = PhaseChip(i + 1, self.t(key))
+            self.phase_chips.append(chip)
+            chips_row.addWidget(chip, 1)
+        scl.addLayout(chips_row)
+
+        self.lbl_wait = QLabel(self.t("ui_install_wait"))
+        self.lbl_wait.setProperty("text_key", "ui_install_wait")
+        self.lbl_wait.setWordWrap(True)
+        self.lbl_wait.setStyleSheet("font-size:12px;color:#94a3b8;")
+        scl.addWidget(self.lbl_wait)
+
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.timeout.connect(self.tick_elapsed)
+        self.install_t0 = time.time()
 
         self.btn_toggle_log = QPushButton(self.t("view_log"))
         self.btn_toggle_log.setStyleSheet("QPushButton{border:none; background:transparent; color:#4a78ff; font-weight:600; font-size:12px; text-align:left; padding:4px 0;} QPushButton:hover{color:#3868ef;}")
@@ -2040,6 +2713,8 @@ class InstallerGUI(QMainWindow):
 
         self.txt_log = QTextEdit()
         self.txt_log.setProperty("log", "true")
+        self.txt_log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.txt_log.setMinimumHeight(150)
         self.txt_log.setReadOnly(True)
         self.txt_log.hide()
 
@@ -2054,10 +2729,9 @@ class InstallerGUI(QMainWindow):
         self.btn_toggle_log.clicked.connect(toggle_log)
 
         l.addWidget(self.slide_card)
-        l.addWidget(self.lbl_status)
-        l.addWidget(self.pbar)
+        l.addWidget(self.status_card)
         l.addWidget(self.btn_toggle_log)
-        l.addWidget(self.txt_log)
+        l.addWidget(self.txt_log, 1)
         l.addStretch()
         return w
 
@@ -2066,29 +2740,35 @@ class InstallerGUI(QMainWindow):
         l = QVBoxLayout()
         l.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        icon_lbl = QLabel()
-        pm = self.get_nav_icon("check_btn").pixmap(100, 100)
-        if pm.isNull():
-             icon_lbl.setText("✓")
-             icon_lbl.setStyleSheet("font-size: 100px; color: #22c55e;")
-        else:
-            icon_lbl.setPixmap(pm)
-        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge = QLabel()
+        badge.setFixedSize(120, 120)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setPixmap(svg_pixmap("check", "#ffffff", 60, 2.6))
+        badge.setStyleSheet("background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #34d399,stop:1 #059669);border-radius:60px;")
 
         title = QLabel(self.t("finish_msg"))
+        title.setProperty("text_key", "finish_msg")
         title.setProperty("heading", "true")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         sub = QLabel(self.t("finish_sub"))
+        sub.setProperty("text_key", "finish_sub")
         sub.setProperty("subheading", "true")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setWordWrap(True)
 
+        hint = QLabel(self.t("ui_finish_hint"))
+        hint.setProperty("text_key", "ui_finish_hint")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:13px;color:#94a3b8;margin-top:6px;")
+
         l.addStretch()
-        l.addWidget(icon_lbl)
-        l.addSpacing(35)
+        l.addWidget(badge, 0, Qt.AlignmentFlag.AlignHCenter)
+        l.addSpacing(30)
         l.addWidget(title)
         l.addWidget(sub)
+        l.addWidget(hint)
         l.addStretch()
         w.setLayout(l)
         return w
@@ -2123,6 +2803,9 @@ class InstallerGUI(QMainWindow):
             if self.c_disk.currentIndex() == -1:
                 QMessageBox.warning(self, "Error", self.t("err_disk"))
                 return False
+            if self.disk_too_small():
+                QMessageBox.warning(self, "Error", self.t("ui_disk_small").format(min=MIN_DISK_GIB))
+                return False
             if self.chk_luks.isChecked() and not self.i_luks_p.text():
                 QMessageBox.warning(self, "Error", self.t("err_pass"))
                 return False
@@ -2148,7 +2831,26 @@ class InstallerGUI(QMainWindow):
         return True
 
     def update_progress(self, value):
-        self.pbar.setValue(value)
+        self.pbar_anim.stop()
+        self.pbar_anim.setStartValue(self.pbar.value())
+        self.pbar_anim.setEndValue(value)
+        self.pbar_anim.start()
+        idx = 0
+        for i, th in enumerate(PHASE_THRESHOLDS):
+            if value >= th:
+                idx = i
+        self.set_phase(idx)
+
+    def set_phase(self, idx, all_done=False):
+        self.current_phase = idx
+        for i, chip in enumerate(self.phase_chips):
+            chip.set_state("done" if (all_done or i < idx) else ("active" if i == idx else "pending"))
+        if not all_done:
+            self.lbl_phase.setText(self.t(PHASE_KEYS[idx]))
+
+    def tick_elapsed(self):
+        secs = int(time.time() - self.install_t0)
+        self.lbl_elapsed.setText(f"{self.t('ui_elapsed')} {secs // 60:02d}:{secs % 60:02d}")
 
     def go_next(self):
         idx = self.stack.currentIndex()
@@ -2156,50 +2858,59 @@ class InstallerGUI(QMainWindow):
 
         if idx == 6:
             self.populate_summary()
-            self.btn_next.setText(self.t("install"))
-            self.btn_next.setIcon(self.get_nav_icon("install_btn"))
-            self.btn_next.setProperty("primary", "true")
-            self.apply_styles()
-        elif idx == 7:
+        elif idx in (7, 8):
             self.start_install()
             return
         elif idx == 9:
-            Sys.run("reboot")
+            if not SIMULATE:
+                Sys.run("reboot")
             sys.exit(0)
 
-        self.stack.setCurrentIndex(idx + 1)
-        self.btn_back.setEnabled(True)
-        self.update_sidebar()
-
-        if self.stack.currentIndex() not in (7, 9):
-            self.btn_next.setText(self.t("next"))
-            self.btn_next.setIcon(self.get_nav_icon("next"))
-            self.btn_next.setProperty("primary", "true")
-            self.apply_styles()
+        self.goto_page(idx + 1)
 
     def go_back(self):
         idx = self.stack.currentIndex()
-        if idx > 0:
-            self.stack.setCurrentIndex(idx - 1)
-            self.update_sidebar()
-            self.btn_next.setText(self.t("next"))
-            self.btn_next.setIcon(self.get_nav_icon("next"))
-            self.btn_next.setProperty("primary", "true")
-            self.apply_styles()
-            if self.stack.currentIndex() == 0:
-                self.btn_back.setEnabled(False)
+        if 0 < idx < 9:
+            self.goto_page(idx - 1)
+
+    def goto_page(self, new_idx):
+        self.nav_container.setEnabled(False)
+        self.overlay.begin()
+        def finish():
+            self.stack.setCurrentIndex(new_idx)
+            self.refresh_nav()
+            self.overlay.end()
+            self.nav_container.setEnabled(True)
+        QTimer.singleShot(380, finish)
 
     def on_log_msg(self, msg):
         if hasattr(self, 'lbl_status') and msg:
             line = msg.strip().split('\n')[-1]
-            if len(line) > 70:
-                line = line[:67] + "..."
+            if len(line) > 90:
+                line = line[:87] + "..."
             self.lbl_status.setText(line)
 
     def start_install(self):
         self.stack.setCurrentIndex(8)
         self.update_sidebar()
         self.nav_container.hide()
+
+        self.txt_log.clear()
+        self.txt_log.hide()
+        self.slide_card.show()
+        self.btn_toggle_log.setText(self.t("view_log"))
+        self.pbar_anim.stop()
+        self.pbar.setValue(0)
+        self.lbl_status.setText(self.t("installing_prep"))
+        self.lbl_phase.setStyleSheet("font-size:18px;font-weight:700;color:#172033;")
+        self.lbl_wait.show()
+        self.install_ok.hide()
+        self.install_spinner.show()
+        self.install_spinner.start()
+        self.set_phase(0)
+        self.install_t0 = time.time()
+        self.tick_elapsed()
+        self.elapsed_timer.start(1000)
         if hasattr(self, 'slide_timer'):
             self.slide_timer.start(5000)
 
@@ -2213,21 +2924,30 @@ class InstallerGUI(QMainWindow):
     def install_done(self, success):
         if hasattr(self, 'slide_timer'):
             self.slide_timer.stop()
-        self.pbar.setValue(100)
+        self.elapsed_timer.stop()
+        self.install_spinner.stop()
+        self.install_spinner.hide()
+        self.pbar_anim.stop()
+
         if success:
+            self.pbar.setValue(100)
+            self.set_phase(4, all_done=True)
             self.stack.setCurrentIndex(9)
             self.nav_container.show()
-            self.btn_back.hide()
-            self.btn_next.setText(self.t("quit"))
-            self.btn_next.setIcon(self.get_nav_icon("check_btn"))
-            self.btn_next.setIcon(self.get_nav_icon("check_btn"))
-            self.btn_next.setProperty("primary", "true")
-            self.apply_styles()
-            self.update_sidebar()
+            self.refresh_nav()
         else:
-            QMessageBox.critical(self, "Error", "Installation failed. Check logs.")
-            self.btn_back.setEnabled(True)
-            self.btn_next.hide()
+            self.slide_card.hide()
+            self.phase_chips[getattr(self, "current_phase", 0)].set_state("failed")
+            self.install_ok.setPixmap(svg_pixmap("x-circle", "#dc2626", 30, 2))
+            self.install_ok.show()
+            self.lbl_phase.setText(self.t("ui_failed"))
+            self.lbl_phase.setStyleSheet("font-size:18px;font-weight:700;color:#b02b2b;")
+            self.lbl_status.setText(self.t("ui_failed_hint"))
+            self.lbl_wait.hide()
+            self.txt_log.show()
+            self.btn_toggle_log.setText(self.t("hide_log"))
+            self.nav_container.show()
+            self.refresh_nav()
 
     def apply_styles(self):
         self.setStyleSheet(STYLES)
@@ -2236,22 +2956,34 @@ class InstallerGUI(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    if not NetUtils.check_connection():
-        QMessageBox.critical(None, "Network Error", TEXT["en"]["net_err"])
-        sys.exit(1)
+    base_font = QFont()
+    base_font.setFamilies(["Inter", "Noto Sans", "Cantarell", "Ubuntu", "DejaVu Sans", "Segoe UI", "Sans Serif"])
+    app.setFont(base_font)
 
     if hasattr(os, "geteuid") and os.geteuid() != 0 and not SIMULATE:
         QMessageBox.critical(None, "Error", "Must run as root.")
         sys.exit(1)
 
     if not SIMULATE:
-        for t in ["debootstrap", "mkfs.xfs", "mkfs.ext4", "pvcreate", "vgcreate", "lvcreate", "parted", "cryptsetup", "wipefs", "mkfs.vfat", "wget", "efibootmgr"]:
-            if not shutil.which(t):
-                QMessageBox.critical(None, "Error", f"Missing tool: {t}")
+        for tool in ["debootstrap", "mkfs.xfs", "mkfs.ext4", "pvcreate", "vgcreate", "lvcreate", "parted", "cryptsetup", "wipefs", "mkfs.vfat", "wget", "efibootmgr"]:
+            if not shutil.which(tool):
+                QMessageBox.critical(None, "Error", f"Missing tool: {tool}")
                 sys.exit(1)
 
     gui = InstallerGUI()
     gui.apply_styles()
     gui.showMaximized()
+    gui.raise_()
+    gui.activateWindow()
+
+    net_worker = NetCheckWorker()
+    gui.net_worker = net_worker
+
+    def on_net(ok):
+        if not ok:
+            QMessageBox.critical(gui, "Network Error", TEXT.get("en", {}).get("net_err", "No network connection."))
+            app.exit(1)
+
+    net_worker.result.connect(on_net)
+    net_worker.start()
     sys.exit(app.exec())
