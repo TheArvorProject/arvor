@@ -1130,6 +1130,147 @@ public:
 #ifdef __NR_futimesat
             __NR_futimesat,
 #endif
+#ifdef __NR_getpid
+            __NR_getpid,
+#endif
+#ifdef __NR_gettid
+            __NR_gettid,
+#endif
+#ifdef __NR_getpgrp
+            __NR_getpgrp,
+#endif
+#ifdef __NR_getgroups
+            __NR_getgroups,
+#endif
+#ifdef __NR_setgroups
+            __NR_setgroups,
+#endif
+#ifdef __NR_setreuid
+            __NR_setreuid,
+#endif
+#ifdef __NR_setregid
+            __NR_setregid,
+#endif
+#ifdef __NR_setfsuid
+            __NR_setfsuid,
+#endif
+#ifdef __NR_setfsgid
+            __NR_setfsgid,
+#endif
+#ifdef __NR_link
+            __NR_link,
+#endif
+#ifdef __NR_linkat
+            __NR_linkat,
+#endif
+#ifdef __NR_mknod
+            __NR_mknod,
+#endif
+#ifdef __NR_mknodat
+            __NR_mknodat,
+#endif
+#ifdef __NR_flock
+            __NR_flock,
+#endif
+#ifdef __NR_sendmsg
+            __NR_sendmsg,
+#endif
+#ifdef __NR_recvmsg
+            __NR_recvmsg,
+#endif
+#ifdef __NR_sendmmsg
+            __NR_sendmmsg,
+#endif
+#ifdef __NR_recvmmsg
+            __NR_recvmmsg,
+#endif
+#ifdef __NR_bind
+            __NR_bind,
+#endif
+#ifdef __NR_accept
+            __NR_accept,
+#endif
+#ifdef __NR_socketpair
+            __NR_socketpair,
+#endif
+#ifdef __NR_select
+            __NR_select,
+#endif
+#ifdef __NR_pause
+            __NR_pause,
+#endif
+#ifdef __NR_rt_sigsuspend
+            __NR_rt_sigsuspend,
+#endif
+#ifdef __NR_rt_sigtimedwait
+            __NR_rt_sigtimedwait,
+#endif
+#ifdef __NR_rt_sigpending
+            __NR_rt_sigpending,
+#endif
+#ifdef __NR_getrusage
+            __NR_getrusage,
+#endif
+#ifdef __NR_times
+            __NR_times,
+#endif
+#ifdef __NR_sched_getparam
+            __NR_sched_getparam,
+#endif
+#ifdef __NR_sched_getscheduler
+            __NR_sched_getscheduler,
+#endif
+#ifdef __NR_sched_get_priority_max
+            __NR_sched_get_priority_max,
+#endif
+#ifdef __NR_sched_get_priority_min
+            __NR_sched_get_priority_min,
+#endif
+#ifdef __NR_capget
+            __NR_capget,
+#endif
+#ifdef __NR_copy_file_range
+            __NR_copy_file_range,
+#endif
+#ifdef __NR_readahead
+            __NR_readahead,
+#endif
+#ifdef __NR_utime
+            __NR_utime,
+#endif
+#ifdef __NR_setxattr
+            __NR_setxattr,
+#endif
+#ifdef __NR_lsetxattr
+            __NR_lsetxattr,
+#endif
+#ifdef __NR_fsetxattr
+            __NR_fsetxattr,
+#endif
+#ifdef __NR_removexattr
+            __NR_removexattr,
+#endif
+#ifdef __NR_lremovexattr
+            __NR_lremovexattr,
+#endif
+#ifdef __NR_fremovexattr
+            __NR_fremovexattr,
+#endif
+#ifdef __NR_sendfile
+            __NR_sendfile,
+#endif
+#ifdef __NR_memfd_create
+            __NR_memfd_create,
+#endif
+#ifdef __NR_alarm
+            __NR_alarm,
+#endif
+#ifdef __NR_getitimer
+            __NR_getitimer,
+#endif
+#ifdef __NR_setitimer
+            __NR_setitimer,
+#endif
             __NR_umask,
             __NR_sched_yield, __NR_sched_getaffinity,
 #ifdef __NR_sched_setaffinity
@@ -1496,40 +1637,18 @@ void mount_fs() {
         std::ofstream touch(resolv_target);
     }
     exec_argv_devnull_out({"mount", "--bind", "/etc/resolv.conf", resolv_target});
-
-    if (fs::exists("/var/lib/apt/lists", ec)) {
-        fs::create_directories(g_tree_root + "/var/lib/apt/lists", ec);
-        exec_argv_devnull_out({"mount", "--bind", "/var/lib/apt/lists", g_tree_root + "/var/lib/apt/lists"});
-    }
-    if (fs::exists("/var/cache/apt/archives", ec)) {
-        fs::create_directories(g_tree_root + "/var/cache/apt/archives", ec);
-        exec_argv_devnull_out({"mount", "--bind", "/var/cache/apt/archives", g_tree_root + "/var/cache/apt/archives"});
-    }
-    if (fs::exists("/var/lib/dpkg", ec)) {
-        fs::create_directories(g_tree_root + "/var/lib/dpkg", ec);
-        exec_argv_devnull_out({"mount", "--bind", "/var/lib/dpkg", g_tree_root + "/var/lib/dpkg"});
-    }
 }
 
 void umount_fs() {
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/dpkg"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/cache/apt/archives"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/apt/lists"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/run"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/tmp"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/etc/resolv.conf"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/shm"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/pts"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/ptmx"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/null"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/zero"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/random"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/urandom"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/full"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/tty"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/proc"});
-    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/sys"});
+    exec_argv_devnull_out({"umount", "-R", "-l", g_tree_root});
+}
+
+void remove_sandbox_snapshot(const std::string& snap_dev) {
+    if (snap_dev.empty() || !is_safe_device_path(snap_dev)) return;
+    if (access(snap_dev.c_str(), F_OK) != 0) return;
+    exec_argv_devnull_out_checked({"udevadm", "settle"});
+    if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) != 0)
+        log_warning(std::format("could not remove sandbox snapshot {}. remove it manually with: lvremove -f {}", snap_dev, snap_dev));
 }
 
 std::string get_root_device() {
@@ -1666,11 +1785,7 @@ bool manage_sandbox(const std::string& action)
 
     if (action == "create") {
         umount_fs();
-        exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
-        exec_argv_devnull_out_checked({"udevadm", "settle"});
-        if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
-            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
-        }
+        remove_sandbox_snapshot(snap_dev);
         exec_argv_devnull_out_checked({"mkdir", "-p", "/nsm/weld"});
 
         if (root_dev.empty() || vg_name.empty() || !is_safe_device_path(root_dev)) {
@@ -1706,9 +1821,9 @@ bool manage_sandbox(const std::string& action)
 
         struct stat dev_st{};
         bool dev_ready = false;
-        for (int attempt = 0; attempt < 20; ++attempt) {
+        for (int attempt = 0; attempt < 50; ++attempt) {
             if (stat(snap_dev.c_str(), &dev_st) == 0 && S_ISBLK(dev_st.st_mode)) { dev_ready = true; break; }
-            usleep(50000);
+            usleep(100000);
         }
         if (!dev_ready) {
             log_error(std::format("snapshot device {} did not become available in time.", snap_dev));
@@ -1726,8 +1841,11 @@ bool manage_sandbox(const std::string& action)
         } else if (fstype == "ext4" || fstype == "ext3" || fstype == "ext2") {
             mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, g_tree_root});
             if (mount_rc != 0 && thin) {
-                exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
+                for (int i = 0; i < 20; ++i) {
+                    if (exec_argv_devnull_out_checked({"umount", "-l", g_tree_root}) != 0) break;
+                }
                 exec_argv_devnull_out_checked({"udevadm", "settle"});
+                usleep(200000);
                 mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, g_tree_root});
             }
         } else if (!fstype.empty() && fstype.find(',') == std::string::npos) {
@@ -1752,15 +1870,47 @@ bool manage_sandbox(const std::string& action)
         return true;
     } else if (action == "delete") {
         umount_fs();
-        exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
-        exec_argv_devnull_out_checked({"udevadm", "settle"});
-        if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
-            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
-        }
+        remove_sandbox_snapshot(snap_dev);
         g_sandbox_active.store(false);
         return true;
     }
     return false;
+}
+
+struct DpkgLockHolder {
+    bool busy = false;
+    pid_t pid = 0;
+    std::string name;
+};
+
+DpkgLockHolder find_dpkg_db_lock_holder() {
+    DpkgLockHolder holder;
+    int fd = open("/var/lib/dpkg/lock", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return holder;
+    struct flock fl{};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    if (fcntl(fd, F_GETLK, &fl) == 0 && fl.l_type != F_UNLCK) {
+        holder.busy = true;
+        holder.pid = fl.l_pid;
+        std::string comm;
+        if (holder.pid > 0 && read_text_file(std::format("/proc/{}/comm", holder.pid), comm))
+            holder.name = trim_copy(comm);
+    }
+    close(fd);
+    return holder;
+}
+
+bool report_dpkg_db_lock_busy() {
+    DpkgLockHolder holder = find_dpkg_db_lock_holder();
+    if (!holder.busy) return false;
+    std::string who = holder.name.empty() ? std::string{"another process"} : holder.name;
+    if (holder.pid > 0) who += std::format(" (pid {})", holder.pid);
+    log_error(std::format("the dpkg database lock (/var/lib/dpkg/lock) is held by {}.", who));
+    std::print(stderr, "Wait for it to finish, or stop it first (e.g. sudo systemctl stop packagekit).\n");
+    return true;
 }
 
 void cleanup_sandbox_on_exit();
@@ -1769,38 +1919,16 @@ bool check_system_locks(bool quiet);
 
 void cleanup_sandbox_on_exit() {
     std::call_once(g_cleanup_once, []() {
-        if (g_sandbox_active.load()) {
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/dpkg"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/cache/apt/archives"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/apt/lists"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/run"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/tmp"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/etc/resolv.conf"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/shm"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/pts"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/ptmx"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/null"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/zero"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/random"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/urandom"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/full"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev/tty"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/dev"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/proc"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/sys"});
-            exec_argv_devnull_out({"umount", "-l", g_tree_root});
-
+        if (g_sandbox_active.exchange(false)) {
+            umount_fs();
             std::string vg_name = !g_cached_vg_name.empty() ? g_cached_vg_name : get_vg_name(get_root_device());
             std::string snap_dev = g_cached_snap_dev;
             if (snap_dev.empty() && !vg_name.empty()) {
                 snap_dev = "/dev/" + vg_name + "/weld_sandbox_snap";
             }
-            if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
-                exec_argv_devnull_out({"lvremove", "-f", snap_dev});
-            }
+            remove_sandbox_snapshot(snap_dev);
             g_cached_snap_lv_name.clear();
             g_cached_snap_dev.clear();
-            g_sandbox_active.store(false);
         }
         g_config_backup.restore_orig();
         release_system_locks();
@@ -2086,9 +2214,22 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
 
     WeldAcquireStatus acquire_status(status_fd, !quiet && status_fd < 0);
     fetcher.SetLog(&acquire_status);
-    if (fetcher.Run() != pkgAcquire::Continue) {
+    if (fetcher.Run() == pkgAcquire::Failed) {
         _error->DumpErrors();
         return false;
+    }
+    {
+        bool fetch_failed = false;
+        for (pkgAcquire::ItemIterator it = fetcher.ItemsBegin(); it != fetcher.ItemsEnd(); ++it) {
+            if ((*it)->Status == pkgAcquire::Item::StatDone && (*it)->Complete) continue;
+            fetch_failed = true;
+            std::string reason = (*it)->ErrorText.empty() ? std::string{"download did not complete"} : (*it)->ErrorText;
+            _error->Error("Failed to fetch %s: %s", (*it)->DescURI().c_str(), reason.c_str());
+        }
+        if (fetch_failed) {
+            _error->DumpErrors();
+            return false;
+        }
     }
 
     std::unique_ptr<APT::Progress::PackageManager> pm_progress;
@@ -3572,10 +3713,6 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             pkgInitConfig(*_config);
             pkgInitSystem(*_config, _system);
 
-            _config->Set("APT::CDROM::NoMount", "true");
-            _config->Set("Acquire::cdrom", "false");
-            _config->Set("Dir::Bin::methods::cdrom", "/bin/false");
-
             sanitize_child_environment();
             setenv("DEBIAN_FRONTEND", "noninteractive", 1);
             bool ok = run_libapt_transaction(action, targets, status_fd, true);
@@ -3640,8 +3777,7 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             reader_thread.join();
             stderr_reader.join();
 
-            unbind_local_deb_dirs(local_deb_mounts);
-            umount_fs();
+            (void)local_deb_mounts;
             manage_sandbox("delete");
 
             if (!waited) {
@@ -3682,6 +3818,11 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
         }
     }
 
+    if (report_dpkg_db_lock_busy()) {
+        g_config_backup.restore_orig();
+        std::print("Transaction aborted. Nothing was changed on the host.\n");
+        return;
+    }
     g_config_backup.restore_orig();
     bool snapshot_created = create_snapshot("apt-pre");
     g_config_backup.apply_new();
@@ -3703,6 +3844,12 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
 
     int host_pipe[2];
     bool have_host_pipe = (pipe(host_pipe) == 0);
+    int host_err[2] = {-1, -1};
+    bool have_host_err = (pipe2(host_err, O_CLOEXEC) == 0);
+
+    // fcntl locks belong to the process that took them: the child's apt would
+    // collide with the parent's dpkg lock, so release it for the transaction.
+    release_system_locks();
 
     pid_t host_pid = fork();
     if (host_pid == 0) {
@@ -3711,8 +3858,15 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
         int devnull_w = open("/dev/null", O_WRONLY);
         if (devnull_w >= 0) {
             dup2(devnull_w, STDOUT_FILENO);
-            dup2(devnull_w, STDERR_FILENO);
             close(devnull_w);
+        }
+        if (have_host_err) {
+            close(host_err[0]);
+            dup2(host_err[1], STDERR_FILENO);
+            if (host_err[1] != STDERR_FILENO) close(host_err[1]);
+        } else {
+            int dn2 = open("/dev/null", O_WRONLY);
+            if (dn2 >= 0) { dup2(dn2, STDERR_FILENO); close(dn2); }
         }
 
         int status_fd = -1;
@@ -3736,8 +3890,20 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
     bool host_ok = false;
     if (host_pid > 0) {
         if (have_host_pipe) close(host_pipe[1]);
+        if (have_host_err) close(host_err[1]);
 
         std::atomic<int> host_percent(-1);
+        std::string host_stderr_output;
+        std::thread host_err_reader([&]() {
+            if (!have_host_err) return;
+            char buf[256];
+            ssize_t n;
+            while ((n = read(host_err[0], buf, sizeof(buf) - 1)) > 0) {
+                buf[n] = '\0';
+                host_stderr_output += buf;
+            }
+            close(host_err[0]);
+        });
 
         std::thread host_reader([&]() {
             if (!have_host_pipe) return;
@@ -3772,8 +3938,18 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
 
         wait_for_child(host_pid, host_status);
         host_reader.join();
+        host_err_reader.join();
         host_ok = WIFEXITED(host_status) && WEXITSTATUS(host_status) == 0;
+        if (!host_ok && !host_stderr_output.empty()) {
+            std::print("\n---- host transaction error output ----\n{}", host_stderr_output);
+            if (host_stderr_output.back() != '\n') std::print("\n");
+            std::print("---------------------------------------\n");
+        }
+    } else {
+        if (have_host_pipe) { close(host_pipe[0]); close(host_pipe[1]); }
+        if (have_host_err) { close(host_err[0]); close(host_err[1]); }
     }
+    check_system_locks(true);
 
     if (host_ok) {
         std::cout << render_weld_progress(100, "Applying Transaction") << "\n\n";
@@ -4118,6 +4294,10 @@ bool check_system_locks(bool quiet = false) {
             log_error("dpkg lock (/var/lib/dpkg/lock-frontend) is currently held by another process.");
             std::print(stderr, "Please wait for the background package operation to complete.\n");
         }
+        return false;
+    }
+    if (!quiet && report_dpkg_db_lock_busy()) {
+        close(fd);
         return false;
     }
     int old_fd = g_dpkg_lock_fd.exchange(fd);
