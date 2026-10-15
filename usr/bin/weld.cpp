@@ -375,7 +375,7 @@ std::string weld_arch() {
 }
 
 std::string weld_version_str() {
-    return std::format("Weld 4.4 ({})", weld_arch());
+    return std::format("Weld 5.0 ({})", weld_arch());
 }
 
 template <typename... Args>
@@ -1131,7 +1131,6 @@ public:
             __NR_futimesat,
 #endif
             __NR_umask,
-            __NR_getdents64,
             __NR_sched_yield, __NR_sched_getaffinity,
 #ifdef __NR_sched_setaffinity
             __NR_sched_setaffinity,
@@ -1169,10 +1168,82 @@ public:
 #ifdef __NR_get_mempolicy
             __NR_get_mempolicy,
 #endif
+#ifdef __NR_poll
+            __NR_poll,
+#endif
+#ifdef __NR_ppoll
+            __NR_ppoll,
+#endif
+#ifdef __NR_pselect6
+            __NR_pselect6,
+#endif
+#ifdef __NR_epoll_create
+            __NR_epoll_create,
+#endif
+#ifdef __NR_epoll_create1
+            __NR_epoll_create1,
+#endif
+#ifdef __NR_epoll_ctl
+            __NR_epoll_ctl,
+#endif
+#ifdef __NR_epoll_wait
+            __NR_epoll_wait,
+#endif
+#ifdef __NR_epoll_pwait
+            __NR_epoll_pwait,
+#endif
+#ifdef __NR_epoll_pwait2
+            __NR_epoll_pwait2,
+#endif
+#ifdef __NR_eventfd
+            __NR_eventfd,
+#endif
+#ifdef __NR_eventfd2
+            __NR_eventfd2,
+#endif
+#ifdef __NR_timerfd_create
+            __NR_timerfd_create,
+#endif
+#ifdef __NR_timerfd_settime
+            __NR_timerfd_settime,
+#endif
+#ifdef __NR_timerfd_gettime
+            __NR_timerfd_gettime,
+#endif
+#ifdef __NR_signalfd4
+            __NR_signalfd4,
+#endif
+#ifdef __NR_signalfd
+            __NR_signalfd,
+#endif
+#ifdef __NR_fsync
+            __NR_fsync,
+#endif
+#ifdef __NR_fdatasync
+            __NR_fdatasync,
+#endif
+#ifdef __NR_sync
+            __NR_sync,
+#endif
+#ifdef __NR_syncfs
+            __NR_syncfs,
+#endif
+#ifdef __NR_fallocate
+            __NR_fallocate,
+#endif
+#ifdef __NR_sync_file_range
+            __NR_sync_file_range,
+#endif
+#ifdef __NR_posix_fadvise64
+            __NR_posix_fadvise64,
+#endif
+#ifdef __NR_getcpu
+            __NR_getcpu,
+#endif
         };
 
         for (int sys_nr : kAllowedSyscalls) {
-            if (sys_nr <= 0) continue;
+            if (sys_nr < 0) continue;
             filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                 static_cast<uint32_t>(sys_nr), 0, 1));
             filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -1770,6 +1841,7 @@ void handle_termination_signal(int sig) {
     sa.sa_flags = 0;
     sigaction(sig, &sa, nullptr);
     raise(sig);
+    _exit(128 + sig);
 }
 
 void setup_safety_handlers() {
@@ -2400,7 +2472,7 @@ std::string curl_fetch_string(const std::string& url, const std::string& user_ag
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.4");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/5.0");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -2444,7 +2516,7 @@ bool curl_download_file(const std::string& url, const std::string& dest_path, co
     if (!user_agent.empty()) {
         curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/4.4");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/5.0");
     }
 
     CURLcode res = curl_easy_perform(curl);
