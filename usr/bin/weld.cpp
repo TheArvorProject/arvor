@@ -1496,9 +1496,25 @@ void mount_fs() {
         std::ofstream touch(resolv_target);
     }
     exec_argv_devnull_out({"mount", "--bind", "/etc/resolv.conf", resolv_target});
+
+    if (fs::exists("/var/lib/apt/lists", ec)) {
+        fs::create_directories(g_tree_root + "/var/lib/apt/lists", ec);
+        exec_argv_devnull_out({"mount", "--bind", "/var/lib/apt/lists", g_tree_root + "/var/lib/apt/lists"});
+    }
+    if (fs::exists("/var/cache/apt/archives", ec)) {
+        fs::create_directories(g_tree_root + "/var/cache/apt/archives", ec);
+        exec_argv_devnull_out({"mount", "--bind", "/var/cache/apt/archives", g_tree_root + "/var/cache/apt/archives"});
+    }
+    if (fs::exists("/var/lib/dpkg", ec)) {
+        fs::create_directories(g_tree_root + "/var/lib/dpkg", ec);
+        exec_argv_devnull_out({"mount", "--bind", "/var/lib/dpkg", g_tree_root + "/var/lib/dpkg"});
+    }
 }
 
 void umount_fs() {
+    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/dpkg"});
+    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/cache/apt/archives"});
+    exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/apt/lists"});
     exec_argv_devnull_out({"umount", "-l", g_tree_root + "/run"});
     exec_argv_devnull_out({"umount", "-l", g_tree_root + "/tmp"});
     exec_argv_devnull_out({"umount", "-l", g_tree_root + "/etc/resolv.conf"});
@@ -1650,19 +1666,10 @@ bool manage_sandbox(const std::string& action)
 
     if (action == "create") {
         umount_fs();
-        for (int attempt = 0; attempt < 10; ++attempt) {
-            if (exec_argv_devnull_out_checked({"umount", g_tree_root}) == 0) break;
-            usleep(200000);
-        }
-        for (int i = 0; i < 20; ++i) {
-            if (exec_argv_devnull_out_checked({"umount", "-l", g_tree_root}) != 0) break;
-        }
+        exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
         exec_argv_devnull_out_checked({"udevadm", "settle"});
         if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
-            for (int attempt = 0; attempt < 10; ++attempt) {
-                if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) == 0) break;
-                usleep(200000);
-            }
+            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
         }
         exec_argv_devnull_out_checked({"mkdir", "-p", "/nsm/weld"});
 
@@ -1699,9 +1706,9 @@ bool manage_sandbox(const std::string& action)
 
         struct stat dev_st{};
         bool dev_ready = false;
-        for (int attempt = 0; attempt < 50; ++attempt) {
+        for (int attempt = 0; attempt < 20; ++attempt) {
             if (stat(snap_dev.c_str(), &dev_st) == 0 && S_ISBLK(dev_st.st_mode)) { dev_ready = true; break; }
-            usleep(100000);
+            usleep(50000);
         }
         if (!dev_ready) {
             log_error(std::format("snapshot device {} did not become available in time.", snap_dev));
@@ -1719,11 +1726,8 @@ bool manage_sandbox(const std::string& action)
         } else if (fstype == "ext4" || fstype == "ext3" || fstype == "ext2") {
             mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, g_tree_root});
             if (mount_rc != 0 && thin) {
-                for (int i = 0; i < 20; ++i) {
-                    if (exec_argv_devnull_out_checked({"umount", "-l", g_tree_root}) != 0) break;
-                }
+                exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
                 exec_argv_devnull_out_checked({"udevadm", "settle"});
-                usleep(200000);
                 mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, g_tree_root});
             }
         } else if (!fstype.empty() && fstype.find(',') == std::string::npos) {
@@ -1748,18 +1752,10 @@ bool manage_sandbox(const std::string& action)
         return true;
     } else if (action == "delete") {
         umount_fs();
-        bool root_unmounted = false;
-        for (int attempt = 0; attempt < 10; ++attempt) {
-            if (exec_argv_devnull_out_checked({"umount", g_tree_root}) == 0) { root_unmounted = true; break; }
-            usleep(200000);
-        }
-        if (!root_unmounted) exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
+        exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
         exec_argv_devnull_out_checked({"udevadm", "settle"});
         if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
-            for (int attempt = 0; attempt < 10; ++attempt) {
-                if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) == 0) break;
-                usleep(200000);
-            }
+            exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev});
         }
         g_sandbox_active.store(false);
         return true;
@@ -1774,6 +1770,9 @@ bool check_system_locks(bool quiet);
 void cleanup_sandbox_on_exit() {
     std::call_once(g_cleanup_once, []() {
         if (g_sandbox_active.load()) {
+            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/dpkg"});
+            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/cache/apt/archives"});
+            exec_argv_devnull_out({"umount", "-l", g_tree_root + "/var/lib/apt/lists"});
             exec_argv_devnull_out({"umount", "-l", g_tree_root + "/run"});
             exec_argv_devnull_out({"umount", "-l", g_tree_root + "/tmp"});
             exec_argv_devnull_out({"umount", "-l", g_tree_root + "/etc/resolv.conf"});
@@ -3572,6 +3571,10 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
 
             pkgInitConfig(*_config);
             pkgInitSystem(*_config, _system);
+
+            _config->Set("APT::CDROM::NoMount", "true");
+            _config->Set("Acquire::cdrom", "false");
+            _config->Set("Dir::Bin::methods::cdrom", "/bin/false");
 
             sanitize_child_environment();
             setenv("DEBIAN_FRONTEND", "noninteractive", 1);
