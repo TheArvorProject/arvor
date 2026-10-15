@@ -3094,6 +3094,25 @@ void print_successful_install(const std::string& action, const std::vector<std::
     }
 }
 
+std::string read_arvor_version_from_os_release() post(r: !r.empty()) {
+    std::string content;
+    if (!read_text_file("/etc/os-release", content)) {
+        return ARVOR_VERSION;
+    }
+    std::istringstream ss(content);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!starts_with(line, "VERSION_ID")) continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) break;
+        std::string value = line.substr(eq + 1);
+        value = strip_quotes(trim_copy(value));
+        if (value.empty()) break;
+        return value;
+    }
+    return ARVOR_VERSION;
+}
+
 void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
     std::string user_agent = "ArvorLinux/" + arv_version;
     std::string ua_page = curl_fetch_string("https://nextferret.github.io/ua", user_agent);
@@ -4145,7 +4164,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> pkgs;
     bool apply_host = false;
     int search_page = 1;
-    std::string arv_version = ARVOR_VERSION;
+    std::string arv_version = read_arvor_version_from_os_release();
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
