@@ -14,9 +14,9 @@ The system relies on a custom infrastructure to handle updates, snapshots, and s
 
 - **arvorctl**: CLI tool to inspect boot health, check file diffs, and trigger instant rollbacks.
 - **arvor-guard**: Background service monitoring Thin Pool storage, preventing out-of-space lockups by auto-cleaning stale snapshots.
-- **Weld**: C++ transactional package manager featuring multithreading, package redirection, and pre-transaction snapshots.
+- **Weld**: C++26 transactional package manager featuring multithreading, package redirection, and pre-transaction snapshots.
 - **nsm**: Snapshot Manager responsible for creating, managing, and restoring system states.
-- **lxsm**: Lightweight sandbox environment manager for testing.
+- **nflxs**: Container manager with Docker Hub integration..
 
 ---
 
