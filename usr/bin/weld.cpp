@@ -274,7 +274,85 @@ std::atomic<bool> g_simulate_mode{false};
 
 std::string g_cached_root_dev;
 std::string g_cached_vg_name;
+std::string g_cached_snap_dev;
+std::string g_cached_snap_lv_name;
 std::once_flag g_cleanup_once;
+
+std::atomic<int> g_dpkg_lock_fd{-1};
+
+namespace {
+
+[[maybe_unused]] bool read_random_bytes(unsigned char* buf, std::size_t n) {
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    std::size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r <= 0) { close(fd); return false; }
+        got += static_cast<std::size_t>(r);
+    }
+    close(fd);
+    return true;
+}
+
+[[maybe_unused]]
+std::string random_suffix(std::size_t n = 8) {
+    unsigned char buf[8];
+    if (n > sizeof(buf)) n = sizeof(buf);
+    if (!read_random_bytes(buf, n)) {
+        return std::to_string(std::time(nullptr) & 0xffffffff);
+    }
+    static constexpr std::string_view kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(n * 2);
+    for (std::size_t i = 0; i < n; ++i) {
+        out.push_back(kHex[(buf[i] >> 4) & 0xF]);
+        out.push_back(kHex[buf[i] & 0xF]);
+    }
+    return out;
+}
+
+bool is_valid_package_name(std::string_view name) {
+    if (name.empty() || name.size() > 256) return false;
+    if (name[0] == '-' || name[0] == '=' || name[0] == '/' || name[0] == ':') return false;
+    if (name[0] == '.' && name.size() > 1 && name[1] == '.') return false;
+    for (char c : name) {
+        if (c == '=' || c == '/' || c == ':' || c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            return false;
+        }
+    }
+    if (name.find("..") != std::string_view::npos) return false;
+    return true;
+}
+
+void sanitize_child_environment() {
+    static constexpr std::array<const char*, 14> kDangerousEnv = {
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_BIND_NOW",
+        "LD_PROFILE", "LD_SHOW_AUXV", "LD_TRACE_LOADED_OBJECTS",
+        "LD_VERBOSE", "LD_WARN", "LDPATH", "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH", "PYTHONPATH", "PERL5OPT"
+    };
+    for (const char* var : kDangerousEnv) {
+        unsetenv(var);
+    }
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("HOME", "/root", 1);
+    setenv("LC_ALL", "C", 1);
+    setenv("LANG", "C", 1);
+}
+
+int open_no_follow(const std::string& path, int flags, mode_t mode = 0) {
+    auto parent_pos = path.find_last_of('/');
+    std::string parent = (parent_pos == std::string::npos) ? "." : path.substr(0, parent_pos);
+    std::string base = (parent_pos == std::string::npos) ? path : path.substr(parent_pos + 1);
+    int parent_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent_fd < 0) return -1;
+    int fd = openat(parent_fd, base.c_str(), flags | O_NOFOLLOW | O_CLOEXEC, mode);
+    close(parent_fd);
+    return fd;
+}
+
+}
 
 std::string weld_arch() {
 #if defined(__x86_64__)
@@ -297,7 +375,7 @@ std::string weld_arch() {
 }
 
 std::string weld_version_str() {
-    return std::format("Weld 5.0 ({})", weld_arch());
+    return std::format("Weld 4.4 ({})", weld_arch());
 }
 
 template <typename... Args>
@@ -351,15 +429,14 @@ std::string to_lower_copy(std::string_view s) {
     return r;
 }
 
-std::string hex_encode(const unsigned char* data, std::size_t len)
-    pre(len == 0 || data != nullptr)
+std::string hex_encode(std::span<const unsigned char> data)
     post(r: !r.empty()) {
     static constexpr std::string_view kHex = "0123456789abcdef";
     std::string out;
-    out.reserve(len * 2);
-    for (std::size_t i = 0; i < len; ++i) {
-        out.push_back(kHex[(data[i] >> 4) & 0xF]);
-        out.push_back(kHex[data[i] & 0xF]);
+    out.reserve(data.size() * 2);
+    for (auto b : data) {
+        out.push_back(kHex[(b >> 4) & 0xF]);
+        out.push_back(kHex[b & 0xF]);
     }
     return out;
 }
@@ -380,33 +457,34 @@ std::vector<unsigned char> base64_decode_buf(std::string_view s) {
     return out;
 }
 
-bool compute_blake2b512(const unsigned char* data, std::size_t len, unsigned char out[64])
-    pre(len == 0 || data != nullptr) pre(out != nullptr) {
+bool compute_blake2b512(std::span<const unsigned char> data, std::span<unsigned char, 64> out)
+    pre(!out.empty()) {
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) return false;
     bool ok = false;
     const EVP_MD* md = EVP_blake2b512();
     if (!md) { EVP_MD_CTX_free(ctx); return false; }
     if (EVP_DigestInit_ex(ctx, md, nullptr) == 1) {
-        if (EVP_DigestUpdate(ctx, data, len) == 1) {
+        if (EVP_DigestUpdate(ctx, data.data(), data.size()) == 1) {
             unsigned int out_len = 0;
-            if (EVP_DigestFinal_ex(ctx, out, &out_len) == 1 && out_len == 64) ok = true;
+            if (EVP_DigestFinal_ex(ctx, out.data(), &out_len) == 1 && out_len == 64) ok = true;
         }
     }
     EVP_MD_CTX_free(ctx);
     return ok;
 }
 
-bool verify_ed25519(const unsigned char* msg, std::size_t msg_len,
-                    const unsigned char sig[64], const unsigned char pubkey[32])
-    pre(msg_len == 0 || msg != nullptr) pre(sig != nullptr) pre(pubkey != nullptr) {
-    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey, 32);
+bool verify_ed25519(std::span<const unsigned char> msg,
+                    std::span<const unsigned char, 64> sig,
+                    std::span<const unsigned char, 32> pubkey)
+    pre(!msg.empty() || msg.data() != nullptr) pre(!sig.empty()) pre(!pubkey.empty()) {
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey.data(), 32);
     if (!pkey) return false;
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) { EVP_PKEY_free(pkey); return false; }
     bool ok = false;
     if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-        int rc = EVP_DigestVerify(ctx, sig, 64, msg, msg_len);
+        int rc = EVP_DigestVerify(ctx, sig.data(), 64, msg.data(), msg.size());
         if (rc == 1) ok = true;
     }
     EVP_MD_CTX_free(ctx);
@@ -490,17 +568,23 @@ bool verify_minisign_signature(const std::string& content, const MinisignSignatu
     if (!prehashed && !raw_ed) return false;
 
     if (raw_ed) {
-        if (!verify_ed25519(reinterpret_cast<const unsigned char*>(content.data()),
-                            content.size(), sig.sig, key.pubkey)) {
+        std::span<const unsigned char> msg{reinterpret_cast<const unsigned char*>(content.data()), content.size()};
+        std::span<const unsigned char, 64> sig_span{sig.sig, 64};
+        std::span<const unsigned char, 32> key_span{key.pubkey, 32};
+        if (!verify_ed25519(msg, sig_span, key_span)) {
             return false;
         }
     } else {
         unsigned char hash[64];
-        if (!compute_blake2b512(reinterpret_cast<const unsigned char*>(content.data()),
-                               content.size(), hash)) {
+        std::span<const unsigned char> data{reinterpret_cast<const unsigned char*>(content.data()), content.size()};
+        std::span<unsigned char, 64> hash_span{hash, 64};
+        if (!compute_blake2b512(data, hash_span)) {
             return false;
         }
-        if (!verify_ed25519(hash, 64, sig.sig, key.pubkey)) return false;
+        std::span<const unsigned char, 64> sig_span{sig.sig, 64};
+        std::span<const unsigned char, 32> key_span{key.pubkey, 32};
+        std::span<const unsigned char> hash_msg{hash, 64};
+        if (!verify_ed25519(hash_msg, sig_span, key_span)) return false;
     }
 
     std::vector<unsigned char> signed_comment;
@@ -510,8 +594,10 @@ bool verify_minisign_signature(const std::string& content, const MinisignSignatu
                           sig.trusted_comment.begin(),
                           sig.trusted_comment.end());
 
-    return verify_ed25519(signed_comment.data(), signed_comment.size(),
-                          sig.global_sig, key.pubkey);
+    std::span<const unsigned char> comment_msg{signed_comment.data(), signed_comment.size()};
+    std::span<const unsigned char, 64> gsig_span{sig.global_sig, 64};
+    std::span<const unsigned char, 32> key_span{key.pubkey, 32};
+    return verify_ed25519(comment_msg, gsig_span, key_span);
 }
 
 std::vector<MinisignPublicKey> load_trusted_minisign_keys() {
@@ -558,7 +644,7 @@ bool verify_repo_metadata_signature(const std::string& metadata, const std::stri
         }
     }
     if (!key_seen) {
-        error_out = std::format("no trusted key matches the signature key id {}", hex_encode(sig.key_id, 8));
+        error_out = std::format("no trusted key matches the signature key id {}", hex_encode(std::span<const unsigned char>{sig.key_id, 8}));
     } else {
         error_out = "signature verification failed for matched trusted key";
     }
@@ -1274,12 +1360,29 @@ long do_pivot_root(const char* new_root, const char* put_old)
     pre(new_root != nullptr) pre(put_old != nullptr);
 
 void bind_safe_dev_node(const std::string& host_path, const std::string& chroot_path, mode_t mode) {
-    std::error_code ec;
-    if (!fs::exists(host_path, ec)) return;
-    if (!fs::exists(chroot_path, ec)) {
-        if (!fs::create_directories(fs::path(chroot_path).parent_path(), ec)) return;
-        mknod(chroot_path.c_str(), mode | 0, 0);
+    struct stat host_st{};
+    int host_fd = open(host_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (host_fd < 0) return;
+    if (fstat(host_fd, &host_st) != 0) { close(host_fd); return; }
+    close(host_fd);
+
+    int dst_fd = open_no_follow(chroot_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (dst_fd < 0) {
+        if (errno == EEXIST) {
+            dst_fd = open_no_follow(chroot_path, O_WRONLY | O_NOFOLLOW);
+            if (dst_fd < 0) return;
+            struct stat dst_st{};
+            if (fstat(dst_fd, &dst_st) != 0 || !S_ISCHR(dst_st.st_mode)) {
+                close(dst_fd);
+                return;
+            }
+        } else {
+            return;
+        }
     }
+    (void)mode;
+    close(dst_fd);
+
     exec_argv_devnull_out({"mount", "--bind", host_path, chroot_path});
 }
 
@@ -1470,8 +1573,9 @@ bool manage_sandbox(const std::string& action)
     std::string vg_name = get_vg_name(root_dev);
     g_cached_root_dev = root_dev;
     g_cached_vg_name = vg_name;
-    std::string snap_lv_name = "weld_sandbox_snap";
-    std::string snap_dev = "/dev/" + vg_name + "/" + snap_lv_name;
+    constexpr std::string_view kSnapLvName = "weld_sandbox_snap";
+    const std::string& snap_lv_name = g_cached_snap_lv_name = std::string{kSnapLvName};
+    const std::string& snap_dev = g_cached_snap_dev = "/dev/" + vg_name + "/" + snap_lv_name;
 
     if (action == "create") {
         umount_fs();
@@ -1592,6 +1696,10 @@ bool manage_sandbox(const std::string& action)
     return false;
 }
 
+void cleanup_sandbox_on_exit();
+void release_system_locks();
+bool check_system_locks(bool quiet);
+
 void cleanup_sandbox_on_exit() {
     std::call_once(g_cleanup_once, []() {
         if (g_sandbox_active.load()) {
@@ -1613,19 +1721,55 @@ void cleanup_sandbox_on_exit() {
             exec_argv_devnull_out({"umount", "-l", g_tree_root});
 
             std::string vg_name = !g_cached_vg_name.empty() ? g_cached_vg_name : get_vg_name(get_root_device());
-            if (!vg_name.empty()) {
-                std::string snap_dev = "/dev/" + vg_name + "/weld_sandbox_snap";
+            std::string snap_dev = g_cached_snap_dev;
+            if (snap_dev.empty() && !vg_name.empty()) {
+                snap_dev = "/dev/" + vg_name + "/weld_sandbox_snap";
+            }
+            if (!snap_dev.empty() && is_safe_device_path(snap_dev)) {
                 exec_argv_devnull_out({"lvremove", "-f", snap_dev});
             }
+            g_cached_snap_lv_name.clear();
+            g_cached_snap_dev.clear();
             g_sandbox_active.store(false);
         }
         g_config_backup.restore_orig();
+        release_system_locks();
     });
 }
 
+namespace {
+
+void write_signal_msg(int sig) {
+    static constexpr std::string_view kPrefix = "E: terminating on signal ";
+    char buf[16];
+    std::size_t pos = 0;
+    if (pos + kPrefix.size() <= sizeof(buf)) {
+        std::memcpy(buf + pos, kPrefix.data(), kPrefix.size());
+        pos += kPrefix.size();
+    }
+    char digits[16];
+    int len = 0;
+    int s = sig;
+    if (s == 0) { digits[len++] = '0'; }
+    else { while (s > 0 && len < 16) { digits[len++] = static_cast<char>('0' + (s % 10)); s /= 10; } }
+    for (int i = len - 1; i >= 0 && pos < sizeof(buf); --i) {
+        buf[pos++] = digits[i];
+    }
+    if (pos < sizeof(buf)) buf[pos++] = '\n';
+    ssize_t written = write(STDERR_FILENO, buf, pos);
+    (void)written;
+}
+
+}
+
 void handle_termination_signal(int sig) {
-    cleanup_sandbox_on_exit();
-    _exit(128 + sig);
+    write_signal_msg(sig);
+    struct sigaction sa{};
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
 }
 
 void setup_safety_handlers() {
@@ -1633,7 +1777,7 @@ void setup_safety_handlers() {
     struct sigaction sa{};
     sa.sa_handler = handle_termination_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
+    sa.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGQUIT, &sa, nullptr);
@@ -2816,7 +2960,7 @@ std::string calculate_sha256(const std::string& file_path) pre(!file_path.empty(
         unsigned char hash[EVP_MAX_MD_SIZE];
         unsigned int hash_len = 0;
         if (EVP_DigestFinal_ex(ctx, hash, &hash_len) == 1 && hash_len > 0) {
-            result = hex_encode(hash, hash_len);
+            result = hex_encode(std::span<const unsigned char>{hash, hash_len});
         }
     }
     EVP_MD_CTX_free(ctx);
@@ -2935,8 +3079,22 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
 
     for (const auto& pkg_name : pkgs) {
         if (ends_with(pkg_name, ".deb")) {
-            if (!path_is_regular_file(pkg_name)) {
+            if (pkg_name.find("..") != std::string::npos || pkg_name.find('\0') != std::string::npos) {
+                if (!quiet) log_error(std::format("suspicious path traversal in: {}", pkg_name));
+                had_error = true;
+                continue;
+            }
+            int probe_fd = open_no_follow(pkg_name, O_RDONLY);
+            if (probe_fd < 0) {
                 if (!quiet) log_error(std::format("unable to locate local package file: {}", pkg_name));
+                had_error = true;
+                continue;
+            }
+            struct stat st{};
+            bool is_regular = (fstat(probe_fd, &st) == 0 && S_ISREG(st.st_mode));
+            close(probe_fd);
+            if (!is_regular) {
+                if (!quiet) log_error(std::format("local package is not a regular file: {}", pkg_name));
                 had_error = true;
                 continue;
             }
@@ -3266,15 +3424,26 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             std::string put_old_path = std::string(g_tree_root) + "/.old_root";
             bool pivoted = false;
             if (mkdir(put_old_path.c_str(), 0755) == 0) {
-                if (mount("", g_tree_root.c_str(), "", MS_PRIVATE | MS_REC, nullptr) == 0) {
-                    if (do_pivot_root(g_tree_root.c_str(), put_old_path.c_str()) == 0) {
-                        pivoted = true;
+                int verify_fd = open_no_follow(put_old_path, O_RDONLY | O_DIRECTORY);
+                if (verify_fd >= 0) {
+                    if (mount("", g_tree_root.c_str(), "", MS_PRIVATE | MS_REC, nullptr) == 0) {
+                        if (do_pivot_root(g_tree_root.c_str(), put_old_path.c_str()) == 0) {
+                            pivoted = true;
+                        }
                     }
+                    close(verify_fd);
                 }
             }
 
             if (pivoted) {
-                chdir("/");
+                if (chdir("/") != 0) {
+                    if (have_err) {
+                        static constexpr std::string_view kMsg = "chdir(\"/\") failed after pivot_root\n";
+                        ssize_t written = write(err_pipe[1], kMsg.data(), kMsg.size());
+                        (void)written;
+                    }
+                    _exit(1);
+                }
                 umount2("/.old_root", MNT_DETACH);
                 rmdir("/.old_root");
             } else {
@@ -3332,6 +3501,7 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             pkgInitConfig(*_config);
             pkgInitSystem(*_config, _system);
 
+            sanitize_child_environment();
             setenv("DEBIAN_FRONTEND", "noninteractive", 1);
             bool ok = run_libapt_transaction(action, targets, status_fd, true);
             std::cout.flush();
@@ -3479,6 +3649,7 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
         }
 
         for (int fd = 4; fd < 1024; ++fd) close(fd);
+        sanitize_child_environment();
         setenv("DEBIAN_FRONTEND", "noninteractive", 1);
         bool ok = run_libapt_transaction(action, targets, status_fd, true);
         std::cout.flush();
@@ -3856,26 +4027,40 @@ int list_installed_packages() {
 }
 
 bool check_system_locks(bool quiet = false) {
-    int fd = open("/var/lib/dpkg/lock-frontend", O_RDWR | O_CREAT | O_CLOEXEC, 0640);
+    int fd = open("/var/lib/dpkg/lock-frontend", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0640);
+    if (fd < 0) {
+        if (!quiet) log_error("cannot open /var/lib/dpkg/lock-frontend");
+        return false;
+    }
+    struct flock fl{};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    if (fcntl(fd, F_SETLK, &fl) == -1) {
+        close(fd);
+        if (!quiet) {
+            log_error("dpkg lock (/var/lib/dpkg/lock-frontend) is currently held by another process.");
+            std::print(stderr, "Please wait for the background package operation to complete.\n");
+        }
+        return false;
+    }
+    int old_fd = g_dpkg_lock_fd.exchange(fd);
+    if (old_fd >= 0) close(old_fd);
+    return true;
+}
+
+void release_system_locks() {
+    int fd = g_dpkg_lock_fd.exchange(-1);
     if (fd >= 0) {
         struct flock fl{};
-        fl.l_type = F_WRLCK;
+        fl.l_type = F_UNLCK;
         fl.l_whence = SEEK_SET;
         fl.l_start = 0;
         fl.l_len = 0;
-        if (fcntl(fd, F_SETLK, &fl) == -1) {
-            close(fd);
-            if (!quiet) {
-                log_error("dpkg lock (/var/lib/dpkg/lock-frontend) is currently held by another process.");
-                std::print(stderr, "Please wait for the background package operation to complete.\n");
-            }
-            return false;
-        }
-        fl.l_type = F_UNLCK;
         fcntl(fd, F_SETLK, &fl);
         close(fd);
     }
-    return true;
 }
 
 int show_package_why(const std::string& pkg_name) {
@@ -4184,7 +4369,13 @@ int main(int argc, char** argv) {
             try { search_page = std::stoi(argv[++i]); } catch (...) { search_page = 1; }
         }
         else if (command.empty() && !arg.empty() && arg[0] != '-') { command = arg; }
-        else if (!arg.empty() && arg[0] != '-') { pkgs.push_back(arg); }
+        else if (!arg.empty() && arg[0] != '-') {
+            if (!is_valid_package_name(arg) && !ends_with(arg, ".deb")) {
+                log_error(std::format("invalid package name: {}", arg));
+                return 1;
+            }
+            pkgs.push_back(arg);
+        }
     }
 
     if (command.empty()) { show_help(); return 0; }
@@ -4273,5 +4464,6 @@ int main(int argc, char** argv) {
     curl_global_cleanup();
     EVP_cleanup();
     ERR_free_strings();
+    release_system_locks();
     return 0;
 }
