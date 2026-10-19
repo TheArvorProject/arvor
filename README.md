@@ -8,7 +8,7 @@ ARM Readme: https://github.com/NextFerret/arvor/blob/main/README-ARM.md
 
 ---
 
-## Starting with version 12 (current version: 10 "Crann Bethadh"), Arvor Linux is no longer considered experimental.
+## Starting with version 12 (current version: 10 "Crann Bethadh"), Arvor Linux will no longer considered experimental.
 
 ## Architecture
 
