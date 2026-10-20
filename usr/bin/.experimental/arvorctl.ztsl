@@ -1,0 +1,74 @@
+# The Arvor License (TAL)
+# Maintainer : Hludwig
+# © NextFerret,2026.
+# This is a Initial Reimplementation of ArvorCTL in ZTSL-26
+def_mod libztsl # basically ztsl. ztc ignores this and compiles THIS ↓
+ztsl.start
+}
+func check_root
+ccompat
+```c
+if (getuid() != 0) {
+    fprintf(stderr, "E: This Command needs Root Privileges.\n");
+    fflush(stderr);
+    exit(1);
+}
+```
+}
+func help
+run.func check_root
+if argument is not defined
+then
+text.show
+```
+Usage: arvorctl [command] [options]
+
+Commands:
+  snapshot [name]        Create a new snapshot of root through nsm (auto-named if omitted)
+  rollback <name>        Roll back the root volume to the specified snapshot through nsm
+  help                   Show this help message
+```
+}
+func create
+run.func check_root
+if argument snapshot is passed with %ea%
+then
+sys.exec
+```
+/usr/bin/nsm create %ea%
+```
+if result is =! 0
+then
+text.show
+```
+E: failed to create snapshot
+```
+}
+func rollback
+run.func check_root
+if argument rollback is passed with %ea%
+then
+sys.exec.silent
+```exec
+/usr/bin/nsm rollback %ea%
+```
+if result is = 0
+then
+text.show
+```
+Rollback of %ea% done. A Reboot is recommended.
+```
+if argument is not defined
+then 
+text.show
+```
+E : unknown command %a%
+```
+run.func help
+}
+func help_command
+if argument help is passed
+then
+run.func help
+}
+ztsl.end
