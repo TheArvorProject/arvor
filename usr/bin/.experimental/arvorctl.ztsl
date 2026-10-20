@@ -69,6 +69,14 @@ run.func help
 func help_command
 if argument help is passed
 then
-run.func help
+text.show
+```
+Usage: arvorctl [command] [options]
+
+Commands:
+  snapshot [name]        Create a new snapshot of root through nsm (auto-named if omitted)
+  rollback <name>        Roll back the root volume to the specified snapshot through nsm
+  help                   Show this help message
+```
 }
 ztsl.end
