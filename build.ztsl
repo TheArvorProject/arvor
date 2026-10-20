@@ -1,6 +1,10 @@
-# to compile it use ztc: https://github.com/ZeonTheFerret/ztc
+# The Arvor License (TAL)
+# Maintainer : Hludwig
+# © NextFerret,2026.
+# to compile it use ztc: https://github.com/hludwig-nf/ztc
 # this code also can be compiled as an ELF and an .c,but it is not tha case here.
-# Zeon (@zeontheferret — both github and discord.)
+# Hludwig (@hludwig-nf)
+# use it with ztc -ztv=p26
 ztsl.start # start
 }
 func "nsm" 
@@ -13,12 +17,13 @@ func "weld"
 sys.exec # compiles weld
 ```shell
 
- g++ -std=c++23 -O2 \
+ g++ -std=c++26 -O2 \
     -Dallow_weld_repositories \
     -Dnflinux \
-    -Darvor_version=\"8.1\" \
     usr/bin/weld.cpp -o ./usr/bin/weld \
-    -lapt-pkg -lcurl
+    -lapt-pkg -lcurl \
+    -freflection -fcontracts -O2 -Wall -Wextra \
+    -static-libgcc -static-libstdc++ \
 
 ```
 }
@@ -28,10 +33,10 @@ sys.exec
 gcc -o usr/bin/arvor_sys_info  # notice that no build code is defined here,because it is made for our discord https://discord.gg/zQaGrHNgxB for specific bug reports. 
 ```
 }
-func "lxsm"
-sys.exec # compiles lxsm
+func "nflxs"
+sys.exec # compiles nflxs
 ```shell
-g++ -std=c++23 -O2 ./usr/bin/lxsm.cpp -o ./usr/bin/lxsm -ldl
+gcc -o ./usr/bin/nflxs usr/bin/nflxs.c -lcrypt
 ```
 }
 func "debootstrap"
@@ -79,7 +84,7 @@ sudo chroot "$TARGET_DIR" env DEBIAN_FRONTEND=noninteractive apt-get install -y 
 func "install_codes" # install the codes
 sys.exec
 ```
-sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/napt./usr/bin/,./usr/bin/lxsm,./usr/bin/arvor*,./usr/bin/arvor_sys_info,./usr/bin/nsmd_start} ./arvor/usr/bin
+sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/weld.,./usr/bin/nflxs,./usr/bin/arvor*,./usr/bin/arvor_sys_info,./usr/bin/nsmd_start} ./arvor/usr/bin
 ```
 }
 func "chroot"
