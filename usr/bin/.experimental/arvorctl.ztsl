@@ -2,6 +2,7 @@
 # Maintainer : Hludwig
 # © NextFerret,2026.
 # This is a Initial Reimplementation of ArvorCTL in ZTSL-26
+# to compile it : ztc -o arvorctl arvorctl.ztsl -ztv=ztsl26
 def_mod libztsl # basically ztsl. ztc ignores this and compiles THIS ↓
 ztsl.start
 }
