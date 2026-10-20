@@ -18,8 +18,6 @@ if (getuid() != 0) {
 }
 func help
 run.func check_root
-if argument is not defined
-then
 text.show
 ```
 Usage: arvorctl [command] [options]
@@ -32,10 +30,10 @@ Commands:
 }
 func create
 run.func check_root
-if argument snapshot is passed with %ea%
+if argument create is passed with %ea%
 then
-sys.exec
-```
+sys.exec.silent
+```exec
 /usr/bin/nsm create %ea%
 ```
 if result is =! 0
@@ -44,6 +42,13 @@ text.show
 ```
 E: failed to create snapshot
 ```
+if argument is not defined
+then 
+text.show
+```
+E : unknown command %a%.
+```
+run.func help
 }
 func rollback
 run.func check_root
@@ -53,7 +58,7 @@ sys.exec.silent
 ```exec
 /usr/bin/nsm rollback %ea%
 ```
-if result is = 0
+if result is =! 1
 then
 text.show
 ```
@@ -63,21 +68,13 @@ if argument is not defined
 then 
 text.show
 ```
-E : unknown command %a%
+E : unknown command %a%.
 ```
 run.func help
 }
 func help_command
 if argument help is passed
 then
-text.show
-```
-Usage: arvorctl [command] [options]
-
-Commands:
-  snapshot [name]        Create a new snapshot of root through nsm (auto-named if omitted)
-  rollback <name>        Roll back the root volume to the specified snapshot through nsm
-  help                   Show this help message
-```
+run.func help
 }
 ztsl.end
