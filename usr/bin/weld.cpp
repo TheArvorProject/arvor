@@ -1,4 +1,4 @@
-// © NextFerret,2026,The Arvor License (TAL)
+// © NextFerret, 2026, The Arvor License (TAL)
 // Maintainer: Hludwig (@hludwig-nf)
 
 #include <algorithm>
@@ -6,57 +6,57 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <cctype>
-#include <contracts>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <dirent.h>
-#include <fcntl.h>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <future>
+#include <initializer_list>
 #include <iostream>
 #include <map>
-#include <meta>
 #include <memory>
 #include <mutex>
 #include <print>
 #include <set>
-#include <signal.h>
-#include <source_location>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <unistd.h>
+
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <sys/wait.h>
-#include <thread>
-#include <tuple>
-#include <unistd.h>
-#include <utility>
-#include <vector>
 
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
-#include <sched.h>
-#include <pthread.h>
-#include <stddef.h>
 
 #include <curl/curl.h>
-#include <openssl/err.h>
+
+#include <openssl/bio.h>
 #include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <openssl/sha.h>
 
 #include <apt-pkg/acquire.h>
 #include <apt-pkg/acquire-item.h>
@@ -73,7 +73,6 @@
 #include <apt-pkg/packagemanager.h>
 #include <apt-pkg/pkgsystem.h>
 #include <apt-pkg/pkgrecords.h>
-#include <apt-pkg/policy.h>
 #include <apt-pkg/sourcelist.h>
 #include <apt-pkg/tagfile.h>
 #include <apt-pkg/update.h>
@@ -211,39 +210,109 @@
 #define CAP_SETFCAP 31
 #endif
 
-#ifdef arvor_version
-#define ARVOR_VERSION arvor_version
+#if defined(weld_contracts)
+#define WELD_CONTRACT(cond) contract_assert(cond)
 #else
-#define ARVOR_VERSION "arvor linux 0.0"
+#define WELD_CONTRACT(cond) ((void)sizeof(cond))
 #endif
 
 namespace fs = std::filesystem;
 
 namespace {
+
 std::mutex g_cout_mutex;
+
+class FdGuard {
+public:
+    FdGuard() = default;
+    explicit FdGuard(int fd) noexcept : fd_(fd) {}
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    FdGuard(FdGuard&& other) noexcept : fd_(other.release()) {}
+    FdGuard& operator=(FdGuard&& other) noexcept {
+        if (this != &other) reset(other.release());
+        return *this;
+    }
+    ~FdGuard() { reset(); }
+
+    [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+    explicit operator bool() const noexcept { return valid(); }
+    [[nodiscard]] int release() noexcept {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+    void reset(int fd = -1) noexcept {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = fd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+struct DirDeleter {
+    void operator()(DIR* d) const noexcept { closedir(d); }
+};
+struct FileDeleter {
+    void operator()(FILE* f) const noexcept { fclose(f); }
+};
+struct BioDeleter {
+    void operator()(BIO* b) const noexcept { BIO_free_all(b); }
+};
+struct EvpMdCtxDeleter {
+    void operator()(EVP_MD_CTX* c) const noexcept { EVP_MD_CTX_free(c); }
+};
+struct EvpPkeyDeleter {
+    void operator()(EVP_PKEY* k) const noexcept { EVP_PKEY_free(k); }
+};
+struct CurlDeleter {
+    void operator()(CURL* c) const noexcept { curl_easy_cleanup(c); }
+};
+
+using DirPtr      = std::unique_ptr<DIR, DirDeleter>;
+using FilePtr     = std::unique_ptr<FILE, FileDeleter>;
+using BioPtr      = std::unique_ptr<BIO, BioDeleter>;
+using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
+using EvpPkeyPtr  = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
+using CurlPtr     = std::unique_ptr<CURL, CurlDeleter>;
+
+class SignalBlockGuard {
+public:
+    explicit SignalBlockGuard(const sigset_t& block) {
+        pthread_sigmask(SIG_BLOCK, &block, &old_mask_);
+    }
+    SignalBlockGuard(const SignalBlockGuard&) = delete;
+    SignalBlockGuard& operator=(const SignalBlockGuard&) = delete;
+    ~SignalBlockGuard() { pthread_sigmask(SIG_SETMASK, &old_mask_, nullptr); }
+
+private:
+    sigset_t old_mask_{};
+};
+
 }
 
-void handle_contract_violation(const std::contracts::contract_violation& v) {
+template <typename... Args>
+void safe_log(Args&&... args) {
     std::lock_guard<std::mutex> lock(g_cout_mutex);
-    std::print(stderr, "E: contract violation: {}\n", v.comment());
-    std::fflush(stderr);
-    std::_Exit(1);
+    (std::cout << ... << std::forward<Args>(args));
+    std::cout.flush();
 }
 
-template <typename T>
-consteval std::string_view type_name() {
-    constexpr auto info = ^^T;
-    constexpr auto name = std::meta::identifier_of(info);
-    return name;
+void log_error(std::string_view msg) {
+    std::lock_guard<std::mutex> lock(g_cout_mutex);
+    std::print(stderr, "E: {}\n", msg);
 }
 
-template <typename... Ts>
-constexpr std::size_t pack_size() {
-    return sizeof...(Ts);
+void log_warning(std::string_view msg) {
+    std::lock_guard<std::mutex> lock(g_cout_mutex);
+    std::print(stderr, "W: {}\n", msg);
 }
 
 namespace {
 
+constexpr std::string_view kWeldVersion = "5.1";
 constexpr std::string_view kTreeRoot = "/nsm/weld/root";
 constexpr std::string_view kNfTreeBin = "/usr/bin/nsm";
 constexpr std::string_view kAutoSnapDir = "/nsm/snapshots/auto";
@@ -258,99 +327,26 @@ constexpr std::size_t kWeldMinMemMb = 256;
 constexpr std::size_t kWeldMaxMetadataSize = 8ULL * 1024 * 1024;
 constexpr std::size_t kWeldMaxDownloadSize = 1024ULL * 1024 * 1024;
 
-std::string g_tree_root{kTreeRoot};
-std::string g_nf_tree_bin{kNfTreeBin};
-std::string g_auto_snap_dir{kAutoSnapDir};
-std::string g_weld_etc_dir{kWeldEtcDir};
-std::string g_weld_sources_file{kWeldSourcesFile};
-std::string g_weld_sources_dir{kWeldSourcesDir};
-std::string g_weld_cache_dir{kWeldCacheDir};
-std::string g_weld_trusted_keys_dir{kWeldTrustedKeysDir};
+const std::string g_tree_root{kTreeRoot};
+const std::string g_nf_tree_bin{kNfTreeBin};
+const std::string g_auto_snap_dir{kAutoSnapDir};
+const std::string g_weld_etc_dir{kWeldEtcDir};
+const std::string g_weld_sources_file{kWeldSourcesFile};
+const std::string g_weld_sources_dir{kWeldSourcesDir};
+const std::string g_weld_cache_dir{kWeldCacheDir};
+const std::string g_weld_trusted_keys_dir{kWeldTrustedKeysDir};
+
+bool g_assume_yes = false;
+bool g_force_reinstall = false;
+bool g_simulate_mode = false;
 
 std::atomic<bool> g_sandbox_active{false};
-std::atomic<bool> g_assume_yes{false};
-std::atomic<bool> g_force_reinstall{false};
-std::atomic<bool> g_simulate_mode{false};
+std::atomic<int> g_dpkg_lock_fd{-1};
 
 std::string g_cached_root_dev;
 std::string g_cached_vg_name;
 std::string g_cached_snap_dev;
-std::string g_cached_snap_lv_name;
 std::once_flag g_cleanup_once;
-
-std::atomic<int> g_dpkg_lock_fd{-1};
-
-namespace {
-
-[[maybe_unused]] bool read_random_bytes(unsigned char* buf, std::size_t n) {
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    std::size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, buf + got, n - got);
-        if (r <= 0) { close(fd); return false; }
-        got += static_cast<std::size_t>(r);
-    }
-    close(fd);
-    return true;
-}
-
-[[maybe_unused]]
-std::string random_suffix(std::size_t n = 8) {
-    unsigned char buf[8];
-    if (n > sizeof(buf)) n = sizeof(buf);
-    if (!read_random_bytes(buf, n)) {
-        return std::to_string(std::time(nullptr) & 0xffffffff);
-    }
-    static constexpr std::string_view kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(n * 2);
-    for (std::size_t i = 0; i < n; ++i) {
-        out.push_back(kHex[(buf[i] >> 4) & 0xF]);
-        out.push_back(kHex[buf[i] & 0xF]);
-    }
-    return out;
-}
-
-bool is_valid_package_name(std::string_view name) {
-    if (name.empty() || name.size() > 256) return false;
-    if (name[0] == '-' || name[0] == '=' || name[0] == '/' || name[0] == ':') return false;
-    if (name[0] == '.' && name.size() > 1 && name[1] == '.') return false;
-    for (char c : name) {
-        if (c == '=' || c == '/' || c == ':' || c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
-            return false;
-        }
-    }
-    if (name.find("..") != std::string_view::npos) return false;
-    return true;
-}
-
-void sanitize_child_environment() {
-    static constexpr std::array<const char*, 14> kDangerousEnv = {
-        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_BIND_NOW",
-        "LD_PROFILE", "LD_SHOW_AUXV", "LD_TRACE_LOADED_OBJECTS",
-        "LD_VERBOSE", "LD_WARN", "LDPATH", "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH", "PYTHONPATH", "PERL5OPT"
-    };
-    for (const char* var : kDangerousEnv) {
-        unsetenv(var);
-    }
-    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-    setenv("HOME", "/root", 1);
-    setenv("LC_ALL", "C", 1);
-    setenv("LANG", "C", 1);
-}
-
-int open_no_follow(const std::string& path, int flags, mode_t mode = 0) {
-    auto parent_pos = path.find_last_of('/');
-    std::string parent = (parent_pos == std::string::npos) ? "." : path.substr(0, parent_pos);
-    std::string base = (parent_pos == std::string::npos) ? path : path.substr(parent_pos + 1);
-    int parent_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (parent_fd < 0) return -1;
-    int fd = openat(parent_fd, base.c_str(), flags | O_NOFOLLOW | O_CLOEXEC, mode);
-    close(parent_fd);
-    return fd;
-}
 
 }
 
@@ -375,50 +371,18 @@ std::string weld_arch() {
 }
 
 std::string weld_version_str() {
-    return std::format("Weld 5.0 ({})", weld_arch());
+    return std::format("Weld {} ({})", kWeldVersion, weld_arch());
 }
 
-template <typename... Args>
-void safe_log(Args&&... args) {
-    std::lock_guard<std::mutex> lock(g_cout_mutex);
-    (std::cout << ... << args);
-    std::cout.flush();
-}
-
-void log_error(std::string_view msg) {
-    std::lock_guard<std::mutex> lock(g_cout_mutex);
-    std::print(stderr, "E: {}\n", msg);
-    std::fflush(stderr);
-}
-
-void log_warning(std::string_view msg) {
-    std::lock_guard<std::mutex> lock(g_cout_mutex);
-    std::print(stderr, "W: {}\n", msg);
-    std::fflush(stderr);
-}
-
-std::string trim_str(std::string_view s) {
-    constexpr std::string_view kWhitespace = " \n\r\t<>";
-    auto start = s.find_first_not_of(kWhitespace);
-    if (start == std::string_view::npos) return {};
-    auto end = s.find_last_not_of(kWhitespace);
-    return std::string{s.substr(start, end - start + 1)};
-}
-
-std::string trim_copy(std::string_view s) {
+std::string trim(std::string_view s) {
     constexpr std::string_view kWhitespace = " \n\r\t";
     auto start = s.find_first_not_of(kWhitespace);
     if (start == std::string_view::npos) return {};
     auto end = s.find_last_not_of(kWhitespace);
-    return std::string{s.substr(start, end - start + 1)};
-}
-
-bool starts_with(std::string_view value, std::string_view prefix) {
-    return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
-}
-
-bool ends_with(std::string_view value, std::string_view suffix) {
-    return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
+    std::string r{s.substr(start, end - start + 1)};
+    WELD_CONTRACT(kWhitespace.find(r.front()) == std::string_view::npos
+                  && kWhitespace.find(r.back()) == std::string_view::npos);
+    return r;
 }
 
 std::string to_lower_copy(std::string_view s) {
@@ -429,8 +393,11 @@ std::string to_lower_copy(std::string_view s) {
     return r;
 }
 
-std::string hex_encode(std::span<const unsigned char> data)
-    post(r: !r.empty()) {
+std::span<const unsigned char> as_bytes(std::string_view s) {
+    return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
+}
+
+std::string hex_encode(std::span<const unsigned char> data) {
     static constexpr std::string_view kHex = "0123456789abcdef";
     std::string out;
     out.reserve(data.size() * 2);
@@ -438,269 +405,19 @@ std::string hex_encode(std::span<const unsigned char> data)
         out.push_back(kHex[(b >> 4) & 0xF]);
         out.push_back(kHex[b & 0xF]);
     }
+    WELD_CONTRACT(out.size() == data.size() * 2);
     return out;
 }
 
-std::vector<unsigned char> base64_decode_buf(std::string_view s) {
-    if (s.empty()) return {};
-    BIO* b64 = BIO_new(BIO_f_base64());
-    if (!b64) return {};
-    BIO* mem = BIO_new_mem_buf(s.data(), static_cast<int>(s.size()));
-    if (!mem) { BIO_free_all(b64); return {}; }
-    BIO_push(b64, mem);
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    std::vector<unsigned char> out(s.size());
-    int n = BIO_read(b64, out.data(), static_cast<int>(s.size()));
-    BIO_free_all(b64);
-    if (n <= 0) return {};
-    out.resize(static_cast<std::size_t>(n));
-    return out;
-}
-
-bool compute_blake2b512(std::span<const unsigned char> data, std::span<unsigned char, 64> out)
-    pre(!out.empty()) {
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) return false;
-    bool ok = false;
-    const EVP_MD* md = EVP_blake2b512();
-    if (!md) { EVP_MD_CTX_free(ctx); return false; }
-    if (EVP_DigestInit_ex(ctx, md, nullptr) == 1) {
-        if (EVP_DigestUpdate(ctx, data.data(), data.size()) == 1) {
-            unsigned int out_len = 0;
-            if (EVP_DigestFinal_ex(ctx, out.data(), &out_len) == 1 && out_len == 64) ok = true;
-        }
+std::string format_bytes(std::uint64_t bytes) {
+    if (bytes < 1024) return std::format("{} B", bytes);
+    if (bytes < 1024ULL * 1024) {
+        return std::format("{:.2f} KB", static_cast<double>(bytes) / 1024.0);
     }
-    EVP_MD_CTX_free(ctx);
-    return ok;
-}
-
-bool verify_ed25519(std::span<const unsigned char> msg,
-                    std::span<const unsigned char, 64> sig,
-                    std::span<const unsigned char, 32> pubkey)
-    pre(!msg.empty() || msg.data() != nullptr) pre(!sig.empty()) pre(!pubkey.empty()) {
-    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey.data(), 32);
-    if (!pkey) return false;
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) { EVP_PKEY_free(pkey); return false; }
-    bool ok = false;
-    if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-        int rc = EVP_DigestVerify(ctx, sig.data(), 64, msg.data(), msg.size());
-        if (rc == 1) ok = true;
+    if (bytes < 1024ULL * 1024 * 1024) {
+        return std::format("{:.2f} MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
     }
-    EVP_MD_CTX_free(ctx);
-    EVP_PKEY_free(pkey);
-    return ok;
-}
-
-struct MinisignPublicKey {
-    unsigned char key_id[8];
-    unsigned char pubkey[32];
-};
-
-struct MinisignSignature {
-    unsigned char sig_alg[2];
-    unsigned char key_id[8];
-    unsigned char sig[64];
-    std::string trusted_comment;
-    unsigned char global_sig[64];
-};
-
-bool parse_minisign_pub_blob(const std::vector<unsigned char>& blob, MinisignPublicKey& key)
-    pre(blob.size() == 0 || blob.data() != nullptr) {
-    if (blob.size() != 42) return false;
-    if (blob[0] != 'E' || blob[1] != 'd') return false;
-    std::memcpy(key.key_id, blob.data() + 2, 8);
-    std::memcpy(key.pubkey, blob.data() + 10, 32);
-    return true;
-}
-
-bool parse_minisign_sig_blob(const std::vector<unsigned char>& blob, MinisignSignature& sig)
-    pre(blob.size() == 0 || blob.data() != nullptr) {
-    if (blob.size() != 74) return false;
-    std::memcpy(sig.sig_alg, blob.data(), 2);
-    bool prehashed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'D');
-    bool raw_ed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'd');
-    if (!prehashed && !raw_ed) return false;
-    std::memcpy(sig.key_id, blob.data() + 2, 8);
-    std::memcpy(sig.sig, blob.data() + 10, 64);
-    return true;
-}
-
-bool parse_minisign_pub_file(const std::string& content, MinisignPublicKey& key) {
-    std::stringstream ss(content);
-    std::string line;
-    int line_num = 0;
-    while (std::getline(ss, line)) {
-        ++line_num;
-        if (line_num != 2) continue;
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        auto blob = base64_decode_buf(line);
-        return parse_minisign_pub_blob(blob, key);
-    }
-    return false;
-}
-
-bool parse_minisign_sig_file(const std::string& content, MinisignSignature& sig) {
-    std::stringstream ss(content);
-    std::string line;
-    std::vector<std::string> lines;
-    while (std::getline(ss, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        lines.push_back(line);
-    }
-    if (lines.size() < 4) return false;
-    auto sig_blob = base64_decode_buf(lines[1]);
-    if (!parse_minisign_sig_blob(sig_blob, sig)) return false;
-    static constexpr std::string_view kTrustedPrefix = "trusted comment: ";
-    if (!starts_with(lines[2], kTrustedPrefix)) return false;
-    sig.trusted_comment = lines[2].substr(kTrustedPrefix.size());
-    auto global_blob = base64_decode_buf(lines[3]);
-    if (global_blob.size() != 64) return false;
-    std::memcpy(sig.global_sig, global_blob.data(), 64);
-    return true;
-}
-
-bool verify_minisign_signature(const std::string& content, const MinisignSignature& sig,
-                               const MinisignPublicKey& key) {
-    if (std::memcmp(sig.key_id, key.key_id, 8) != 0) return false;
-    bool prehashed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'D');
-    bool raw_ed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'd');
-    if (!prehashed && !raw_ed) return false;
-
-    if (raw_ed) {
-        std::span<const unsigned char> msg{reinterpret_cast<const unsigned char*>(content.data()), content.size()};
-        std::span<const unsigned char, 64> sig_span{sig.sig, 64};
-        std::span<const unsigned char, 32> key_span{key.pubkey, 32};
-        if (!verify_ed25519(msg, sig_span, key_span)) {
-            return false;
-        }
-    } else {
-        unsigned char hash[64];
-        std::span<const unsigned char> data{reinterpret_cast<const unsigned char*>(content.data()), content.size()};
-        std::span<unsigned char, 64> hash_span{hash, 64};
-        if (!compute_blake2b512(data, hash_span)) {
-            return false;
-        }
-        std::span<const unsigned char, 64> sig_span{sig.sig, 64};
-        std::span<const unsigned char, 32> key_span{key.pubkey, 32};
-        std::span<const unsigned char> hash_msg{hash, 64};
-        if (!verify_ed25519(hash_msg, sig_span, key_span)) return false;
-    }
-
-    std::vector<unsigned char> signed_comment;
-    signed_comment.reserve(64 + sig.trusted_comment.size());
-    signed_comment.insert(signed_comment.end(), sig.sig, sig.sig + 64);
-    signed_comment.insert(signed_comment.end(),
-                          sig.trusted_comment.begin(),
-                          sig.trusted_comment.end());
-
-    std::span<const unsigned char> comment_msg{signed_comment.data(), signed_comment.size()};
-    std::span<const unsigned char, 64> gsig_span{sig.global_sig, 64};
-    std::span<const unsigned char, 32> key_span{key.pubkey, 32};
-    return verify_ed25519(comment_msg, gsig_span, key_span);
-}
-
-std::vector<MinisignPublicKey> load_trusted_minisign_keys() {
-    std::vector<MinisignPublicKey> keys;
-    DIR* dir = opendir(g_weld_trusted_keys_dir.c_str());
-    if (!dir) return keys;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name.size() < 5) continue;
-        if (!ends_with(name, ".pub")) continue;
-        std::string path = g_weld_trusted_keys_dir + "/" + name;
-        std::ifstream in(path);
-        if (!in) continue;
-        std::stringstream buf;
-        buf << in.rdbuf();
-        MinisignPublicKey key;
-        if (parse_minisign_pub_file(buf.str(), key)) keys.push_back(key);
-    }
-    closedir(dir);
-    return keys;
-}
-
-[[maybe_unused]]
-bool verify_repo_metadata_signature(const std::string& metadata, const std::string& sig_content,
-                                     std::string& trusted_comment_out, std::string& error_out) {
-    MinisignSignature sig;
-    if (!parse_minisign_sig_file(sig_content, sig)) {
-        error_out = "minisign signature is malformed";
-        return false;
-    }
-    std::vector<MinisignPublicKey> keys = load_trusted_minisign_keys();
-    if (keys.empty()) {
-        error_out = std::format("no trusted minisign keys installed in {}", g_weld_trusted_keys_dir);
-        return false;
-    }
-    bool key_seen = false;
-    for (const auto& key : keys) {
-        if (std::memcmp(key.key_id, sig.key_id, 8) != 0) continue;
-        key_seen = true;
-        if (verify_minisign_signature(metadata, sig, key)) {
-            trusted_comment_out = sig.trusted_comment;
-            return true;
-        }
-    }
-    if (!key_seen) {
-        error_out = std::format("no trusted key matches the signature key id {}", hex_encode(std::span<const unsigned char>{sig.key_id, 8}));
-    } else {
-        error_out = "signature verification failed for matched trusted key";
-    }
-    return false;
-}
-
-bool is_safe_argument(std::string_view arg) {
-    if (arg.empty()) return false;
-    if (arg.find('\0') != std::string_view::npos) return false;
-    if (arg.find('\n') != std::string_view::npos) return false;
-    if (arg.find('\r') != std::string_view::npos) return false;
-    return true;
-}
-
-bool is_safe_device_path(std::string_view path) {
-    if (path.empty()) return false;
-    if (path[0] != '/') return false;
-    if (path.find("..") != std::string_view::npos) return false;
-    if (path.find('\0') != std::string_view::npos) return false;
-    if (path.find('\n') != std::string_view::npos) return false;
-    if (path.size() > 4096) return false;
-    if (path.find(' ') != std::string_view::npos) return false;
-    if (path.find(';') != std::string_view::npos) return false;
-    if (path.find('|') != std::string_view::npos) return false;
-    if (path.find('&') != std::string_view::npos) return false;
-    if (path.find('$') != std::string_view::npos) return false;
-    if (path.find('`') != std::string_view::npos) return false;
-    if (path.find("()") != std::string_view::npos) return false;
-    if (path.find('<') != std::string_view::npos) return false;
-    if (path.find('>') != std::string_view::npos) return false;
-    if (path.find('\\') != std::string_view::npos) return false;
-    return true;
-}
-
-[[maybe_unused]]
-std::string sanitize_filename(std::string_view raw) {
-    auto pos_slash = raw.find_last_of('/');
-    std::string base = (pos_slash == std::string_view::npos)
-        ? std::string{raw}
-        : std::string{raw.substr(pos_slash + 1)};
-    auto start = base.find_first_not_of(" \n\r\t");
-    std::string cleaned = (start == std::string::npos)
-        ? std::string{}
-        : base.substr(start, base.find_last_not_of(" \n\r\t") - start + 1);
-    std::string safe;
-    safe.reserve(cleaned.size());
-    for (char c : cleaned) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-') {
-            safe.push_back(c);
-        }
-    }
-    while (!safe.empty() && (safe.front() == '-' || safe.front() == '.')) {
-        safe.erase(safe.begin());
-    }
-    if (safe == "." || safe == "..") safe = "safe_file";
-    return safe.empty() ? "safe_file" : safe;
+    return std::format("{:.2f} GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
 }
 
 std::string strip_inline_comment(std::string_view line) {
@@ -755,18 +472,332 @@ std::string path_basename(std::string_view path) {
     return std::string{path.substr(pos + 1)};
 }
 
-std::string format_bytes(std::uint64_t bytes) post(r: !r.empty()) {
-    if (bytes < 1024) return std::format("{} B", bytes);
-    if (bytes < 1024ULL * 1024) {
-        return std::format("{:.2f} KB", static_cast<double>(bytes) / 1024.0);
+bool is_valid_package_name(std::string_view name) {
+    if (name.empty() || name.size() > 256) return false;
+    if (name[0] == '-' || name[0] == '=' || name[0] == '/' || name[0] == ':') return false;
+    if (name[0] == '.' && name.size() > 1 && name[1] == '.') return false;
+    for (char c : name) {
+        if (c == '=' || c == '/' || c == ':' || c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            return false;
+        }
     }
-    if (bytes < 1024ULL * 1024 * 1024) {
-        return std::format("{:.2f} MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
-    }
-    return std::format("{:.2f} GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+    if (name.find("..") != std::string_view::npos) return false;
+    return true;
 }
 
-bool wait_for_child(pid_t pid, int& status) pre(pid > 0) {
+bool is_safe_argument(std::string_view arg) {
+    if (arg.empty()) return false;
+    if (arg.find('\0') != std::string_view::npos) return false;
+    if (arg.find('\n') != std::string_view::npos) return false;
+    if (arg.find('\r') != std::string_view::npos) return false;
+    return true;
+}
+
+bool is_safe_device_path(std::string_view path) {
+    if (path.empty()) return false;
+    if (path[0] != '/') return false;
+    if (path.find("..") != std::string_view::npos) return false;
+    if (path.find('\0') != std::string_view::npos) return false;
+    if (path.find('\n') != std::string_view::npos) return false;
+    if (path.size() > 4096) return false;
+    if (path.find(' ') != std::string_view::npos) return false;
+    if (path.find(';') != std::string_view::npos) return false;
+    if (path.find('|') != std::string_view::npos) return false;
+    if (path.find('&') != std::string_view::npos) return false;
+    if (path.find('$') != std::string_view::npos) return false;
+    if (path.find('`') != std::string_view::npos) return false;
+    if (path.find("()") != std::string_view::npos) return false;
+    if (path.find('<') != std::string_view::npos) return false;
+    if (path.find('>') != std::string_view::npos) return false;
+    if (path.find('\\') != std::string_view::npos) return false;
+    return true;
+}
+
+[[maybe_unused]]
+std::string sanitize_filename(std::string_view raw) {
+    auto pos_slash = raw.find_last_of('/');
+    std::string base = (pos_slash == std::string_view::npos)
+        ? std::string{raw}
+        : std::string{raw.substr(pos_slash + 1)};
+    auto start = base.find_first_not_of(" \n\r\t");
+    std::string cleaned = (start == std::string::npos)
+        ? std::string{}
+        : base.substr(start, base.find_last_not_of(" \n\r\t") - start + 1);
+    std::string safe;
+    safe.reserve(cleaned.size());
+    for (char c : cleaned) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-') {
+            safe.push_back(c);
+        }
+    }
+    while (!safe.empty() && (safe.front() == '-' || safe.front() == '.')) {
+        safe.erase(safe.begin());
+    }
+    if (safe == "." || safe == "..") safe = "safe_file";
+    return safe.empty() ? "safe_file" : safe;
+}
+
+void sanitize_child_environment() {
+    static constexpr std::array<const char*, 14> kDangerousEnv = {
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_BIND_NOW",
+        "LD_PROFILE", "LD_SHOW_AUXV", "LD_TRACE_LOADED_OBJECTS",
+        "LD_VERBOSE", "LD_WARN", "LDPATH", "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH", "PYTHONPATH", "PERL5OPT"
+    };
+    for (const char* var : kDangerousEnv) {
+        unsetenv(var);
+    }
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("HOME", "/root", 1);
+    setenv("LC_ALL", "C", 1);
+    setenv("LANG", "C", 1);
+}
+
+int open_no_follow(const std::string& path, int flags, mode_t mode = 0) {
+    auto parent_pos = path.find_last_of('/');
+    std::string parent = (parent_pos == std::string::npos) ? "." : path.substr(0, parent_pos);
+    std::string base = (parent_pos == std::string::npos) ? path : path.substr(parent_pos + 1);
+    FdGuard parent_fd{open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+    if (!parent_fd) return -1;
+    return openat(parent_fd.get(), base.c_str(), flags | O_NOFOLLOW | O_CLOEXEC, mode);
+}
+
+std::vector<unsigned char> base64_decode_buf(std::string_view s) {
+    constexpr std::size_t kMaxBase64Input = 65536;
+    if (s.empty() || s.size() > kMaxBase64Input) return {};
+    BioPtr b64{BIO_new(BIO_f_base64())};
+    if (!b64) return {};
+    BioPtr mem{BIO_new_mem_buf(s.data(), static_cast<int>(s.size()))};
+    if (!mem) return {};
+    BIO_push(b64.get(), mem.get());
+    mem.release();
+    BIO_set_flags(b64.get(), BIO_FLAGS_BASE64_NO_NL);
+    std::vector<unsigned char> out(s.size());
+    int n = BIO_read(b64.get(), out.data(), static_cast<int>(out.size()));
+    if (n <= 0) return {};
+    out.resize(static_cast<std::size_t>(n));
+    return out;
+}
+
+bool compute_blake2b512(std::span<const unsigned char> data, std::span<unsigned char, 64> out) {
+    EvpMdCtxPtr ctx{EVP_MD_CTX_new()};
+    if (!ctx) return false;
+    const EVP_MD* md = EVP_blake2b512();
+    if (md == nullptr) return false;
+    if (EVP_DigestInit_ex(ctx.get(), md, nullptr) != 1) return false;
+    if (EVP_DigestUpdate(ctx.get(), data.data(), data.size()) != 1) return false;
+    unsigned int out_len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), out.data(), &out_len) != 1 || out_len != 64) return false;
+    return true;
+}
+
+bool verify_ed25519(std::span<const unsigned char> msg,
+                    std::span<const unsigned char, 64> sig,
+                    std::span<const unsigned char, 32> pubkey) {
+    EvpPkeyPtr pkey{EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, pubkey.data(), 32)};
+    if (!pkey) return false;
+    EvpMdCtxPtr ctx{EVP_MD_CTX_new()};
+    if (!ctx) return false;
+    if (EVP_DigestVerifyInit(ctx.get(), nullptr, nullptr, nullptr, pkey.get()) != 1) return false;
+    return EVP_DigestVerify(ctx.get(), sig.data(), sig.size(), msg.data(), msg.size()) == 1;
+}
+
+struct MinisignPublicKey {
+    std::array<unsigned char, 8> key_id{};
+    std::array<unsigned char, 32> pubkey{};
+};
+
+struct MinisignSignature {
+    std::array<unsigned char, 2> sig_alg{};
+    std::array<unsigned char, 8> key_id{};
+    std::array<unsigned char, 64> sig{};
+    std::string trusted_comment;
+    std::array<unsigned char, 64> global_sig{};
+};
+
+bool parse_minisign_pub_blob(std::span<const unsigned char> blob, MinisignPublicKey& key) {
+    if (blob.size() != 42) return false;
+    if (blob[0] != 'E' || blob[1] != 'd') return false;
+    std::ranges::copy(blob.subspan(2, 8), key.key_id.begin());
+    std::ranges::copy(blob.subspan(10, 32), key.pubkey.begin());
+    return true;
+}
+
+bool parse_minisign_sig_blob(std::span<const unsigned char> blob, MinisignSignature& sig) {
+    if (blob.size() != 74) return false;
+    std::ranges::copy(blob.subspan(0, 2), sig.sig_alg.begin());
+    const bool prehashed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'D');
+    const bool raw_ed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'd');
+    if (!prehashed && !raw_ed) return false;
+    std::ranges::copy(blob.subspan(2, 8), sig.key_id.begin());
+    std::ranges::copy(blob.subspan(10, 64), sig.sig.begin());
+    return true;
+}
+
+bool parse_minisign_pub_file(const std::string& content, MinisignPublicKey& key) {
+    std::stringstream ss(content);
+    std::string line;
+    int line_num = 0;
+    while (std::getline(ss, line)) {
+        ++line_num;
+        if (line_num != 2) continue;
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        auto blob = base64_decode_buf(line);
+        return parse_minisign_pub_blob(blob, key);
+    }
+    return false;
+}
+
+bool parse_minisign_sig_file(const std::string& content, MinisignSignature& sig) {
+    std::stringstream ss(content);
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(ss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        lines.push_back(line);
+    }
+    if (lines.size() < 4) return false;
+    auto sig_blob = base64_decode_buf(lines[1]);
+    if (!parse_minisign_sig_blob(sig_blob, sig)) return false;
+    static constexpr std::string_view kTrustedPrefix = "trusted comment: ";
+    if (!lines[2].starts_with(kTrustedPrefix)) return false;
+    sig.trusted_comment = lines[2].substr(kTrustedPrefix.size());
+    auto global_blob = base64_decode_buf(lines[3]);
+    if (global_blob.size() != 64) return false;
+    std::ranges::copy(global_blob, sig.global_sig.begin());
+    return true;
+}
+
+bool verify_minisign_signature(const std::string& content, const MinisignSignature& sig,
+                               const MinisignPublicKey& key) {
+    if (sig.key_id != key.key_id) return false;
+    const bool prehashed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'D');
+    const bool raw_ed = (sig.sig_alg[0] == 'E' && sig.sig_alg[1] == 'd');
+    if (!prehashed && !raw_ed) return false;
+
+    if (raw_ed) {
+        if (!verify_ed25519(as_bytes(content),
+                            std::span<const unsigned char, 64>{sig.sig},
+                            std::span<const unsigned char, 32>{key.pubkey})) {
+            return false;
+        }
+    } else {
+        std::array<unsigned char, 64> hash{};
+        if (!compute_blake2b512(as_bytes(content), std::span<unsigned char, 64>{hash})) {
+            return false;
+        }
+        if (!verify_ed25519(std::span<const unsigned char, 64>{hash},
+                            std::span<const unsigned char, 64>{sig.sig},
+                            std::span<const unsigned char, 32>{key.pubkey})) {
+            return false;
+        }
+    }
+
+    std::vector<unsigned char> signed_comment;
+    signed_comment.reserve(sig.sig.size() + sig.trusted_comment.size());
+    signed_comment.insert(signed_comment.end(), sig.sig.begin(), sig.sig.end());
+    signed_comment.insert(signed_comment.end(),
+                          sig.trusted_comment.begin(),
+                          sig.trusted_comment.end());
+
+    return verify_ed25519(std::span<const unsigned char>{signed_comment},
+                          std::span<const unsigned char, 64>{sig.global_sig},
+                          std::span<const unsigned char, 32>{key.pubkey});
+}
+
+std::vector<MinisignPublicKey> load_trusted_minisign_keys() {
+    std::vector<MinisignPublicKey> keys;
+    DirPtr dir{opendir(g_weld_trusted_keys_dir.c_str())};
+    if (!dir) return keys;
+    for (struct dirent* entry = readdir(dir.get()); entry != nullptr;
+         entry = readdir(dir.get())) {
+        std::string_view name = entry->d_name;
+        if (name.size() < 5 || !name.ends_with(".pub")) continue;
+        std::string path = std::format("{}/{}", g_weld_trusted_keys_dir, name);
+        std::ifstream in(path);
+        if (!in) continue;
+        std::stringstream buf;
+        buf << in.rdbuf();
+        MinisignPublicKey key;
+        if (parse_minisign_pub_file(buf.str(), key)) keys.push_back(key);
+    }
+    return keys;
+}
+
+[[maybe_unused]]
+std::expected<std::string, std::string>
+verify_repo_metadata_signature(const std::string& metadata, const std::string& sig_content) {
+    MinisignSignature sig;
+    if (!parse_minisign_sig_file(sig_content, sig)) {
+        return std::unexpected(std::string{"minisign signature is malformed"});
+    }
+    std::vector<MinisignPublicKey> keys = load_trusted_minisign_keys();
+    if (keys.empty()) {
+        return std::unexpected(
+            std::format("no trusted minisign keys installed in {}", g_weld_trusted_keys_dir));
+    }
+    bool key_seen = false;
+    for (const auto& key : keys) {
+        if (key.key_id != sig.key_id) continue;
+        key_seen = true;
+        if (verify_minisign_signature(metadata, sig, key)) {
+            return sig.trusted_comment;
+        }
+    }
+    if (!key_seen) {
+        return std::unexpected(std::format(
+            "no trusted key matches the signature key id {}",
+            hex_encode(std::span<const unsigned char>{sig.key_id})));
+    }
+    return std::unexpected(std::string{"signature verification failed for matched trusted key"});
+}
+
+std::string calculate_sha256(const std::string& file_path) {
+    std::ifstream in(file_path, std::ios::binary);
+    if (!in) return "";
+    EvpMdCtxPtr ctx{EVP_MD_CTX_new()};
+    if (!ctx) return "";
+    if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) return "";
+    std::array<char, 65536> buf{};
+    while (in) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        std::streamsize got = in.gcount();
+        if (got > 0) {
+            if (EVP_DigestUpdate(ctx.get(), buf.data(), static_cast<std::size_t>(got)) != 1) {
+                return "";
+            }
+        }
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> hash{};
+    unsigned int hash_len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), hash.data(), &hash_len) != 1 || hash_len == 0) return "";
+    WELD_CONTRACT(hash_len == 32);
+    return hex_encode(std::span<const unsigned char>{hash.data(), hash_len});
+}
+
+void close_fds_above(int lowest_fd) {
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, static_cast<unsigned int>(lowest_fd),
+                static_cast<unsigned int>(-1), 0U) == 0) {
+        return;
+    }
+#endif
+    DirPtr dir{opendir("/proc/self/fd")};
+    if (dir) {
+        const int dir_fd = dirfd(dir.get());
+        for (struct dirent* entry = readdir(dir.get()); entry != nullptr;
+             entry = readdir(dir.get())) {
+            const int fd = std::atoi(entry->d_name);
+            if (fd >= lowest_fd && fd != dir_fd) close(fd);
+        }
+        return;
+    }
+    const long max_fd = sysconf(_SC_OPEN_MAX);
+    const long cap = (max_fd < 0 || max_fd > 65536) ? 65536 : max_fd;
+    for (long fd = lowest_fd; fd < cap; ++fd) close(static_cast<int>(fd));
+}
+
+bool wait_for_child(pid_t pid, int& status) {
     status = 0;
     while (true) {
         int rc = 0;
@@ -785,65 +816,62 @@ bool wait_for_child(pid_t pid, int& status) pre(pid > 0) {
     }
 }
 
-void exec_abs_argv(const std::vector<char*>& argv_ptrs)
-    pre(!argv_ptrs.empty()) pre(argv_ptrs[0] != nullptr) {
-    if (argv_ptrs.empty() || argv_ptrs[0] == nullptr) _exit(127);
-    const char* binary = argv_ptrs[0];
-    if (strchr(binary, '/')) {
-        execv(binary, const_cast<char* const*>(argv_ptrs.data()));
+struct ArgzBuffer {
+    std::vector<char> data;
+    std::vector<char*> argv;
+};
+
+ArgzBuffer make_argv(std::initializer_list<std::string_view> args) {
+    ArgzBuffer out;
+    std::size_t total = 0;
+    for (std::string_view a : args) total += a.size() + 1;
+    out.data.resize(total);
+    char* w = out.data.data();
+    out.argv.reserve(args.size() + 1);
+    for (std::string_view a : args) {
+        if (!a.empty()) std::memcpy(w, a.data(), a.size());
+        w[a.size()] = '\0';
+        out.argv.push_back(w);
+        w += a.size() + 1;
+    }
+    out.argv.push_back(nullptr);
+    WELD_CONTRACT(out.data.size() == total && out.argv.size() == args.size() + 1
+                  && out.argv.back() == nullptr);
+    return out;
+}
+
+[[noreturn]]
+void exec_abs_argv(const std::vector<char*>& argv_ptrs) {
+    if (argv_ptrs.empty() || argv_ptrs.front() == nullptr) _exit(127);
+    const char* binary = argv_ptrs.front();
+    if (strchr(binary, '/') != nullptr) {
+        execv(binary, argv_ptrs.data());
     } else {
-        static constexpr std::array<const char*, 4> kPaths = {
-            "/usr/bin", "/bin", "/usr/sbin", "/sbin"
-        };
-        char fullpath[4096];
-        for (const auto* p : kPaths) {
-            std::snprintf(fullpath, sizeof(fullpath), "%s/%s", p, binary);
-            execv(fullpath, const_cast<char* const*>(argv_ptrs.data()));
+        for (std::string_view dir : {"/usr/bin", "/bin", "/usr/sbin", "/sbin"}) {
+            std::string fullpath = std::format("{}/{}", dir, binary);
+            execv(fullpath.c_str(), argv_ptrs.data());
         }
     }
     _exit(127);
 }
 
-std::vector<char*> build_argv(const std::vector<std::string>& args) {
-    std::vector<char*> argv_ptrs;
-    argv_ptrs.reserve(args.size() + 1);
-    for (const auto& a : args) argv_ptrs.push_back(const_cast<char*>(a.c_str()));
-    argv_ptrs.push_back(nullptr);
-    return argv_ptrs;
-}
-
-int exec_argv(const std::vector<std::string>& args, int stdout_fd = -1, int stderr_fd = -1, int extra_fd = -1) {
-    if (args.empty()) return 1;
+int exec_argv(std::initializer_list<std::string_view> args, int stdout_fd = -1, int stderr_fd = -1) {
+    if (args.size() == 0) return 1;
+    const ArgzBuffer argv = make_argv(args);
     pid_t pid = fork();
     if (pid < 0) return 1;
     if (pid == 0) {
         int devnull_r = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        if (devnull_r >= 0) { dup2(devnull_r, STDIN_FILENO); close(devnull_r); }
+        if (devnull_r >= 0) {
+            dup2(devnull_r, STDIN_FILENO);
+            close(devnull_r);
+        }
         if (stdout_fd >= 0 && stdout_fd != STDOUT_FILENO) dup2(stdout_fd, STDOUT_FILENO);
         if (stderr_fd >= 0 && stderr_fd != STDERR_FILENO) dup2(stderr_fd, STDERR_FILENO);
-        if (extra_fd >= 0) {
-            if (extra_fd != 3) dup2(extra_fd, 3);
-            fcntl(3, F_SETFD, 0);
-        }
-        if (stdout_fd >= 0 && stdout_fd != STDOUT_FILENO && stdout_fd != STDERR_FILENO && stdout_fd != 3) close(stdout_fd);
-        if (stderr_fd >= 0 && stderr_fd != STDERR_FILENO && stderr_fd != STDOUT_FILENO && stderr_fd != 3 && stderr_fd != stdout_fd) close(stderr_fd);
-        if (extra_fd >= 0 && extra_fd != 3 && extra_fd != STDOUT_FILENO && extra_fd != STDERR_FILENO) close(extra_fd);
-        DIR* dir = opendir("/proc/self/fd");
-        if (dir) {
-            int dir_fd = dirfd(dir);
-            struct dirent* entry;
-            while ((entry = readdir(dir)) != nullptr) {
-                int fd = atoi(entry->d_name);
-                if (fd > 2 && fd != extra_fd && fd != dir_fd) close(fd);
-            }
-            closedir(dir);
-        } else {
-            long max_fd = sysconf(_SC_OPEN_MAX);
-            int cap = (max_fd < 0 || max_fd > 4096) ? 1024 : static_cast<int>(max_fd);
-            for (int fd = 4; fd < cap; ++fd) close(fd);
-        }
-        auto argv_ptrs = build_argv(args);
-        exec_abs_argv(argv_ptrs);
+        if (stdout_fd > STDERR_FILENO) close(stdout_fd);
+        if (stderr_fd > STDERR_FILENO && stderr_fd != stdout_fd) close(stderr_fd);
+        close_fds_above(3);
+        exec_abs_argv(argv.argv);
     }
     int status = 0;
     if (!wait_for_child(pid, status)) return 1;
@@ -851,64 +879,85 @@ int exec_argv(const std::vector<std::string>& args, int stdout_fd = -1, int stde
     return 1;
 }
 
-int exec_argv_devnull_out(const std::vector<std::string>& args) {
-    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    int rc = exec_argv(args, devnull, devnull);
-    if (devnull >= 0) close(devnull);
+int exec_argv_devnull_out(std::initializer_list<std::string_view> args) {
+    FdGuard devnull{open("/dev/null", O_WRONLY | O_CLOEXEC)};
+    int rc = exec_argv(args, devnull.get(), devnull.get());
     return rc;
 }
 
-int exec_argv_devnull_out_checked(const std::vector<std::string>& args) {
-    if (args.empty()) return 1;
+int exec_argv_devnull_out_checked(std::initializer_list<std::string_view> args) {
+    if (args.size() == 0) return 1;
     for (const auto& a : args) {
         if (!is_safe_argument(a)) return 1;
     }
     return exec_argv_devnull_out(args);
 }
 
-std::string exec_argv_capture(const std::vector<std::string>& args) {
-    if (args.empty()) return {};
+std::string exec_argv_capture(std::initializer_list<std::string_view> args) {
+    if (args.size() == 0) return {};
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0) return {};
+    const ArgzBuffer argv = make_argv(args);
     pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return {}; }
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return {};
+    }
     if (pid == 0) {
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-        int devnull_r = open("/dev/null", O_RDONLY);
-        if (devnull_r >= 0) { dup2(devnull_r, STDIN_FILENO); close(devnull_r); }
-        for (int fd = 3; fd < 1024; ++fd) close(fd);
-        auto argv_ptrs = build_argv(args);
-        exec_abs_argv(argv_ptrs);
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        int devnull_r = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (devnull_r >= 0) {
+            dup2(devnull_r, STDIN_FILENO);
+            close(devnull_r);
+        }
+        close_fds_above(3);
+        exec_abs_argv(argv.argv);
     }
     close(pipefd[1]);
+    FdGuard read_end{pipefd[0]};
     std::string result;
-    char buf[512];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) result.append(buf, static_cast<std::size_t>(n));
-    close(pipefd[0]);
+    std::array<char, 512> buf{};
+    for (;;) {
+        ssize_t n = read(read_end.get(), buf.data(), buf.size());
+        if (n > 0) {
+            result.append(buf.data(), static_cast<std::size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
     int status = 0;
     wait_for_child(pid, status);
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return result;
     return {};
 }
 
-bool read_text_file(const std::string& path, std::string& content) pre(!path.empty());
-bool write_text_file(const std::string& path, const std::string& content) pre(!path.empty());
-
-bool read_text_file(const std::string& path, std::string& content) pre(!path.empty()) {
-    std::ifstream in(path);
+bool read_text_file(const std::string& path, std::string& content,
+                    std::uint64_t max_size = 64ULL * 1024 * 1024) {
+    std::ifstream in(path, std::ios::binary);
     if (!in) return false;
-    std::stringstream buffer;
-    buffer << in.rdbuf();
-    content = buffer.str();
+    in.seekg(0, std::ios::end);
+    std::streamoff size = in.tellg();
+    if (size < 0 || static_cast<std::uint64_t>(size) > max_size) return false;
+    in.seekg(0, std::ios::beg);
+    content.clear();
+    if (size > 0) {
+        content.resize(static_cast<std::size_t>(size));
+        in.read(content.data(), size);
+        if (in.gcount() != size) return false;
+    }
     return true;
 }
 
-bool write_text_file(const std::string& path, const std::string& content) pre(!path.empty()) {
+bool write_text_file(const std::string& path, const std::string& content) {
     std::string dir = path;
     auto slash = dir.find_last_of('/');
     if (slash != std::string::npos) dir = dir.substr(0, slash);
@@ -916,22 +965,19 @@ bool write_text_file(const std::string& path, const std::string& content) pre(!p
     char tmpl[4096];
     int n = std::snprintf(tmpl, sizeof(tmpl), "%s/.weld_XXXXXX", dir.c_str());
     if (n < 0 || static_cast<std::size_t>(n) >= sizeof(tmpl)) return false;
-    sigset_t old_mask, block_mask;
+
+    sigset_t block_mask;
     sigemptyset(&block_mask);
     sigaddset(&block_mask, SIGINT);
     sigaddset(&block_mask, SIGTERM);
     sigaddset(&block_mask, SIGQUIT);
     sigaddset(&block_mask, SIGHUP);
-    pthread_sigmask(SIG_BLOCK, &block_mask, &old_mask);
-    int fd = mkstemp(tmpl);
-    if (fd < 0) {
-        pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
-        return false;
-    }
-    if (fchmod(fd, 0600) != 0) {
-        close(fd);
+    SignalBlockGuard sig_guard{block_mask};
+
+    FdGuard fd{mkstemp(tmpl)};
+    if (!fd) return false;
+    if (fchmod(fd.get(), 0600) != 0) {
         unlink(tmpl);
-        pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
         return false;
     }
     bool write_ok = true;
@@ -939,7 +985,7 @@ bool write_text_file(const std::string& path, const std::string& content) pre(!p
         const char* data = content.data();
         std::size_t remaining = content.size();
         while (remaining > 0) {
-            ssize_t written = write(fd, data, remaining);
+            ssize_t written = write(fd.get(), data, remaining);
             if (written < 0) {
                 if (errno == EINTR) continue;
                 write_ok = false;
@@ -949,27 +995,28 @@ bool write_text_file(const std::string& path, const std::string& content) pre(!p
             remaining -= static_cast<std::size_t>(written);
         }
     }
-    if (fsync(fd) != 0) write_ok = false;
-    if (close(fd) != 0) write_ok = false;
+    if (write_ok && fsync(fd.get()) != 0) write_ok = false;
+    if (close(fd.release()) != 0) write_ok = false;
     if (!write_ok) {
         unlink(tmpl);
-        pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
         return false;
     }
-    bool renamed = (rename(tmpl, path.c_str()) == 0);
-    if (!renamed) unlink(tmpl);
-    pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
-    return renamed;
+    if (rename(tmpl, path.c_str()) != 0) {
+        unlink(tmpl);
+        return false;
+    }
+    return true;
 }
 
 class ChrootSeccompManager {
 public:
-    static bool apply_filter(std::string& err_out) {
+    [[nodiscard]] static std::expected<void, std::string> apply_filter() {
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-            err_out = std::format("failed to set PR_SET_NO_NEW_PRIVS: {}", std::strerror(errno));
-            return false;
+            return std::unexpected(std::format("failed to set PR_SET_NO_NEW_PRIVS: {}",
+                                               std::strerror(errno)));
         }
         std::vector<sock_filter> filter;
+        filter.reserve(512);
         filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
             static_cast<uint32_t>(offsetof(struct seccomp_data, arch))));
 #if SECCOMP_TARGET_ARCH != 0
@@ -1392,18 +1439,19 @@ public:
 
         filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)));
 
+        if (filter.size() > BPF_MAXINSNS) {
+            return std::unexpected(std::string{"seccomp filter exceeds the kernel instruction limit"});
+        }
         struct sock_fprog prog;
         prog.len = static_cast<unsigned short>(filter.size());
         prog.filter = filter.data();
         if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
-            err_out = std::format("failed to load SECCOMP filter: {}", std::strerror(errno));
-            return false;
+            return std::unexpected(std::format("failed to load SECCOMP filter: {}",
+                                               std::strerror(errno)));
         }
-        return true;
+        return {};
     }
 };
-
-} // namespace (anonymous)
 
 struct ConfigBackup {
     std::string os_release_orig;
@@ -1500,10 +1548,11 @@ enum class PrecheckResult { Proceed, NoChanges, Failed };
 
 void perform_install_transaction(const std::vector<std::string>& pkgs, bool apply_host, bool is_upgrade = false);
 bool run_libapt_transaction(const std::string& action, const std::vector<std::string>& targets,
-                             int status_fd, bool quiet);
+                            int status_fd, bool quiet);
 PrecheckResult precheck_transaction(const std::string& action, const std::vector<std::string>& pkgs, bool quiet);
-std::string format_bytes_ext(std::uint64_t bytes);
 std::vector<WeldRepoMetadata> load_cached_weld_metadata();
+void release_system_locks();
+bool check_system_locks(bool quiet = false);
 
 bool nf_tree_available() {
     return access(g_nf_tree_bin.c_str(), X_OK) == 0;
@@ -1563,38 +1612,54 @@ void show_help() {
     std::print("  {}-v, --version{}             Show the Weld version\n", kDim, kReset);
 }
 
-std::string get_root_device();
-std::string get_root_fstype();
-std::string get_vg_name(const std::string& lv_path);
-bool is_lv_thin(const std::string& lv_path);
-double get_vg_free_gb(const std::string& vg_name);
-long do_pivot_root(const char* new_root, const char* put_old)
-    pre(new_root != nullptr) pre(put_old != nullptr);
-
-void bind_safe_dev_node(const std::string& host_path, const std::string& chroot_path, mode_t mode) {
-    struct stat host_st{};
-    int host_fd = open(host_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (host_fd < 0) return;
-    if (fstat(host_fd, &host_st) != 0) { close(host_fd); return; }
-    close(host_fd);
-
-    int dst_fd = open_no_follow(chroot_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
-    if (dst_fd < 0) {
-        if (errno == EEXIST) {
-            dst_fd = open_no_follow(chroot_path, O_WRONLY | O_NOFOLLOW);
-            if (dst_fd < 0) return;
-            struct stat dst_st{};
-            if (fstat(dst_fd, &dst_st) != 0 || !S_ISCHR(dst_st.st_mode)) {
-                close(dst_fd);
-                return;
-            }
-        } else {
-            return;
-        }
+std::string get_root_device() {
+    std::string out = exec_argv_capture({"findmnt", "-n", "-o", "SOURCE", "/"});
+    out = trim(out);
+    auto bracket = out.find('[');
+    if (bracket != std::string::npos) out = out.substr(0, bracket);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
+        out.pop_back();
     }
-    (void)mode;
-    close(dst_fd);
+    if (out.empty()) return "";
+    if (!is_safe_device_path(out)) return "";
+    if (!out.starts_with("/dev/")) return "";
+    return out;
+}
 
+std::string get_root_fstype() {
+    std::string out = exec_argv_capture({"findmnt", "-n", "-o", "FSTYPE", "/"});
+    return trim(out);
+}
+
+std::string get_vg_name(const std::string& lv_path) {
+    std::string out = exec_argv_capture({"lvs", "--noheadings", "-o", "vg_name", lv_path});
+    return trim(out);
+}
+
+bool is_lv_thin(const std::string& lv_path) {
+    std::string out = exec_argv_capture({"lvs", "--noheadings", "-o", "segtype", lv_path});
+    out = trim(out);
+    return out.find("thin") != std::string::npos;
+}
+
+double get_vg_free_gb(const std::string& vg_name) {
+    std::string out = exec_argv_capture({"vgs", "--noheadings", "-o", "vg_free", "--units", "g", vg_name});
+    out = trim(out);
+    auto g = out.find_first_of("gG");
+    if (g != std::string::npos) out = out.substr(0, g);
+    try {
+        return std::stod(out);
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+void bind_safe_dev_node(const std::string& host_path, const std::string& chroot_path) {
+    struct stat host_st{};
+    if (stat(host_path.c_str(), &host_st) != 0 || !S_ISCHR(host_st.st_mode)) return;
+    if (access(chroot_path.c_str(), F_OK) != 0) {
+        FdGuard fd{open_no_follow(chroot_path, O_WRONLY | O_CREAT, 0666)};
+    }
     exec_argv_devnull_out({"mount", "--bind", host_path, chroot_path});
 }
 
@@ -1603,21 +1668,24 @@ void mount_fs() {
     fs::create_directories(g_tree_root + "/dev", ec);
     fs::create_directories(g_tree_root + "/dev/pts", ec);
 
-    exec_argv_devnull_out({"mount", "-t", "devtmpfs", "-o", "nosuid,noexec,mode=755", "devtmpfs", g_tree_root + "/dev"});
-    bind_safe_dev_node("/dev/null",   g_tree_root + "/dev/null",   S_IFCHR | 0666);
-    bind_safe_dev_node("/dev/zero",   g_tree_root + "/dev/zero",   S_IFCHR | 0666);
-    bind_safe_dev_node("/dev/random", g_tree_root + "/dev/random", S_IFCHR | 0666);
-    bind_safe_dev_node("/dev/urandom", g_tree_root + "/dev/urandom", S_IFCHR | 0666);
-    bind_safe_dev_node("/dev/full",   g_tree_root + "/dev/full",   S_IFCHR | 0666);
-    bind_safe_dev_node("/dev/tty",    g_tree_root + "/dev/tty",    S_IFCHR | 0666);
+    exec_argv_devnull_out({"mount", "-t", "devtmpfs", "-o", "nosuid,noexec,mode=755",
+                           "devtmpfs", g_tree_root + "/dev"});
+    bind_safe_dev_node("/dev/null",    g_tree_root + "/dev/null");
+    bind_safe_dev_node("/dev/zero",    g_tree_root + "/dev/zero");
+    bind_safe_dev_node("/dev/random",  g_tree_root + "/dev/random");
+    bind_safe_dev_node("/dev/urandom", g_tree_root + "/dev/urandom");
+    bind_safe_dev_node("/dev/full",    g_tree_root + "/dev/full");
+    bind_safe_dev_node("/dev/tty",     g_tree_root + "/dev/tty");
 
     exec_argv_devnull_out({"mount", "-t", "devpts", "-o", "nosuid,noexec,mode=620,ptmxmode=666",
-                            "devpts", g_tree_root + "/dev/pts"});
+                           "devpts", g_tree_root + "/dev/pts"});
     exec_argv_devnull_out({"mount", "-t", "tmpfs", "-o", "nosuid,noexec,mode=755,size=512M",
-                            "tmpfs", g_tree_root + "/dev/shm"});
+                           "tmpfs", g_tree_root + "/dev/shm"});
 
     if (fs::exists("/dev/ptmx", ec)) {
-        if (!fs::exists(g_tree_root + "/dev/ptmx", ec)) mknod((g_tree_root + "/dev/ptmx").c_str(), S_IFCHR | 0666, 0);
+        if (!fs::exists(g_tree_root + "/dev/ptmx", ec)) {
+            mknod((g_tree_root + "/dev/ptmx").c_str(), S_IFCHR | 0666, 0);
+        }
         exec_argv_devnull_out({"mount", "--bind", "/dev/ptmx", g_tree_root + "/dev/ptmx"});
     }
 
@@ -1627,9 +1695,9 @@ void mount_fs() {
     exec_argv_devnull_out({"mount", "-o", "remount,ro,nosuid,nodev,noexec", g_tree_root + "/sys"});
 
     exec_argv_devnull_out({"mount", "-t", "tmpfs", "tmpfs", g_tree_root + "/tmp",
-                            "-o", "mode=1777,nosuid,nodev,noexec,size=2G"});
+                           "-o", "mode=1777,nosuid,nodev,noexec,size=2G"});
     exec_argv_devnull_out({"mount", "-t", "tmpfs", "tmpfs", g_tree_root + "/run",
-                            "-o", "mode=755,nosuid,nodev,noexec,size=512M"});
+                           "-o", "mode=755,nosuid,nodev,noexec,size=512M"});
 
     std::string resolv_target = g_tree_root + "/etc/resolv.conf";
     if (!fs::exists("/etc/resolv.conf")) return;
@@ -1647,45 +1715,11 @@ void remove_sandbox_snapshot(const std::string& snap_dev) {
     if (snap_dev.empty() || !is_safe_device_path(snap_dev)) return;
     if (access(snap_dev.c_str(), F_OK) != 0) return;
     exec_argv_devnull_out_checked({"udevadm", "settle"});
-    if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) != 0)
-        log_warning(std::format("could not remove sandbox snapshot {}. remove it manually with: lvremove -f {}", snap_dev, snap_dev));
-}
-
-std::string get_root_device() {
-    std::string out = exec_argv_capture({"findmnt", "-n", "-o", "SOURCE", "/"});
-    out = trim_str(out);
-    auto bracket = out.find('[');
-    if (bracket != std::string::npos) out = out.substr(0, bracket);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
-        out.pop_back();
-    if (out.empty()) return "";
-    if (!is_safe_device_path(out)) return "";
-    if (!starts_with(out, "/dev/")) return "";
-    return out;
-}
-
-std::string get_root_fstype() {
-    std::string out = exec_argv_capture({"findmnt", "-n", "-o", "FSTYPE", "/"});
-    return trim_str(out);
-}
-
-std::string get_vg_name(const std::string& lv_path) {
-    std::string out = exec_argv_capture({"lvs", "--noheadings", "-o", "vg_name", lv_path});
-    return trim_str(out);
-}
-
-bool is_lv_thin(const std::string& lv_path) {
-    std::string out = exec_argv_capture({"lvs", "--noheadings", "-o", "segtype", lv_path});
-    out = trim_str(out);
-    return out.find("thin") != std::string::npos;
-}
-
-double get_vg_free_gb(const std::string& vg_name) {
-    std::string out = exec_argv_capture({"vgs", "--noheadings", "-o", "vg_free", "--units", "g", vg_name});
-    out = trim_str(out);
-    auto g = out.find_first_of("gG");
-    if (g != std::string::npos) out = out.substr(0, g);
-    try { return std::stod(out); } catch (...) { return 0.0; }
+    if (exec_argv_devnull_out_checked({"lvremove", "-f", snap_dev}) != 0) {
+        log_warning(std::format(
+            "could not remove sandbox snapshot {}. remove it manually with: lvremove -f {}",
+            snap_dev, snap_dev));
+    }
 }
 
 void restrict_capabilities() {
@@ -1702,7 +1736,7 @@ void restrict_capabilities() {
     hdr.version = _LINUX_CAPABILITY_VERSION_3;
     hdr.pid = 0;
     weld_cap_data data[2] = {};
-    uint32_t keep_mask =
+    const uint32_t keep_mask =
         (1u << CAP_CHOWN) | (1u << CAP_DAC_OVERRIDE) | (1u << CAP_FOWNER) |
         (1u << CAP_FSETID) | (1u << CAP_KILL) | (1u << CAP_SETGID) |
         (1u << CAP_SETUID) | (1u << CAP_SETPCAP) | (1u << CAP_NET_BIND_SERVICE) |
@@ -1714,17 +1748,17 @@ void restrict_capabilities() {
     syscall(__NR_capset, &hdr, data);
 }
 
-long do_pivot_root(const char* new_root, const char* put_old)
-    pre(new_root != nullptr) pre(put_old != nullptr) {
+long do_pivot_root(const char* new_root, const char* put_old) {
+    if (new_root == nullptr || put_old == nullptr) return -1;
     return syscall(__NR_pivot_root, new_root, put_old);
 }
 
-bool check_system_memory(std::size_t min_mb) pre(min_mb > 0) {
+bool check_system_memory(std::size_t min_mb) {
     std::ifstream f("/proc/meminfo");
     if (!f) return true;
     std::string line;
     while (std::getline(f, line)) {
-        if (!starts_with(line, "MemAvailable:")) continue;
+        if (!line.starts_with("MemAvailable:")) continue;
         std::istringstream iss(line.substr(13));
         unsigned long kb = 0;
         iss >> kb;
@@ -1755,8 +1789,7 @@ void apply_strict_resource_limits() {
     setrlimit(RLIMIT_CORE, &rl);
 }
 
-bool create_snapshot(const std::string& name)
-    pre(!name.empty()) pre(name.find('/') == std::string::npos) {
+bool create_snapshot(const std::string& name) {
     if (name.empty() || name.find('/') != std::string::npos) return false;
     if (nf_tree_available()) {
         if (exec_argv_devnull_out_checked({g_nf_tree_bin, "create", name}) == 0) return true;
@@ -1773,15 +1806,20 @@ bool create_snapshot(const std::string& name)
     return false;
 }
 
-bool manage_sandbox(const std::string& action)
-    pre(action == "create" || action == "delete") {
+bool manage_sandbox(std::string_view action) {
+    if (action != "create" && action != "delete") return false;
+
     std::string root_dev = get_root_device();
     std::string vg_name = get_vg_name(root_dev);
     g_cached_root_dev = root_dev;
     g_cached_vg_name = vg_name;
+
     constexpr std::string_view kSnapLvName = "weld_sandbox_snap";
-    const std::string& snap_lv_name = g_cached_snap_lv_name = std::string{kSnapLvName};
-    const std::string& snap_dev = g_cached_snap_dev = "/dev/" + vg_name + "/" + snap_lv_name;
+    const std::string snap_lv_name{kSnapLvName};
+    std::string snap_dev = vg_name.empty()
+        ? std::string{}
+        : std::format("/dev/{}/{}", vg_name, snap_lv_name);
+    g_cached_snap_dev = snap_dev;
 
     if (action == "create") {
         umount_fs();
@@ -1793,7 +1831,7 @@ bool manage_sandbox(const std::string& action)
             return false;
         }
 
-        bool thin = is_lv_thin(root_dev);
+        const bool thin = is_lv_thin(root_dev);
         int rc;
         if (thin) {
             rc = exec_argv_devnull_out_checked({"lvcreate", "-s", "-k", "n", "--name", snap_lv_name, root_dev});
@@ -1802,7 +1840,8 @@ bool manage_sandbox(const std::string& action)
             log_warning("falling back to thick snapshot. free VG space will be consumed.");
             double free_gb = get_vg_free_gb(vg_name);
             if (free_gb < 1.0) {
-                log_error(std::format("insufficient free space in volume group: 1 GB required, {:.2f} GB available.", free_gb));
+                log_error(std::format(
+                    "insufficient free space in volume group: 1 GB required, {:.2f} GB available.", free_gb));
                 return false;
             }
             std::string snap_size = "1G";
@@ -1822,7 +1861,10 @@ bool manage_sandbox(const std::string& action)
         struct stat dev_st{};
         bool dev_ready = false;
         for (int attempt = 0; attempt < 50; ++attempt) {
-            if (stat(snap_dev.c_str(), &dev_st) == 0 && S_ISBLK(dev_st.st_mode)) { dev_ready = true; break; }
+            if (stat(snap_dev.c_str(), &dev_st) == 0 && S_ISBLK(dev_st.st_mode)) {
+                dev_ready = true;
+                break;
+            }
             usleep(100000);
         }
         if (!dev_ready) {
@@ -1832,7 +1874,7 @@ bool manage_sandbox(const std::string& action)
         }
         exec_argv_devnull_out_checked({"mkdir", "-p", g_tree_root});
         exec_argv_devnull_out_checked({"udevadm", "settle"});
-        std::string fstype = trim_str(exec_argv_capture({"blkid", "-s", "TYPE", "-o", "value", snap_dev}));
+        std::string fstype = trim(exec_argv_capture({"blkid", "-s", "TYPE", "-o", "value", snap_dev}));
         if (fstype.empty()) fstype = get_root_fstype();
 
         int mount_rc;
@@ -1841,9 +1883,7 @@ bool manage_sandbox(const std::string& action)
         } else if (fstype == "ext4" || fstype == "ext3" || fstype == "ext2") {
             mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, g_tree_root});
             if (mount_rc != 0 && thin) {
-                for (int i = 0; i < 20; ++i) {
-                    if (exec_argv_devnull_out_checked({"umount", "-l", g_tree_root}) != 0) break;
-                }
+                exec_argv_devnull_out_checked({"umount", "-l", g_tree_root});
                 exec_argv_devnull_out_checked({"udevadm", "settle"});
                 usleep(200000);
                 mount_rc = exec_argv_devnull_out_checked({"mount", "-t", fstype, snap_dev, g_tree_root});
@@ -1868,13 +1908,12 @@ bool manage_sandbox(const std::string& action)
         exec_argv_devnull_out_checked({"chmod", "1777", g_tree_root + "/tmp"});
         g_sandbox_active.store(true);
         return true;
-    } else if (action == "delete") {
-        umount_fs();
-        remove_sandbox_snapshot(snap_dev);
-        g_sandbox_active.store(false);
-        return true;
     }
-    return false;
+
+    umount_fs();
+    remove_sandbox_snapshot(snap_dev);
+    g_sandbox_active.store(false);
+    return true;
 }
 
 struct DpkgLockHolder {
@@ -1885,21 +1924,21 @@ struct DpkgLockHolder {
 
 DpkgLockHolder find_dpkg_db_lock_holder() {
     DpkgLockHolder holder;
-    int fd = open("/var/lib/dpkg/lock", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return holder;
+    FdGuard fd{open("/var/lib/dpkg/lock", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    if (!fd) return holder;
     struct flock fl{};
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
     fl.l_len = 0;
-    if (fcntl(fd, F_GETLK, &fl) == 0 && fl.l_type != F_UNLCK) {
+    if (fcntl(fd.get(), F_GETLK, &fl) == 0 && fl.l_type != F_UNLCK) {
         holder.busy = true;
         holder.pid = fl.l_pid;
         std::string comm;
-        if (holder.pid > 0 && read_text_file(std::format("/proc/{}/comm", holder.pid), comm))
-            holder.name = trim_copy(comm);
+        if (holder.pid > 0 && read_text_file(std::format("/proc/{}/comm", holder.pid), comm)) {
+            holder.name = trim(comm);
+        }
     }
-    close(fd);
     return holder;
 }
 
@@ -1913,21 +1952,18 @@ bool report_dpkg_db_lock_busy() {
     return true;
 }
 
-void cleanup_sandbox_on_exit();
-void release_system_locks();
-bool check_system_locks(bool quiet);
-
 void cleanup_sandbox_on_exit() {
-    std::call_once(g_cleanup_once, []() {
+    std::call_once(g_cleanup_once, [] {
         if (g_sandbox_active.exchange(false)) {
             umount_fs();
-            std::string vg_name = !g_cached_vg_name.empty() ? g_cached_vg_name : get_vg_name(get_root_device());
+            std::string vg_name = !g_cached_vg_name.empty()
+                ? g_cached_vg_name
+                : get_vg_name(get_root_device());
             std::string snap_dev = g_cached_snap_dev;
             if (snap_dev.empty() && !vg_name.empty()) {
                 snap_dev = "/dev/" + vg_name + "/weld_sandbox_snap";
             }
             remove_sandbox_snapshot(snap_dev);
-            g_cached_snap_lv_name.clear();
             g_cached_snap_dev.clear();
         }
         g_config_backup.restore_orig();
@@ -1939,20 +1975,21 @@ namespace {
 
 void write_signal_msg(int sig) {
     static constexpr std::string_view kPrefix = "E: terminating on signal ";
-    char buf[16];
+    char buf[64];
     std::size_t pos = 0;
-    if (pos + kPrefix.size() <= sizeof(buf)) {
-        std::memcpy(buf + pos, kPrefix.data(), kPrefix.size());
-        pos += kPrefix.size();
+    if (kPrefix.size() <= sizeof(buf)) {
+        std::memcpy(buf, kPrefix.data(), kPrefix.size());
+        pos = kPrefix.size();
     }
-    char digits[16];
+    if (sig < 0) sig = 0;
+    char digits[8];
     int len = 0;
     int s = sig;
-    if (s == 0) { digits[len++] = '0'; }
-    else { while (s > 0 && len < 16) { digits[len++] = static_cast<char>('0' + (s % 10)); s /= 10; } }
-    for (int i = len - 1; i >= 0 && pos < sizeof(buf); --i) {
-        buf[pos++] = digits[i];
-    }
+    do {
+        digits[len++] = static_cast<char>('0' + (s % 10));
+        s /= 10;
+    } while (s > 0 && len < 7);
+    while (len > 0 && pos < sizeof(buf)) buf[pos++] = digits[--len];
     if (pos < sizeof(buf)) buf[pos++] = '\n';
     ssize_t written = write(STDERR_FILENO, buf, pos);
     (void)written;
@@ -1984,15 +2021,14 @@ void setup_safety_handlers() {
 }
 
 std::string get_latest_snapshot(const std::string& prefix) {
-    DIR* dir = opendir(g_auto_snap_dir.c_str());
+    DirPtr dir{opendir(g_auto_snap_dir.c_str())};
     if (!dir) return {};
-    struct dirent* entry;
     std::vector<std::string> matches;
-    while ((entry = readdir(dir)) != nullptr) {
+    for (struct dirent* entry = readdir(dir.get()); entry != nullptr;
+         entry = readdir(dir.get())) {
         std::string name = entry->d_name;
-        if (starts_with(name, prefix)) matches.push_back(name);
+        if (name.starts_with(prefix)) matches.push_back(std::move(name));
     }
-    closedir(dir);
     if (matches.empty()) return {};
     std::ranges::sort(matches);
     return matches.back();
@@ -2007,10 +2043,6 @@ void do_rollback(const std::string& prefix) {
     }
 }
 
-std::string format_bytes_ext(std::uint64_t bytes) {
-    return format_bytes(bytes);
-}
-
 std::string render_sync_progress(int percentage, const std::string& label) {
     if (percentage < 0) percentage = 0;
     if (percentage > 100) percentage = 100;
@@ -2020,29 +2052,28 @@ std::string render_sync_progress(int percentage, const std::string& label) {
     while (pct.size() < 4) pct = " " + pct;
     int bar_width = total_width - static_cast<int>(prefix.size()) - static_cast<int>(pct.size()) - 1;
     if (bar_width < 1) bar_width = 1;
-    int filled = (percentage * bar_width) / 100;
+    const int filled = (percentage * bar_width) / 100;
     std::string bar;
     bar.reserve(static_cast<std::size_t>(bar_width));
     for (int i = 0; i < filled; ++i) bar += '-';
     for (int i = filled; i < bar_width; ++i) bar += ' ';
-    return std::format("\r{}{} {} {}", prefix, bar, "", pct);
+    return std::format("\r{}{} {}", prefix, bar, pct);
 }
 
 std::string render_weld_progress(int percentage, const std::string& label) {
     if (percentage < 0) percentage = 0;
     if (percentage > 100) percentage = 100;
     const int bar_width = 32;
-    int filled = (percentage * bar_width) / 100;
+    const int filled = (percentage * bar_width) / 100;
     std::string bar;
     bar.reserve(static_cast<std::size_t>(bar_width));
     for (int i = 0; i < filled; ++i) bar += '-';
     for (int i = filled; i < bar_width; ++i) bar += ' ';
-    char pct_buf[16];
-    std::snprintf(pct_buf, sizeof(pct_buf), "%3d%%", percentage);
+    const std::string pct = std::format("{:3}%", percentage);
     constexpr std::string_view kDim = "\033[38;5;250m";
     constexpr std::string_view kAccent = "\033[38;5;117m";
     constexpr std::string_view kReset = "\033[0m";
-    return std::format("\r{}{}{} {}{}{} {}", kAccent, label, kReset, kDim, bar, kReset, pct_buf);
+    return std::format("\r{}{}{} {}{}{} {}", kAccent, label, kReset, kDim, bar, kReset, pct);
 }
 
 class WeldAcquireStatus final : public pkgAcquireStatus {
@@ -2106,7 +2137,7 @@ std::string local_deb_package_name(const std::string& path) {
 bool register_local_debs(pkgSourceList* src_list, const std::vector<std::string>& targets,
                          std::map<std::string, std::string>& local_pkg_names, bool quiet) {
     for (const auto& t : targets) {
-        if (!ends_with(t, ".deb")) continue;
+        if (!t.ends_with(".deb")) continue;
         std::string pkg_name = local_deb_package_name(t);
         if (pkg_name.empty()) {
             if (!quiet) log_error(std::format("could not determine package name for {}", t));
@@ -2124,27 +2155,33 @@ bool register_local_debs(pkgSourceList* src_list, const std::vector<std::string>
 }
 
 bool run_libapt_transaction(const std::string& action, const std::vector<std::string>& targets,
-                             int status_fd, bool quiet) {
+                            int status_fd, bool quiet) {
     if (status_fd >= 0) _config->Set("APT::Status-Fd", status_fd);
     _config->Set("Dpkg::Use-Pty", "false");
     _config->Set("APT::Sandbox::User", "root");
 
     pkgCacheFile cache_file;
     pkgSourceList* src_list = cache_file.GetSourceList();
-    if (src_list == nullptr) { _error->DumpErrors(); return false; }
+    if (src_list == nullptr) {
+        _error->DumpErrors();
+        return false;
+    }
 
     std::map<std::string, std::string> local_pkg_names;
     if (!register_local_debs(src_list, targets, local_pkg_names, quiet)) return false;
 
     pkgCache* cache = cache_file.GetPkgCache();
     pkgDepCache* dep_cache = cache_file.GetDepCache();
-    if (cache == nullptr || dep_cache == nullptr) { _error->DumpErrors(); return false; }
+    if (cache == nullptr || dep_cache == nullptr) {
+        _error->DumpErrors();
+        return false;
+    }
 
     pkgProblemResolver fixer(dep_cache);
 
     if (action == "install") {
         for (const auto& t : targets) {
-            std::string pkg_name = ends_with(t, ".deb") ? local_pkg_names[t] : t;
+            std::string pkg_name = t.ends_with(".deb") ? local_pkg_names[t] : t;
             pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
             if (pkg.end()) {
                 if (!quiet) log_error(std::format("package {} not found", pkg_name));
@@ -2152,7 +2189,7 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
             }
             fixer.Clear(pkg);
             fixer.Protect(pkg);
-            if (g_force_reinstall.load()) dep_cache->SetReInstall(pkg, true);
+            if (g_force_reinstall) dep_cache->SetReInstall(pkg, true);
             dep_cache->MarkInstall(pkg, true);
             if (!(*dep_cache)[pkg].Install()) {
                 if (!quiet) log_error(std::format("unable to mark {} for installation", pkg_name));
@@ -2192,7 +2229,10 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
     }
 
     std::unique_ptr<pkgPackageManager> pm(_system->CreatePM(dep_cache));
-    if (!pm) { _error->DumpErrors(); return false; }
+    if (!pm) {
+        _error->DumpErrors();
+        return false;
+    }
 
     pkgAcquire fetcher;
     pkgRecords recs(*cache);
@@ -2205,10 +2245,11 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
     if (!quiet && status_fd < 0) {
         unsigned long long need = fetcher.FetchNeeded();
         if (need > 0) {
-            if (need < 1024ULL * 1024)
+            if (need < 1024ULL * 1024) {
                 std::print("Downloading packages ({} KB)...\n", need / 1024);
-            else
+            } else {
                 std::print("Downloading packages ({} MB)...\n", need / 1024 / 1024);
+            }
         }
     }
 
@@ -2223,7 +2264,9 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
         for (pkgAcquire::ItemIterator it = fetcher.ItemsBegin(); it != fetcher.ItemsEnd(); ++it) {
             if ((*it)->Status == pkgAcquire::Item::StatDone && (*it)->Complete) continue;
             fetch_failed = true;
-            std::string reason = (*it)->ErrorText.empty() ? std::string{"download did not complete"} : (*it)->ErrorText;
+            std::string reason = (*it)->ErrorText.empty()
+                ? std::string{"download did not complete"}
+                : (*it)->ErrorText;
             _error->Error("Failed to fetch %s: %s", (*it)->DescURI().c_str(), reason.c_str());
         }
         if (fetch_failed) {
@@ -2233,10 +2276,11 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
     }
 
     std::unique_ptr<APT::Progress::PackageManager> pm_progress;
-    if (status_fd >= 0)
+    if (status_fd >= 0) {
         pm_progress = std::make_unique<APT::Progress::PackageManagerProgressFd>(status_fd);
-    else
+    } else {
         pm_progress = std::make_unique<APT::Progress::PackageManager>();
+    }
 
     pkgPackageManager::OrderResult result = pm->DoInstall(pm_progress.get());
     if (result != pkgPackageManager::Completed) {
@@ -2248,22 +2292,23 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
 
 #ifdef allow_weld_repositories
 std::string normalize_weld_base_url(const std::string& raw_url) {
-    std::string url = trim_copy(raw_url);
-    if (!starts_with(url, "http://") && !starts_with(url, "https://"))
+    std::string url = trim(raw_url);
+    if (!url.starts_with("http://") && !url.starts_with("https://")) {
         url = "https://" + url;
+    }
     while (!url.empty() && url.back() == '/') url.pop_back();
     return url;
 }
 
 bool parse_weld_source_line(const std::string& raw_line, WeldSource& source) {
-    std::string line = trim_copy(raw_line);
+    std::string line = trim(raw_line);
     if (line.empty() || line[0] == '#') return false;
     std::istringstream iss(line);
     std::string type, base_url, release;
     if (!(iss >> type >> base_url >> release)) return false;
     if (type != "deb") return false;
     base_url = normalize_weld_base_url(base_url);
-    release = trim_copy(release);
+    release = trim(release);
     if (base_url.empty() || release.empty()) return false;
     source.base_url = base_url;
     source.release = release;
@@ -2276,7 +2321,7 @@ void load_weld_sources_from_file(const std::string& path, std::vector<WeldSource
     std::string line;
     while (std::getline(in, line)) {
         WeldSource source;
-        if (parse_weld_source_line(line, source)) sources.push_back(source);
+        if (parse_weld_source_line(line, source)) sources.push_back(std::move(source));
     }
 }
 #endif
@@ -2286,20 +2331,20 @@ std::vector<WeldSource> load_weld_sources() {
     return {};
 #else
     std::vector<WeldSource> sources;
-    if (path_is_regular_file(g_weld_sources_file))
+    if (path_is_regular_file(g_weld_sources_file)) {
         load_weld_sources_from_file(g_weld_sources_file, sources);
+    }
     if (path_is_directory(g_weld_sources_dir)) {
-        DIR* dir = opendir(g_weld_sources_dir.c_str());
-        if (dir != nullptr) {
+        DirPtr dir{opendir(g_weld_sources_dir.c_str())};
+        if (dir) {
             std::vector<std::string> files;
-            struct dirent* entry;
-            while ((entry = readdir(dir)) != nullptr) {
+            for (struct dirent* entry = readdir(dir.get()); entry != nullptr;
+                 entry = readdir(dir.get())) {
                 std::string name = entry->d_name;
                 if (name == "." || name == "..") continue;
                 std::string path = g_weld_sources_dir + "/" + name;
-                if (path_is_regular_file(path)) files.push_back(path);
+                if (path_is_regular_file(path)) files.push_back(std::move(path));
             }
-            closedir(dir);
             std::ranges::sort(files);
             for (const auto& path : files) load_weld_sources_from_file(path, sources);
         }
@@ -2427,7 +2472,7 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
     std::string raw_line;
     while (std::getline(ss, raw_line)) {
         std::string line = strip_inline_comment(raw_line);
-        std::string trimmed = trim_copy(line);
+        std::string trimmed = trim(line);
         if (trimmed.empty()) continue;
 
         if (trimmed == "[repoinfo_st]") {
@@ -2518,8 +2563,8 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
         auto colon = trimmed.find(':');
         if (colon == std::string::npos) continue;
 
-        std::string key = trim_copy(trimmed.substr(0, colon));
-        std::string value = strip_quotes(trim_copy(trimmed.substr(colon + 1)));
+        std::string key = trim(trimmed.substr(0, colon));
+        std::string value = strip_quotes(trim(trimmed.substr(colon + 1)));
 
         if (current_section == Section::RepoInfo) {
             if (!has_pending_repo) continue;
@@ -2581,91 +2626,92 @@ std::size_t curl_string_write_cb(char* ptr, std::size_t size, std::size_t nmemb,
     return total;
 }
 
-std::string curl_fetch_string(const std::string& url, const std::string& user_agent = "",
-                              long timeout_sec = 30, std::size_t max_size = kWeldMaxMetadataSize) {
-    if (url.empty()) return "";
-    auto start = url.find_first_not_of(" \n\r\t");
-    std::string norm_url = (start == std::string::npos)
-        ? std::string{}
-        : url.substr(start, url.find_last_not_of(" \n\r\t") - start + 1);
-    if (norm_url.empty() || norm_url.front() == '-') return "";
-    if (!starts_with(norm_url, "https://")) return "";
-    if (norm_url.size() > 4096) return "";
-
-    CURL* curl = curl_easy_init();
-    if (!curl) return "";
-    std::string response;
-    CurlStringCtx ctx{&response, max_size, false};
-    curl_easy_setopt(curl, CURLOPT_URL, norm_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_string_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+void curl_apply_common_security(CURL* curl) {
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_PIPEWAIT, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    if (!user_agent.empty()) {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
-    } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/5.0");
+}
+
+void curl_apply_user_agent(CURL* curl, const std::string& user_agent) {
+    const std::string ua = user_agent.empty() ? std::format("Weld/{}", kWeldVersion) : user_agent;
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, ua.c_str());
+}
+
+std::string curl_fetch_string(const std::string& url, const std::string& user_agent = "",
+                              long timeout_sec = 30, std::size_t max_size = kWeldMaxMetadataSize) {
+    std::string norm_url = trim(url);
+    if (norm_url.empty() || !norm_url.starts_with("https://") || norm_url.size() > 4096) {
+        return {};
     }
+    CurlPtr curl{curl_easy_init()};
+    if (!curl) return {};
 
-    CURLcode res = curl_easy_perform(curl);
+    std::string response;
+    CurlStringCtx ctx{&response, max_size, false};
+    curl_easy_setopt(curl.get(), CURLOPT_URL, norm_url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_string_write_cb);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &ctx);
+    curl_apply_common_security(curl.get());
+    curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, timeout_sec);
+    curl_easy_setopt(curl.get(), CURLOPT_PIPEWAIT, 0L);
+    curl_apply_user_agent(curl.get(), user_agent);
+
+    CURLcode res = curl_easy_perform(curl.get());
     long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK || response_code != 200) return "";
-    if (ctx.overflow) return "";
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+    if (res != CURLE_OK || response_code != 200 || ctx.overflow) return {};
     return response;
 }
 
+struct CurlFileCtx {
+    FILE* fp;
+    std::uint64_t written = 0;
+    std::uint64_t max_size = 0;
+    bool overflow = false;
+};
+
 std::size_t curl_file_write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
-    FILE* fp = static_cast<FILE*>(userdata);
-    return fwrite(ptr, size, nmemb, fp);
+    auto* ctx = static_cast<CurlFileCtx*>(userdata);
+    std::size_t total = size * nmemb;
+    if (ctx->written + total > ctx->max_size) {
+        ctx->overflow = true;
+        return 0;
+    }
+    if (std::fwrite(ptr, 1, total, ctx->fp) != total) return 0;
+    ctx->written += total;
+    return total;
 }
 
-bool curl_download_file(const std::string& url, const std::string& dest_path, const std::string& user_agent = "") {
-    if (url.empty() || dest_path.empty()) return false;
-    if (!starts_with(url, "https://")) return false;
+bool curl_download_file(const std::string& url, const std::string& dest_path,
+                        const std::string& user_agent = "",
+                        std::uint64_t max_size = kWeldMaxDownloadSize) {
+    if (url.empty() || dest_path.empty() || !url.starts_with("https://")) return false;
 
-    FILE* fp = fopen(dest_path.c_str(), "wb");
+    FilePtr fp{std::fopen(dest_path.c_str(), "wb")};
     if (!fp) return false;
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        fclose(fp);
-        unlink(dest_path.c_str());
-        return false;
-    }
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_file_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    if (!user_agent.empty()) {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
-    } else {
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Weld/5.0");
-    }
+    CurlPtr curl{curl_easy_init()};
+    if (!curl) return false;
 
-    CURLcode res = curl_easy_perform(curl);
+    CurlFileCtx ctx{fp.get(), 0, max_size, false};
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_file_write_cb);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &ctx);
+    curl_apply_common_security(curl.get());
+    curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 600L);
+    curl_apply_user_agent(curl.get(), user_agent);
+
+    CURLcode res = curl_easy_perform(curl.get());
     long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_cleanup(curl);
-    fclose(fp);
-
-    if (res != CURLE_OK || response_code != 200) {
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+    fp.reset();
+    if (res != CURLE_OK || response_code != 200 || ctx.overflow) {
         unlink(dest_path.c_str());
         return false;
     }
@@ -2690,7 +2736,7 @@ bool sync_weld_metadata() {
     }
 
     std::atomic<int> completed(0);
-    int total = static_cast<int>(sources.size());
+    const int total = static_cast<int>(sources.size());
     safe_log(render_sync_progress(0, "Syncing Weld Repositories"));
 
     std::vector<std::future<bool>> futures;
@@ -2698,15 +2744,19 @@ bool sync_weld_metadata() {
 
     for (const auto& source : sources) {
         futures.push_back(std::async(std::launch::async, [source, &completed, total]() -> bool {
-            std::string meta_url = source.base_url + "/releases/" + source.release + "/repo-metadata";
-            std::string sig_url  = meta_url + ".minisig";
+            const std::string meta_url = source.base_url + "/releases/" + source.release + "/repo-metadata";
+            const std::string sig_url = meta_url + ".minisig";
+
+            auto report_progress = [&completed, total] {
+                int done = completed.fetch_add(1) + 1;
+                int pct = (done * 100) / total;
+                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+            };
 
             std::string metadata = curl_fetch_string(meta_url);
             if (metadata.empty()) {
                 safe_log("\nE: Failed to fetch repository metadata from ", meta_url, "\n");
-                int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                report_progress();
                 return false;
             }
 
@@ -2715,48 +2765,35 @@ bool sync_weld_metadata() {
                 safe_log("\nE: Repository ", source.base_url, " is missing its minisign signature.\n");
                 safe_log("E: Expected signature file: ", sig_url, "\n");
                 safe_log("E: Weld refuses to trust unsigned repository metadata.\n");
-                int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                report_progress();
                 return false;
             }
 
-            std::string trusted_comment;
-            std::string verify_err;
-            if (!verify_repo_metadata_signature(metadata, signature, trusted_comment, verify_err)) {
-                safe_log("\nE: Signature verification failed for ", source.base_url, ": ", verify_err, "\n");
+            auto verified = verify_repo_metadata_signature(metadata, signature);
+            if (!verified) {
+                safe_log("\nE: Signature verification failed for ", source.base_url, ": ", verified.error(), "\n");
                 safe_log("E: Weld refuses to use this repository.\n");
-                int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                report_progress();
                 return false;
             }
 
             std::string safe_release = sanitize_filename(source.release);
             std::string release_dir = g_weld_etc_dir + "/" + safe_release;
             if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) {
-                int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                report_progress();
                 return false;
             }
             std::string output_path = release_dir + "/repo-metadata";
             if (!write_text_file(output_path, metadata)) {
-                int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                report_progress();
                 return false;
             }
             std::string sig_output_path = release_dir + "/repo-metadata.minisig";
             if (!write_text_file(sig_output_path, signature)) {
-                int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                report_progress();
                 return false;
             }
-            int done = completed.fetch_add(1) + 1;
-            int pct = (done * 100) / total;
-            safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+            report_progress();
             return true;
         }));
     }
@@ -2804,10 +2841,11 @@ bool clean_apt_archives_cache() {
         }
     }
 
-    if (removed_any)
+    if (removed_any) {
         std::print("APT archives cleaned: {} ({} freed)\n", archives, format_bytes(bytes_freed));
-    else
+    } else {
         std::print("APT archives already clean: {}\n", archives);
+    }
     return true;
 }
 
@@ -2842,10 +2880,11 @@ bool clean_weld_cache_only() {
         log_error(std::format("failed to recreate Weld cache directory: {}", cache_dir));
         return false;
     }
-    if (removed_any)
+    if (removed_any) {
         std::print("Weld cache cleaned: {}\n", cache_dir);
-    else
+    } else {
         std::print("Weld cache is already clean.\n");
+    }
     return true;
 #endif
 }
@@ -2858,13 +2897,14 @@ bool clean_weld_cache() {
 
 class WeldArchiveCleaner final : public pkgArchiveCleaner {
 public:
-    std::size_t   removed_count = 0;
+    std::size_t removed_count = 0;
     std::uint64_t bytes_freed = 0;
 protected:
-    void Erase(int const dirfd, char const * const File,
-               std::string const &Pkg, std::string const &Ver,
-               struct stat const &St) override {
-        (void)Pkg; (void)Ver;
+    void Erase(int const dirfd, char const* const File,
+               std::string const& Pkg, std::string const& Ver,
+               struct stat const& St) override {
+        (void)Pkg;
+        (void)Ver;
         bytes_freed += static_cast<std::uint64_t>(St.st_size);
         if (unlinkat(dirfd, File, 0) == 0) ++removed_count;
     }
@@ -2903,7 +2943,7 @@ bool autoclean_apt_archives_cache() {
 
     if (cleaner.removed_count > 0) {
         std::print("APT autoclean removed {} obsolete .deb file(s) ({} freed)\n",
-            cleaner.removed_count, format_bytes(cleaner.bytes_freed));
+                   cleaner.removed_count, format_bytes(cleaner.bytes_freed));
     } else {
         std::print("APT archives: no obsolete packages found.\n");
     }
@@ -2937,7 +2977,7 @@ bool autoclean_weld_cache_only() {
         for (const auto& file_entry : fs::directory_iterator(rel_entry.path(), ec)) {
             if (!file_entry.is_regular_file()) continue;
             std::string filename = file_entry.path().filename().string();
-            if (valid_filenames.find(filename) == valid_filenames.end()) {
+            if (!valid_filenames.contains(filename)) {
                 std::uint64_t sz = file_entry.file_size(ec);
                 if (!ec) bytes_freed += sz;
                 fs::remove(file_entry.path(), ec);
@@ -2992,57 +3032,57 @@ std::vector<WeldRepoMetadata> load_cached_weld_metadata() {
         std::string sig_content;
         if (!read_text_file(sig_path, sig_content)) {
             log_error(std::format("repository {} is missing its minisign signature file. refusing to load.",
-                source.base_url));
+                                  source.base_url));
             continue;
         }
 
-        std::string trusted_comment;
-        std::string verify_err;
-        if (!verify_repo_metadata_signature(content, sig_content, trusted_comment, verify_err)) {
+        auto verified = verify_repo_metadata_signature(content, sig_content);
+        if (!verified) {
             log_error(std::format("cached signature for {} is invalid: {}. refusing to load.",
-                source.base_url, verify_err));
+                                  source.base_url, verified.error()));
             continue;
         }
 
         WeldRepoMetadata metadata;
         metadata.base_url = source.base_url;
         metadata.release = source.release;
-        metadata.trusted_comment = trusted_comment;
+        metadata.trusted_comment = std::move(verified.value());
         std::string parse_err;
         if (!parse_weld_repo_metadata_v2(content, metadata, parse_err)) {
             log_error(std::format("metadata for {} is malformed: {}. refusing to load.",
-                source.base_url, parse_err));
+                                  source.base_url, parse_err));
             continue;
         }
         if (metadata.release.empty()) metadata.release = source.release;
-        repos.push_back(metadata);
+        repos.push_back(std::move(metadata));
     }
     return repos;
 #endif
 }
 
-int compare_versions(const std::string& a, const std::string& b)
-    post(r: r >= -1 && r <= 1) {
+int compare_versions(const std::string& a, const std::string& b) {
     if (a.empty() && b.empty()) return 0;
     if (a.empty()) return -1;
     if (b.empty()) return 1;
-    if (_system != nullptr && _system->VS != nullptr)
+    if (_system != nullptr && _system->VS != nullptr) {
         return _system->VS->CmpVersion(a.c_str(), b.c_str());
+    }
     if (a == b) return 0;
     return a < b ? -1 : 1;
 }
 
 std::string extract_weld_version(const std::string& pkg_name, const std::string& file_name) {
-    std::string base = path_basename(trim_copy(file_name));
-    if (!ends_with(base, ".deb")) return "";
+    std::string base = path_basename(trim(file_name));
+    if (!base.ends_with(".deb")) return "";
     std::string stem = base.substr(0, base.size() - 4);
     std::string rest;
-    if (starts_with(stem, pkg_name + "_"))
+    if (stem.starts_with(pkg_name + "_")) {
         rest = stem.substr(pkg_name.size() + 1);
-    else if (starts_with(stem, pkg_name + "-"))
+    } else if (stem.starts_with(pkg_name + "-")) {
         rest = stem.substr(pkg_name.size() + 1);
-    else
+    } else {
         return "";
+    }
     auto split = rest.find_last_of('_');
     if (split != std::string::npos && split > 0) return rest.substr(0, split);
     split = rest.find_last_of('-');
@@ -3067,8 +3107,8 @@ AptPackageState get_apt_package_state(pkgCacheFile& cache_file, const std::strin
     return state;
 }
 
-WeldPackageCandidate find_best_weld_candidate(const std::vector<WeldRepoMetadata>& repos, const std::string& pkg_name)
-    pre(!pkg_name.empty()) {
+WeldPackageCandidate find_best_weld_candidate(const std::vector<WeldRepoMetadata>& repos,
+                                              const std::string& pkg_name) {
     WeldPackageCandidate best;
     for (const auto& repo : repos) {
         auto it = repo.packages.find(pkg_name);
@@ -3082,10 +3122,11 @@ WeldPackageCandidate find_best_weld_candidate(const std::vector<WeldRepoMetadata
         candidate.actual_pkg_name = pkg_name;
         candidate.original_query_name = pkg_name;
         candidate.is_replacement = false;
-        candidate.description = repo.descriptions.count(pkg_name) ? repo.descriptions.at(pkg_name) : "";
+        candidate.description = repo.descriptions.contains(pkg_name) ? repo.descriptions.at(pkg_name) : "";
         candidate.version = extract_weld_version(pkg_name, candidate.file_name);
-        if (!best.found || compare_versions(candidate.version, best.version) > 0)
-            best = candidate;
+        if (!best.found || compare_versions(candidate.version, best.version) > 0) {
+            best = std::move(candidate);
+        }
     }
     if (best.found) return best;
 
@@ -3106,31 +3147,29 @@ WeldPackageCandidate find_best_weld_candidate(const std::vector<WeldRepoMetadata
         candidate.actual_pkg_name = target_weld_pkg;
         candidate.original_query_name = pkg_name;
         candidate.is_replacement = true;
-        candidate.description = repo.descriptions.count(target_weld_pkg) ? repo.descriptions.at(target_weld_pkg) : "";
+        candidate.description = repo.descriptions.contains(target_weld_pkg) ? repo.descriptions.at(target_weld_pkg) : "";
         candidate.version = extract_weld_version(target_weld_pkg, candidate.file_name);
-        if (!best.found || compare_versions(candidate.version, best.version) > 0)
-            best = candidate;
+        if (!best.found || compare_versions(candidate.version, best.version) > 0) {
+            best = std::move(candidate);
+        }
     }
     return best;
 }
 
-std::string build_weld_download_url(const WeldPackageCandidate& candidate)
-    pre(candidate.found) pre(!candidate.base_url.empty())
-    pre(!candidate.release.empty()) pre(!candidate.file_name.empty())
-    post(r: !r.empty()) {
-    std::string file_name = trim_copy(candidate.file_name);
+std::string build_weld_download_url(const WeldPackageCandidate& candidate) {
+    std::string file_name = trim(candidate.file_name);
     while (!file_name.empty() && file_name.front() == '/') file_name.erase(file_name.begin());
-    std::size_t pos = 0;
-    while ((pos = file_name.find("..", pos)) != std::string::npos) {
+    for (std::size_t pos = 0; (pos = file_name.find("..", pos)) != std::string::npos;) {
         file_name.erase(pos, 2);
     }
     while (!file_name.empty() && file_name.front() == '/') file_name.erase(file_name.begin());
-    return candidate.base_url + "/releases/" + candidate.release + "/" + file_name;
+    return std::format("{}/releases/{}/{}", candidate.base_url, candidate.release, file_name);
 }
 
 bool cache_weld_package(const WeldPackageCandidate& candidate, std::string& local_path) {
 #ifndef allow_weld_repositories
-    (void)candidate; (void)local_path;
+    (void)candidate;
+    (void)local_path;
     return false;
 #else
     std::string safe_release = sanitize_filename(candidate.release);
@@ -3140,43 +3179,9 @@ bool cache_weld_package(const WeldPackageCandidate& candidate, std::string& loca
     if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) return false;
     local_path = release_dir + "/" + safe_file;
     std::string url = build_weld_download_url(candidate);
-    if (url.empty() || url.front() == '-') return false;
-    if (!starts_with(url, "https://")) return false;
+    if (!url.starts_with("https://")) return false;
     return curl_download_file(url, local_path);
 #endif
-}
-
-std::string calculate_sha256(const std::string& file_path) pre(!file_path.empty()) {
-    std::ifstream in(file_path, std::ios::binary);
-    if (!in) return "";
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) return "";
-    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
-        EVP_MD_CTX_free(ctx);
-        return "";
-    }
-    char buf[65536];
-    bool failed = false;
-    while (in) {
-        in.read(buf, sizeof(buf));
-        std::streamsize got = in.gcount();
-        if (got > 0) {
-            if (EVP_DigestUpdate(ctx, buf, static_cast<std::size_t>(got)) != 1) {
-                failed = true;
-                break;
-            }
-        }
-    }
-    std::string result;
-    if (!failed) {
-        unsigned char hash[EVP_MAX_MD_SIZE];
-        unsigned int hash_len = 0;
-        if (EVP_DigestFinal_ex(ctx, hash, &hash_len) == 1 && hash_len > 0) {
-            result = hex_encode(std::span<const unsigned char>{hash, hash_len});
-        }
-    }
-    EVP_MD_CTX_free(ctx);
-    return result;
 }
 
 struct PendingWeldDownload {
@@ -3191,12 +3196,12 @@ bool download_weld_packages(std::vector<PendingWeldDownload>& pending_weld_downl
                             std::vector<InstallDecision>& decisions, bool quiet) {
     if (pending_weld_downloads.empty()) return true;
 
-    std::size_t num_threads = std::min<std::size_t>(4, pending_weld_downloads.size());
-    std::vector<std::thread> workers;
+    const std::size_t num_threads = std::min<std::size_t>(4, pending_weld_downloads.size());
+    std::vector<std::jthread> workers;
     std::atomic<std::size_t> current_index(0);
 
     for (std::size_t t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&]() {
+        workers.emplace_back([&] {
             while (true) {
                 std::size_t idx = current_index.fetch_add(1);
                 if (idx >= pending_weld_downloads.size()) break;
@@ -3204,18 +3209,20 @@ bool download_weld_packages(std::vector<PendingWeldDownload>& pending_weld_downl
                 if (!quiet) safe_log("Downloading Weld package: ", pending.pkg_name, "...\n");
                 auto start_time = std::chrono::steady_clock::now();
                 if (!cache_weld_package(pending.candidate, pending.local_path)) {
-                    pending.error_msg = std::format("E: Failed to download {} from the Weld repository.\n",
-                        pending.pkg_name);
+                    pending.error_msg = std::format(
+                        "E: Failed to download {} from the Weld repository.\n", pending.pkg_name);
                     continue;
                 }
                 auto end_time = std::chrono::steady_clock::now();
-                double elapsed_sec = std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time).count();
+                double elapsed_sec =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time).count();
 
                 if (pending.candidate.sha256.empty()) {
                     pending.error_msg = std::format(
                         "E: SHA256 checksum is missing in metadata for package {}.\n"
                         "E: Refusing to install unverified package.\n", pending.pkg_name);
-                    exec_argv_devnull_out({"rm", "-f", pending.local_path});
+                    std::error_code rm_ec;
+                    fs::remove(pending.local_path, rm_ec);
                     continue;
                 }
 
@@ -3227,7 +3234,8 @@ bool download_weld_packages(std::vector<PendingWeldDownload>& pending_weld_downl
                         "E: Got:      {}\n"
                         "E: Aborting installation of this package.\n",
                         pending.pkg_name, pending.candidate.sha256, local_hash);
-                    exec_argv_devnull_out({"rm", "-f", pending.local_path});
+                    std::error_code rm_ec;
+                    fs::remove(pending.local_path, rm_ec);
                     continue;
                 }
 
@@ -3272,14 +3280,14 @@ bool download_weld_packages(std::vector<PendingWeldDownload>& pending_weld_downl
             decision.apt_argument = pending.local_path;
             decision.selected_version = pending.candidate.version;
             decision.from_weld = true;
-            decisions.push_back(decision);
+            decisions.push_back(std::move(decision));
         }
     }
     return ok;
 }
 
 bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector<InstallDecision>& decisions,
-                                bool quiet, bool is_upgrade) pre(!pkgs.empty()) {
+                               bool quiet, bool is_upgrade) {
     if (pkgs.empty()) {
         if (!quiet) log_error("no packages were specified.");
         return false;
@@ -3290,21 +3298,20 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
     std::vector<PendingWeldDownload> pending_weld_downloads;
 
     for (const auto& pkg_name : pkgs) {
-        if (ends_with(pkg_name, ".deb")) {
+        if (pkg_name.ends_with(".deb")) {
             if (pkg_name.find("..") != std::string::npos || pkg_name.find('\0') != std::string::npos) {
                 if (!quiet) log_error(std::format("suspicious path traversal in: {}", pkg_name));
                 had_error = true;
                 continue;
             }
-            int probe_fd = open_no_follow(pkg_name, O_RDONLY);
-            if (probe_fd < 0) {
+            FdGuard probe_fd{open_no_follow(pkg_name, O_RDONLY)};
+            if (!probe_fd) {
                 if (!quiet) log_error(std::format("unable to locate local package file: {}", pkg_name));
                 had_error = true;
                 continue;
             }
             struct stat st{};
-            bool is_regular = (fstat(probe_fd, &st) == 0 && S_ISREG(st.st_mode));
-            close(probe_fd);
+            bool is_regular = (fstat(probe_fd.get(), &st) == 0 && S_ISREG(st.st_mode));
             if (!is_regular) {
                 if (!quiet) log_error(std::format("local package is not a regular file: {}", pkg_name));
                 had_error = true;
@@ -3320,7 +3327,7 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
             decision.apt_argument = resolved_path;
             decision.selected_version = "";
             decision.from_weld = false;
-            decisions.push_back(decision);
+            decisions.push_back(std::move(decision));
             continue;
         }
 
@@ -3344,12 +3351,12 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
             AptPackageState target_apt_state = (weld_candidate.is_replacement)
                 ? get_apt_package_state(cache_file, weld_candidate.actual_pkg_name)
                 : apt_state;
-            if (target_apt_state.installed && !g_force_reinstall.load()
+            if (target_apt_state.installed && !g_force_reinstall
                 && compare_versions(target_apt_state.installed_version, weld_candidate.version) >= 0) {
                 if (!quiet) print_install_already_present_message(weld_candidate.actual_pkg_name, is_upgrade);
                 continue;
             }
-            pending_weld_downloads.push_back({pkg_name, weld_candidate, "", false, ""});
+            pending_weld_downloads.push_back({pkg_name, std::move(weld_candidate), "", false, ""});
             continue;
         }
 
@@ -3359,7 +3366,7 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
             continue;
         }
 
-        if (apt_state.installed && !g_force_reinstall.load()
+        if (apt_state.installed && !g_force_reinstall
             && compare_versions(apt_state.installed_version, apt_state.candidate_version) >= 0) {
             if (!quiet) print_install_already_present_message(pkg_name, is_upgrade);
             continue;
@@ -3370,7 +3377,7 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
         decision.apt_argument = pkg_name;
         decision.selected_version = apt_state.candidate_version;
         decision.from_weld = false;
-        decisions.push_back(decision);
+        decisions.push_back(std::move(decision));
     }
 
     if (!download_weld_packages(pending_weld_downloads, decisions, quiet)) {
@@ -3396,6 +3403,7 @@ std::string parse_arvor_ua_version(const std::string& page) {
         }
     }
     while (!ver.empty() && ver.back() == '.') ver.pop_back();
+    WELD_CONTRACT(ver.find_first_not_of("0123456789.") == std::string::npos);
     return ver;
 }
 
@@ -3441,7 +3449,7 @@ void print_successful_install(const std::string& action, const std::vector<std::
     pkgRecords records(*cache);
     bool printed_any = false;
     for (const auto& t : targets) {
-        if (ends_with(t, ".deb")) continue;
+        if (t.ends_with(".deb")) continue;
         pkgCache::PkgIterator pkg = cache->FindPkg(t);
         if (pkg.end() || pkg->CurrentVer == 0) continue;
         pkgCache::VerIterator ver = pkg.CurrentVer();
@@ -3464,23 +3472,22 @@ void print_successful_install(const std::string& action, const std::vector<std::
     }
 }
 
-std::string read_arvor_version_from_os_release() post(r: !r.empty()) {
+std::expected<std::string, std::string> read_arvor_version_from_os_release() {
     std::string content;
     if (!read_text_file("/etc/os-release", content)) {
-        return ARVOR_VERSION;
+        return std::unexpected(std::string{"cannot read /etc/os-release"});
     }
     std::istringstream ss(content);
     std::string line;
     while (std::getline(ss, line)) {
-        if (!starts_with(line, "VERSION_ID")) continue;
+        if (!line.starts_with("VERSION_ID")) continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) break;
-        std::string value = line.substr(eq + 1);
-        value = strip_quotes(trim_copy(value));
+        std::string value = strip_quotes(trim(line.substr(eq + 1)));
         if (value.empty()) break;
         return value;
     }
-    return ARVOR_VERSION;
+    return std::unexpected(std::string{"/etc/os-release has no VERSION_ID"});
 }
 
 void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
@@ -3503,10 +3510,10 @@ void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
         std::print("Arvor Linux local version: {}\n", arv_version);
         std::print("A newer release ({}) is available. Proceed with upgrade? [Y/n] ", remote_version);
         std::cout.flush();
-        if (!g_assume_yes.load()) {
+        if (!g_assume_yes) {
             std::string answer;
             std::getline(std::cin, answer);
-            if (answer != "y" && answer != "Y") {
+            if (!answer.empty() && answer != "y" && answer != "Y") {
                 std::print("Upgrade cancelled.\n");
                 return;
             }
@@ -3518,31 +3525,30 @@ void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
 
     std::string os_release = curl_fetch_string("https://nextferret.github.io/etc/os-release", user_agent);
     std::string codenames = curl_fetch_string("https://nextferret.github.io/version_codename", user_agent);
-    std::string repo_number_str = trim_copy(curl_fetch_string("https://nextferret.github.io/repo-number", user_agent));
+    std::string repo_number_str = trim(curl_fetch_string("https://nextferret.github.io/repo-number", user_agent));
     std::string weld_sources;
     std::string apt_sources;
 
     if (!codenames.empty() && !repo_number_str.empty()) {
         auto comma = codenames.find(',');
         if (comma != std::string::npos) {
-            std::string weld_code = trim_copy(codenames.substr(0, comma));
-            std::string debian_code = trim_copy(codenames.substr(comma + 1));
+            std::string weld_code = trim(codenames.substr(0, comma));
+            std::string debian_code = trim(codenames.substr(comma + 1));
             std::string base_repo_url = "https://thearvorindex.github.io/repo-arvorlinux--" + repo_number_str;
             std::string meta_url = base_repo_url + "/releases/" + weld_code + "/repo-metadata";
-            std::string sig_url  = meta_url + ".minisig";
+            std::string sig_url = meta_url + ".minisig";
             std::string meta = curl_fetch_string(meta_url);
-            std::string sig  = curl_fetch_string(sig_url);
+            std::string sig = curl_fetch_string(sig_url);
             if (!meta.empty() && !sig.empty()) {
-                std::string tc;
-                std::string err;
-                if (verify_repo_metadata_signature(meta, sig, tc, err)) {
+                if (auto verified = verify_repo_metadata_signature(meta, sig)) {
                     weld_sources = "deb " + base_repo_url + " " + weld_code + "\n";
                     apt_sources = "deb http://deb.debian.org/debian " + debian_code + " main contrib non-free non-free-firmware\n";
                     apt_sources += "deb http://deb.debian.org/debian-security " + debian_code + "-security main contrib non-free non-free-firmware\n";
                     apt_sources += "deb http://deb.debian.org/debian " + debian_code + "-updates main contrib non-free non-free-firmware\n";
                 } else {
-                    log_error(std::format("refusing to switch to release {} because its signature could not be verified: {}",
-                        weld_code, err));
+                    log_error(std::format(
+                        "refusing to switch to release {} because its signature could not be verified: {}",
+                        weld_code, verified.error()));
                 }
             }
         }
@@ -3556,8 +3562,9 @@ void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
     std::vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
     std::vector<std::string> pkgs_to_install;
     for (const auto& repo : repos) {
-        for (const auto& req : repo.required_packages)
+        for (const auto& req : repo.required_packages) {
             pkgs_to_install.push_back(req);
+        }
     }
 
     if (!pkgs_to_install.empty()) {
@@ -3572,28 +3579,20 @@ void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
 #endif
 }
 
-std::vector<std::string> bind_mount_local_deb_dirs(const std::vector<std::string>& targets) {
+void bind_mount_local_deb_dirs(const std::vector<std::string>& targets) {
     std::set<std::string> parents;
     for (const auto& t : targets) {
-        if (!ends_with(t, ".deb")) continue;
+        if (!t.ends_with(".deb")) continue;
         fs::path parent = fs::path(t).parent_path();
         if (!parent.empty()) parents.insert(parent.string());
     }
-    std::vector<std::string> mounted;
     for (const auto& parent : parents) {
         std::string target = g_tree_root + parent;
         std::error_code ec;
         fs::create_directories(target, ec);
         if (ec) continue;
         exec_argv_devnull_out({"mount", "--bind", parent, target});
-        mounted.push_back(target);
     }
-    return mounted;
-}
-
-void unbind_local_deb_dirs(const std::vector<std::string>& mounted) {
-    for (auto it = mounted.rbegin(); it != mounted.rend(); ++it)
-        exec_argv_devnull_out({"umount", "-l", *it});
 }
 
 void perform_transaction_argv(const std::string& action, const std::vector<std::string>& targets, bool apply_host) {
@@ -3605,12 +3604,16 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             return;
         }
         mount_fs();
-        std::vector<std::string> local_deb_mounts = bind_mount_local_deb_dirs(targets);
+        bind_mount_local_deb_dirs(targets);
 
-        int apt_pipe[2]  = {-1, -1};
-        bool have_pipe   = (pipe(apt_pipe) == 0);
-        int err_pipe[2]  = {-1, -1};
-        bool have_err    = (pipe2(err_pipe, O_CLOEXEC) == 0);
+        int apt_pipe[2] = {-1, -1};
+        bool have_pipe = (pipe(apt_pipe) == 0);
+        FdGuard apt_read{have_pipe ? apt_pipe[0] : -1};
+        FdGuard apt_write{have_pipe ? apt_pipe[1] : -1};
+        int err_pipe[2] = {-1, -1};
+        bool have_err = (pipe2(err_pipe, O_CLOEXEC) == 0);
+        FdGuard err_read{have_err ? err_pipe[0] : -1};
+        FdGuard err_write{have_err ? err_pipe[1] : -1};
 
         std::cout.flush();
         std::cerr.flush();
@@ -3636,14 +3639,13 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             std::string put_old_path = std::string(g_tree_root) + "/.old_root";
             bool pivoted = false;
             if (mkdir(put_old_path.c_str(), 0755) == 0) {
-                int verify_fd = open_no_follow(put_old_path, O_RDONLY | O_DIRECTORY);
-                if (verify_fd >= 0) {
+                FdGuard verify_fd{open_no_follow(put_old_path, O_RDONLY | O_DIRECTORY)};
+                if (verify_fd) {
                     if (mount("", g_tree_root.c_str(), "", MS_PRIVATE | MS_REC, nullptr) == 0) {
                         if (do_pivot_root(g_tree_root.c_str(), put_old_path.c_str()) == 0) {
                             pivoted = true;
                         }
                     }
-                    close(verify_fd);
                 }
             }
 
@@ -3673,21 +3675,25 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             apply_strict_resource_limits();
             restrict_capabilities();
 
-            {
-                std::string seccomp_err;
-                if (!ChrootSeccompManager::apply_filter(seccomp_err)) {
-                    if (have_err && !seccomp_err.empty()) {
-                        std::string msg = std::format("W: SECCOMP filter notice: {}\n", seccomp_err);
-                        ssize_t written = write(err_pipe[1], msg.c_str(), msg.size());
-                        (void)written;
-                    }
+            if (auto seccomp = ChrootSeccompManager::apply_filter(); !seccomp) {
+                if (have_err) {
+                    std::string msg = std::format("E: SECCOMP initialization failed: {}\n", seccomp.error());
+                    ssize_t written = write(err_pipe[1], msg.data(), msg.size());
+                    (void)written;
                 }
+                _exit(1);
             }
 
             int devnull_r = open("/dev/null", O_RDONLY);
-            if (devnull_r >= 0) { dup2(devnull_r, STDIN_FILENO); close(devnull_r); }
+            if (devnull_r >= 0) {
+                dup2(devnull_r, STDIN_FILENO);
+                close(devnull_r);
+            }
             int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); close(devnull); }
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                close(devnull);
+            }
 
             if (have_err) {
                 close(err_pipe[0]);
@@ -3697,21 +3703,23 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
                 }
             } else {
                 int dn2 = open("/dev/null", O_WRONLY);
-                if (dn2 >= 0) { dup2(dn2, STDERR_FILENO); close(dn2); }
+                if (dn2 >= 0) {
+                    dup2(dn2, STDERR_FILENO);
+                    close(dn2);
+                }
             }
 
             int status_fd = -1;
             if (have_pipe) {
                 close(apt_pipe[0]);
-                if (apt_pipe[1] != 3) { dup2(apt_pipe[1], 3); close(apt_pipe[1]); }
-                fcntl(3, F_SETFD, 0);
+                if (apt_pipe[1] != 3) {
+                    dup2(apt_pipe[1], 3);
+                    close(apt_pipe[1]);
+                }
                 status_fd = 3;
             }
 
-            for (int fd = 4; fd < 1024; ++fd) close(fd);
-
-            pkgInitConfig(*_config);
-            pkgInitSystem(*_config, _system);
+            close_fds_above(4);
 
             sanitize_child_environment();
             setenv("DEBIAN_FRONTEND", "noninteractive", 1);
@@ -3721,33 +3729,40 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             _exit(ok ? 0 : 1);
 
         } else if (pid > 0) {
-            if (have_pipe) close(apt_pipe[1]);
-            if (have_err)  close(err_pipe[1]);
+            apt_write.reset();
+            err_write.reset();
 
             std::cout << render_weld_progress(0, "Verifying Transaction") << std::flush;
 
             std::atomic<int> apt_percent(-1);
             std::string child_stderr_output;
 
-            std::thread stderr_reader([&]() {
-                if (!have_err) return;
-                char buf[256];
-                ssize_t n;
-                while ((n = read(err_pipe[0], buf, sizeof(buf) - 1)) > 0) {
-                    buf[n] = '\0';
-                    child_stderr_output += buf;
+            std::jthread stderr_reader([&child_stderr_output, rfd = err_read.release()] {
+                if (rfd < 0) return;
+                std::array<char, 256> buf{};
+                for (;;) {
+                    ssize_t n = read(rfd, buf.data(), buf.size());
+                    if (n > 0) {
+                        child_stderr_output.append(buf.data(), static_cast<std::size_t>(n));
+                        continue;
+                    }
+                    if (n < 0 && errno == EINTR) continue;
+                    break;
                 }
-                close(err_pipe[0]);
+                close(rfd);
             });
 
-            std::thread reader_thread([&]() {
-                if (!have_pipe) return;
-                FILE* f = fdopen(apt_pipe[0], "r");
-                if (!f) { close(apt_pipe[0]); return; }
-                char line[512];
+            std::jthread reader_thread([&apt_percent, rfd = apt_read.release()] {
+                if (rfd < 0) return;
+                FilePtr f{fdopen(rfd, "r")};
+                if (!f) {
+                    close(rfd);
+                    return;
+                }
+                std::array<char, 512> line{};
                 int last_shown = -1;
-                while (fgets(line, sizeof(line), f) != nullptr) {
-                    std::string s(line);
+                while (fgets(line.data(), static_cast<int>(line.size()), f.get()) != nullptr) {
+                    std::string s(line.data());
                     bool is_pm = (s.size() > 9 && s.substr(0, 9) == "pmstatus:");
                     bool is_dl = (!is_pm && s.size() > 9 && s.substr(0, 9) == "dlstatus:");
                     if (!is_pm && !is_dl) continue;
@@ -3768,7 +3783,6 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
                         }
                     } catch (...) {}
                 }
-                fclose(f);
             });
 
             int status = 0;
@@ -3777,7 +3791,6 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             reader_thread.join();
             stderr_reader.join();
 
-            (void)local_deb_mounts;
             manage_sandbox("delete");
 
             if (!waited) {
@@ -3798,21 +3811,19 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
 
             std::cout << render_weld_progress(100, "Verifying Transaction") << "\n\n";
 
-            if (!g_assume_yes.load()) {
+            if (!g_assume_yes) {
                 std::print("Sandbox verification passed without errors.\n");
                 std::print("The transaction is now ready to be applied to the host system.\n");
                 std::print("Do you wish to continue? [Y/n] ");
                 std::string confirm;
                 std::getline(std::cin, confirm);
-                if (confirm != "y" && confirm != "Y") {
+                if (!confirm.empty() && confirm != "y" && confirm != "Y") {
                     g_config_backup.restore_orig();
                     std::print("Transaction aborted by user.\n");
                     return;
                 }
             }
         } else {
-            if (have_pipe) { close(apt_pipe[0]); close(apt_pipe[1]); }
-            if (have_err)  { close(err_pipe[0]); close(err_pipe[1]); }
             std::print("\033[1;31mE:\033[0m Unable to fork process for sandbox verification.\n");
             return;
         }
@@ -3827,7 +3838,7 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
     bool snapshot_created = create_snapshot("apt-pre");
     g_config_backup.apply_new();
 
-    std::string kver = trim_copy(exec_argv_capture({"uname", "-r"}));
+    std::string kver = trim(exec_argv_capture({"uname", "-r"}));
     if (!kver.empty()) {
         std::string src = "/lib/modules/" + kver;
         std::string dst = "/var/tmp/.arvor_kmodules_" + kver;
@@ -3842,19 +3853,24 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
 
     std::cout << render_weld_progress(0, "Applying Transaction") << std::flush;
 
-    int host_pipe[2];
+    int host_pipe[2] = {-1, -1};
     bool have_host_pipe = (pipe(host_pipe) == 0);
+    FdGuard host_read{have_host_pipe ? host_pipe[0] : -1};
+    FdGuard host_write{have_host_pipe ? host_pipe[1] : -1};
     int host_err[2] = {-1, -1};
     bool have_host_err = (pipe2(host_err, O_CLOEXEC) == 0);
+    FdGuard host_err_read{have_host_err ? host_err[0] : -1};
+    FdGuard host_err_write{have_host_err ? host_err[1] : -1};
 
-    // fcntl locks belong to the process that took them: the child's apt would
-    // collide with the parent's dpkg lock, so release it for the transaction.
     release_system_locks();
 
     pid_t host_pid = fork();
     if (host_pid == 0) {
         int devnull_r = open("/dev/null", O_RDONLY);
-        if (devnull_r >= 0) { dup2(devnull_r, STDIN_FILENO); close(devnull_r); }
+        if (devnull_r >= 0) {
+            dup2(devnull_r, STDIN_FILENO);
+            close(devnull_r);
+        }
         int devnull_w = open("/dev/null", O_WRONLY);
         if (devnull_w >= 0) {
             dup2(devnull_w, STDOUT_FILENO);
@@ -3866,18 +3882,23 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             if (host_err[1] != STDERR_FILENO) close(host_err[1]);
         } else {
             int dn2 = open("/dev/null", O_WRONLY);
-            if (dn2 >= 0) { dup2(dn2, STDERR_FILENO); close(dn2); }
+            if (dn2 >= 0) {
+                dup2(dn2, STDERR_FILENO);
+                close(dn2);
+            }
         }
 
         int status_fd = -1;
         if (have_host_pipe) {
             close(host_pipe[0]);
-            if (host_pipe[1] != 3) { dup2(host_pipe[1], 3); close(host_pipe[1]); }
-            fcntl(3, F_SETFD, 0);
+            if (host_pipe[1] != 3) {
+                dup2(host_pipe[1], 3);
+                close(host_pipe[1]);
+            }
             status_fd = 3;
         }
 
-        for (int fd = 4; fd < 1024; ++fd) close(fd);
+        close_fds_above(4);
         sanitize_child_environment();
         setenv("DEBIAN_FRONTEND", "noninteractive", 1);
         bool ok = run_libapt_transaction(action, targets, status_fd, true);
@@ -3889,30 +3910,38 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
     int host_status = 0;
     bool host_ok = false;
     if (host_pid > 0) {
-        if (have_host_pipe) close(host_pipe[1]);
-        if (have_host_err) close(host_err[1]);
+        host_write.reset();
+        host_err_write.reset();
 
         std::atomic<int> host_percent(-1);
         std::string host_stderr_output;
-        std::thread host_err_reader([&]() {
-            if (!have_host_err) return;
-            char buf[256];
-            ssize_t n;
-            while ((n = read(host_err[0], buf, sizeof(buf) - 1)) > 0) {
-                buf[n] = '\0';
-                host_stderr_output += buf;
+
+        std::jthread host_err_reader([&host_stderr_output, rfd = host_err_read.release()] {
+            if (rfd < 0) return;
+            std::array<char, 256> buf{};
+            for (;;) {
+                ssize_t n = read(rfd, buf.data(), buf.size());
+                if (n > 0) {
+                    host_stderr_output.append(buf.data(), static_cast<std::size_t>(n));
+                    continue;
+                }
+                if (n < 0 && errno == EINTR) continue;
+                break;
             }
-            close(host_err[0]);
+            close(rfd);
         });
 
-        std::thread host_reader([&]() {
-            if (!have_host_pipe) return;
-            FILE* f = fdopen(host_pipe[0], "r");
-            if (!f) { close(host_pipe[0]); return; }
-            char line[512];
+        std::jthread host_reader([&host_percent, rfd = host_read.release()] {
+            if (rfd < 0) return;
+            FilePtr f{fdopen(rfd, "r")};
+            if (!f) {
+                close(rfd);
+                return;
+            }
+            std::array<char, 512> line{};
             int last_shown = -1;
-            while (fgets(line, sizeof(line), f) != nullptr) {
-                std::string s(line);
+            while (fgets(line.data(), static_cast<int>(line.size()), f.get()) != nullptr) {
+                std::string s(line.data());
                 bool is_pm = (s.size() > 9 && s.substr(0, 9) == "pmstatus:");
                 bool is_dl = (!is_pm && s.size() > 9 && s.substr(0, 9) == "dlstatus:");
                 if (!is_pm && !is_dl) continue;
@@ -3933,7 +3962,6 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
                     }
                 } catch (...) {}
             }
-            fclose(f);
         });
 
         wait_for_child(host_pid, host_status);
@@ -3945,9 +3973,6 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             if (host_stderr_output.back() != '\n') std::print("\n");
             std::print("---------------------------------------\n");
         }
-    } else {
-        if (have_host_pipe) { close(host_pipe[0]); close(host_pipe[1]); }
-        if (have_host_err) { close(host_err[0]); close(host_err[1]); }
     }
     check_system_locks(true);
 
@@ -3998,22 +4023,23 @@ void perform_global_upgrade(bool apply_host) {
         std::string local_path;
         if (!cache_weld_package(candidate, local_path)) return;
         if (candidate.sha256.empty()) {
-            exec_argv_devnull_out({"rm", "-f", local_path});
+            std::error_code rm_ec;
+            fs::remove(local_path, rm_ec);
             std::print("W: No SHA256 checksum found in metadata for {}, skipping.\n", pkg_name);
             return;
-        } else {
-            std::string h = calculate_sha256(local_path);
-            if (h != candidate.sha256) {
-                exec_argv_devnull_out({"rm", "-f", local_path});
-                std::print("E: Checksum mismatch for {}, skipping.\n", pkg_name);
-                return;
-            }
+        }
+        std::string h = calculate_sha256(local_path);
+        if (h != candidate.sha256) {
+            std::error_code rm_ec;
+            fs::remove(local_path, rm_ec);
+            std::print("E: Checksum mismatch for {}, skipping.\n", pkg_name);
+            return;
         }
         std::print("Queuing weld upgrade: {}", pkg_name);
         if (!installed_version.empty()) std::print(" ({} -> {})", installed_version, candidate.version);
         else std::print(" ({})", candidate.version);
         std::print("\n");
-        weld_upgrade_args.push_back(local_path);
+        weld_upgrade_args.push_back(std::move(local_path));
     };
 
     std::set<std::string> handled_pkgs;
@@ -4021,7 +4047,10 @@ void perform_global_upgrade(bool apply_host) {
         if (repo.required_packages.empty()) continue;
         std::string already_installed_req;
         for (const auto& req : repo.required_packages) {
-            if (!get_installed_version(req).empty()) { already_installed_req = req; break; }
+            if (!get_installed_version(req).empty()) {
+                already_installed_req = req;
+                break;
+            }
         }
         if (!already_installed_req.empty()) {
             std::string iv = get_installed_version(already_installed_req);
@@ -4060,7 +4089,7 @@ void perform_global_upgrade(bool apply_host) {
     for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
         if (pkg->CurrentVer == 0) continue;
         std::string pkg_name = pkg.Name();
-        if (handled_pkgs.count(pkg_name)) continue;
+        if (handled_pkgs.contains(pkg_name)) continue;
         AptPackageState apt_state = get_apt_package_state(cache_file, pkg_name);
         try_queue_weld_upgrade(pkg_name, apt_state.installed_version);
     }
@@ -4075,7 +4104,10 @@ void perform_global_upgrade(bool apply_host) {
 }
 
 void perform_upgrade_transaction(const std::vector<std::string>& pkgs, bool apply_host) {
-    if (pkgs.empty()) { perform_global_upgrade(apply_host); return; }
+    if (pkgs.empty()) {
+        perform_global_upgrade(apply_host);
+        return;
+    }
     perform_install_transaction(pkgs, apply_host, true);
 }
 
@@ -4084,8 +4116,9 @@ PrecheckResult precheck_transaction(const std::string& action, const std::vector
         pkgCacheFile probe_cache_file;
         pkgCache* probe_cache = probe_cache_file.GetPkgCache();
         pkgDepCache* probe_dep_cache = probe_cache_file.GetDepCache();
-        if (probe_cache == nullptr || probe_dep_cache == nullptr)
+        if (probe_cache == nullptr || probe_dep_cache == nullptr) {
             return PrecheckResult::Proceed;
+        }
 
         bool upgrade_ok = (action == "upgrade")
             ? APT::Upgrade::Upgrade(*probe_dep_cache,
@@ -4104,8 +4137,9 @@ PrecheckResult precheck_transaction(const std::string& action, const std::vector
         return PrecheckResult::Proceed;
     }
 
-    if (action != "install" && action != "remove" && action != "purge")
+    if (action != "install" && action != "remove" && action != "purge") {
         return PrecheckResult::Proceed;
+    }
 
     if (pkgs.empty()) {
         if (!quiet) log_error("no packages were specified.");
@@ -4116,8 +4150,9 @@ PrecheckResult precheck_transaction(const std::string& action, const std::vector
     pkgCache* cache = cache_file.GetPkgCache();
     pkgDepCache* dep_cache = cache_file.GetDepCache();
 
-    if (cache == nullptr || dep_cache == nullptr)
+    if (cache == nullptr || dep_cache == nullptr) {
         return PrecheckResult::Proceed;
+    }
 
     bool has_changes = false;
 
@@ -4149,7 +4184,10 @@ PrecheckResult precheck_transaction(const std::string& action, const std::vector
 }
 
 int run_search(const std::vector<std::string>& terms, int page) {
-    if (terms.empty()) { std::print("Usage: weld search <term> [-p <page>]\n"); return 1; }
+    if (terms.empty()) {
+        std::print("Usage: weld search <term> [-p <page>]\n");
+        return 1;
+    }
     if (page < 1) page = 1;
     std::string term = to_lower_copy(terms[0]);
     const int page_size = 30;
@@ -4157,16 +4195,17 @@ int run_search(const std::vector<std::string>& terms, int page) {
 
     pkgCacheFile cache_file;
     pkgCache* cache = cache_file.GetPkgCache();
-    if (cache == nullptr) { _error->DumpErrors(); return 1; }
+    if (cache == nullptr) {
+        _error->DumpErrors();
+        return 1;
+    }
 
     int matches = 0;
     int shown = 0;
-    std::set<std::string> seen_names;
 
     for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
         std::string name = pkg.Name();
         if (to_lower_copy(name).find(term) == std::string::npos) continue;
-        if (!seen_names.insert(name).second) continue;
         int index = matches;
         ++matches;
         if (index < offset || shown >= page_size) continue;
@@ -4250,8 +4289,9 @@ int show_package_info(const std::string& pkg_name) {
             if (repo.base_url == weld_cand.base_url && repo.release == weld_cand.release) {
                 if (!repo.name.empty()) std::print("Repo Name:   {}\n", repo.name);
                 if (!repo.maintainer.empty()) std::print("Maintainer:  {}\n", repo.maintainer);
-                if (!repo.trusted_comment.empty())
+                if (!repo.trusted_comment.empty()) {
                     std::print("Signature:   {}verified{} ({})\n", kDim, kReset, repo.trusted_comment);
+                }
                 break;
             }
         }
@@ -4275,47 +4315,6 @@ int list_installed_packages() {
     }
     std::print("\nTotal installed packages: {}\n", count);
     return 0;
-}
-
-bool check_system_locks(bool quiet = false) {
-    int fd = open("/var/lib/dpkg/lock-frontend", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0640);
-    if (fd < 0) {
-        if (!quiet) log_error("cannot open /var/lib/dpkg/lock-frontend");
-        return false;
-    }
-    struct flock fl{};
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-    if (fcntl(fd, F_SETLK, &fl) == -1) {
-        close(fd);
-        if (!quiet) {
-            log_error("dpkg lock (/var/lib/dpkg/lock-frontend) is currently held by another process.");
-            std::print(stderr, "Please wait for the background package operation to complete.\n");
-        }
-        return false;
-    }
-    if (!quiet && report_dpkg_db_lock_busy()) {
-        close(fd);
-        return false;
-    }
-    int old_fd = g_dpkg_lock_fd.exchange(fd);
-    if (old_fd >= 0) close(old_fd);
-    return true;
-}
-
-void release_system_locks() {
-    int fd = g_dpkg_lock_fd.exchange(-1);
-    if (fd >= 0) {
-        struct flock fl{};
-        fl.l_type = F_UNLCK;
-        fl.l_whence = SEEK_SET;
-        fl.l_start = 0;
-        fl.l_len = 0;
-        fcntl(fd, F_SETLK, &fl);
-        close(fd);
-    }
 }
 
 int show_package_why(const std::string& pkg_name) {
@@ -4365,7 +4364,7 @@ int show_package_why(const std::string& pkg_name) {
 
     if (rev_count == 0) {
         std::print("  {}No installed packages depend on '{}'. It was likely installed manually or as a top-level requirement.{}\n",
-            kGray, pkg_name, kReset);
+                   kGray, pkg_name, kReset);
     } else if (rev_count == 1) {
         std::print("\nRequired by 1 currently installed package.\n");
     } else {
@@ -4389,7 +4388,7 @@ int show_package_depends(const std::string& pkg_name) {
         return 1;
     }
 
-    pkgCache::VerIterator ver = target_pkg.CurrentVer() != 0 ? target_pkg.CurrentVer() : target_pkg.VersionList();
+    pkgCache::VerIterator ver = target_pkg->CurrentVer != 0 ? target_pkg.CurrentVer() : target_pkg.VersionList();
     if (ver.end()) {
         log_error(std::format("no versions available for package '{}'.", pkg_name));
         return 1;
@@ -4414,6 +4413,45 @@ int show_package_depends(const std::string& pkg_name) {
     return 0;
 }
 
+bool check_system_locks(bool quiet) {
+    FdGuard fd{open("/var/lib/dpkg/lock-frontend", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0640)};
+    if (!fd) {
+        if (!quiet) log_error("cannot open /var/lib/dpkg/lock-frontend");
+        return false;
+    }
+    struct flock fl{};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    if (fcntl(fd.get(), F_SETLK, &fl) == -1) {
+        if (!quiet) {
+            log_error("dpkg lock (/var/lib/dpkg/lock-frontend) is currently held by another process.");
+            std::print(stderr, "Please wait for the background package operation to complete.\n");
+        }
+        return false;
+    }
+    if (!quiet && report_dpkg_db_lock_busy()) {
+        return false;
+    }
+    int old_fd = g_dpkg_lock_fd.exchange(fd.release());
+    if (old_fd >= 0) close(old_fd);
+    return true;
+}
+
+void release_system_locks() {
+    int fd = g_dpkg_lock_fd.exchange(-1);
+    if (fd >= 0) {
+        struct flock fl{};
+        fl.l_type = F_UNLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;
+        fl.l_len = 0;
+        fcntl(fd, F_SETLK, &fl);
+        close(fd);
+    }
+}
+
 void do_transaction_rollback() {
     std::print("Querying available recovery snapshots for rollback...\n");
     std::string latest_snap = get_latest_snapshot("apt-pre");
@@ -4429,7 +4467,7 @@ void do_transaction_rollback() {
     std::print("Are you sure you want to rollback to this snapshot? [Y/n] ");
     std::string confirm;
     std::getline(std::cin, confirm);
-    if (confirm == "y" || confirm == "Y") {
+    if (confirm.empty() || confirm == "y" || confirm == "Y") {
         do_rollback("apt-pre");
     } else {
         std::print("Rollback cancelled.\n");
@@ -4480,7 +4518,7 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
     } else if (action == "install") {
         pkgProblemResolver fixer(dep_cache);
         for (const auto& pkg_name : pkgs) {
-            if (ends_with(pkg_name, ".deb")) {
+            if (pkg_name.ends_with(".deb")) {
                 if (!path_is_regular_file(pkg_name)) {
                     log_error(std::format("unable to locate local package file: {}", pkg_name));
                     had_error = true;
@@ -4510,7 +4548,7 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
                 AptPackageState target_apt_state = (weld_candidate.is_replacement)
                     ? get_apt_package_state(cache_file, weld_candidate.actual_pkg_name)
                     : apt_state;
-                if (target_apt_state.installed && !g_force_reinstall.load()
+                if (target_apt_state.installed && !g_force_reinstall
                     && compare_versions(target_apt_state.installed_version, weld_candidate.version) >= 0) {
                     extra_lines.push_back(weld_candidate.actual_pkg_name + " is already up to date ("
                         + weld_candidate.version + ") via Weld.");
@@ -4519,7 +4557,7 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
                 std::string line = "Inst " + weld_candidate.actual_pkg_name + " (";
                 if (target_apt_state.installed) line += target_apt_state.installed_version + " => ";
                 line += weld_candidate.version + ") from Weld repository " + weld_candidate.base_url;
-                extra_lines.push_back(line);
+                extra_lines.push_back(std::move(line));
                 continue;
             }
 
@@ -4529,7 +4567,7 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
                 continue;
             }
 
-            if (apt_state.installed && !g_force_reinstall.load()
+            if (apt_state.installed && !g_force_reinstall
                 && compare_versions(apt_state.installed_version, apt_state.candidate_version) >= 0) {
                 extra_lines.push_back(pkg_name + " is already the newest version ("
                     + apt_state.installed_version + ").");
@@ -4539,7 +4577,7 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
             pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
             fixer.Clear(pkg);
             fixer.Protect(pkg);
-            if (g_force_reinstall.load()) dep_cache->SetReInstall(pkg, true);
+            if (g_force_reinstall) dep_cache->SetReInstall(pkg, true);
             dep_cache->MarkInstall(pkg, true);
         }
         if (!fixer.Resolve(true) || _error->PendingError()) {
@@ -4594,57 +4632,84 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
 
 int main(int argc, char** argv) {
     setup_safety_handlers();
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    ERR_load_crypto_strings();
-    OpenSSL_add_all_digests();
-    pkgInitConfig(*_config);
-    pkgInitSystem(*_config, _system);
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        log_error("failed to initialize libcurl.");
+        return 1;
+    }
+    if (!pkgInitConfig(*_config)) {
+        log_error("failed to initialize the APT configuration.");
+        return 1;
+    }
+    if (!pkgInitSystem(*_config, _system)) {
+        log_error("failed to initialize the APT package system.");
+        return 1;
+    }
 
     std::string command;
     std::vector<std::string> pkgs;
     bool apply_host = false;
     int search_page = 1;
-    std::string arv_version = read_arvor_version_from_os_release();
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") { show_help(); return 0; }
-        else if (arg == "--v" || arg == "-v" || arg == "--version") {
+        if (arg == "-h" || arg == "--help") {
+            show_help();
+            return 0;
+        } else if (arg == "--v" || arg == "-v" || arg == "--version") {
             std::print("{}\n", weld_version_str());
             return 0;
-        }
-        else if (arg == "--vb") { _config->Set("Debug::pkgAcquire", "true"); }
-        else if (arg == "--apply-host") { apply_host = true; }
-        else if (arg == "-y" || arg == "--yes" || arg == "--assume-yes") { g_assume_yes.store(true); }
-        else if (arg == "--reinstall") { g_force_reinstall.store(true); }
-        else if (arg == "-s" || arg == "--simulate" || arg == "--dry-run" || arg == "--just-print") {
-            g_simulate_mode.store(true);
-        }
-        else if (arg == "-p" && i + 1 < argc) {
-            try { search_page = std::stoi(argv[++i]); } catch (...) { search_page = 1; }
-        }
-        else if (command.empty() && !arg.empty() && arg[0] != '-') { command = arg; }
-        else if (!arg.empty() && arg[0] != '-') {
-            if (!is_valid_package_name(arg) && !ends_with(arg, ".deb")) {
+        } else if (arg == "--vb") {
+            _config->Set("Debug::pkgAcquire", "true");
+        } else if (arg == "--apply-host") {
+            apply_host = true;
+        } else if (arg == "-y" || arg == "--yes" || arg == "--assume-yes") {
+            g_assume_yes = true;
+        } else if (arg == "--reinstall") {
+            g_force_reinstall = true;
+        } else if (arg == "-s" || arg == "--simulate" || arg == "--dry-run" || arg == "--just-print") {
+            g_simulate_mode = true;
+        } else if (arg == "-p" && i + 1 < argc) {
+            try {
+                search_page = std::stoi(argv[++i]);
+            } catch (...) {
+                search_page = 1;
+            }
+        } else if (command.empty() && !arg.empty() && arg[0] != '-') {
+            command = arg;
+        } else if (!arg.empty() && arg[0] != '-') {
+            if (!is_valid_package_name(arg) && !arg.ends_with(".deb")) {
                 log_error(std::format("invalid package name: {}", arg));
                 return 1;
             }
-            pkgs.push_back(arg);
+            pkgs.push_back(std::move(arg));
         }
     }
 
-    if (command.empty()) { show_help(); return 0; }
+    if (command.empty()) {
+        show_help();
+        return 0;
+    }
 
     if (command == "why") {
-        if (pkgs.empty()) { std::print("Usage: weld why <package_name>\n"); return 1; }
+        if (pkgs.empty()) {
+            std::print("Usage: weld why <package_name>\n");
+            return 1;
+        }
         return show_package_why(pkgs[0]);
     }
     if (command == "depends" || command == "deps") {
-        if (pkgs.empty()) { std::print("Usage: weld depends <package_name>\n"); return 1; }
+        if (pkgs.empty()) {
+            std::print("Usage: weld depends <package_name>\n");
+            return 1;
+        }
         return show_package_depends(pkgs[0]);
     }
     if (command == "info" || command == "show") {
-        if (pkgs.empty()) { std::print("Usage: weld info <package_name>\n"); return 1; }
+        if (pkgs.empty()) {
+            std::print("Usage: weld info <package_name>\n");
+            return 1;
+        }
         return show_package_info(pkgs[0]);
     }
     if (command == "list" || command == "list-installed") {
@@ -4654,18 +4719,30 @@ int main(int argc, char** argv) {
         return run_search(pkgs, search_page);
     }
 
-    if (g_simulate_mode.load()) {
-        if (command == "install") { simulate_transaction("install", pkgs); return 0; }
+    if (g_simulate_mode) {
+        if (command == "install") {
+            simulate_transaction("install", pkgs);
+            return 0;
+        }
         if (command == "upgrade") {
             if (pkgs.empty()) simulate_transaction("upgrade", pkgs);
             else simulate_transaction("install", pkgs);
             return 0;
         }
-        if (command == "dist-upgrade") { simulate_transaction("dist-upgrade", pkgs); return 0; }
-        if (command == "remove" || command == "purge") { simulate_transaction(command, pkgs); return 0; }
+        if (command == "dist-upgrade") {
+            simulate_transaction("dist-upgrade", pkgs);
+            return 0;
+        }
+        if (command == "remove" || command == "purge") {
+            simulate_transaction(command, pkgs);
+            return 0;
+        }
     }
 
-    if (geteuid() != 0) { log_error("root privileges required."); return 1; }
+    if (geteuid() != 0) {
+        log_error("root privileges required.");
+        return 1;
+    }
 
     if (!check_system_locks()) return 1;
 
@@ -4696,19 +4773,20 @@ int main(int argc, char** argv) {
         do_transaction_rollback();
     } else if (command == "dist-upgrade") {
 #ifdef nflinux
-        do_nflinux_upgrade(apply_host, arv_version);
+        auto arv_version = read_arvor_version_from_os_release();
+        if (!arv_version) {
+            log_error("cannot determine the Arvor Linux version (" + arv_version.error() + ").");
+            return 1;
+        }
+        do_nflinux_upgrade(apply_host, *arv_version);
 #else
-        (void)arv_version;
         perform_transaction("dist-upgrade", pkgs, apply_host);
 #endif
     } else if (command == "install") {
-        (void)arv_version;
         perform_install_transaction(pkgs, apply_host);
     } else if (command == "upgrade") {
-        (void)arv_version;
         perform_upgrade_transaction(pkgs, apply_host);
     } else if (command == "remove" || command == "purge") {
-        (void)arv_version;
         perform_transaction(command, pkgs, apply_host);
     } else {
         log_error(std::format("unknown command: {}", command));
@@ -4717,8 +4795,6 @@ int main(int argc, char** argv) {
     }
 
     curl_global_cleanup();
-    EVP_cleanup();
-    ERR_free_strings();
     release_system_locks();
     return 0;
 }
