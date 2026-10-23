@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -213,7 +214,7 @@
 #if defined(weld_contracts)
 #define WELD_CONTRACT(cond) contract_assert(cond)
 #else
-#define WELD_CONTRACT(cond) ((void)sizeof(cond))
+#define WELD_CONTRACT(cond) assert(cond)
 #endif
 
 namespace fs = std::filesystem;
