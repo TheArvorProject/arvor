@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -211,11 +210,9 @@
 #define CAP_SETFCAP 31
 #endif
 
-#if defined(weld_contracts)
+// Invariant checks on pure helpers. Contracts are mandatory, not a build
+// option: the compiler must be invoked with -fcontracts (enforce mode).
 #define WELD_CONTRACT(cond) contract_assert(cond)
-#else
-#define WELD_CONTRACT(cond) assert(cond)
-#endif
 
 namespace fs = std::filesystem;
 
