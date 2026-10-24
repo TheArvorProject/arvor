@@ -320,6 +320,7 @@ constexpr std::string_view kWeldSourcesFile = "/etc/weld/sources.list";
 constexpr std::string_view kWeldSourcesDir = "/etc/weld/sources.list.d";
 constexpr std::string_view kWeldCacheDir = "/etc/weld/cache";
 constexpr std::string_view kWeldTrustedKeysDir = "/etc/weld/trusted_keys";
+constexpr std::string_view kWeldPackagesFile = "/etc/weld/packages.weld";
 
 constexpr std::size_t kWeldMinMemMb = 256;
 constexpr std::size_t kWeldMaxMetadataSize = 8ULL * 1024 * 1024;
@@ -333,6 +334,7 @@ const std::string g_weld_sources_file{kWeldSourcesFile};
 const std::string g_weld_sources_dir{kWeldSourcesDir};
 const std::string g_weld_cache_dir{kWeldCacheDir};
 const std::string g_weld_trusted_keys_dir{kWeldTrustedKeysDir};
+const std::string g_weld_packages_file{kWeldPackagesFile};
 
 bool g_assume_yes = false;
 bool g_force_reinstall = false;
@@ -480,6 +482,62 @@ bool is_valid_package_name(std::string_view name) {
         }
     }
     if (name.find("..") != std::string_view::npos) return false;
+    return true;
+}
+
+struct PackageSpec {
+    std::string name;
+    std::string version;
+    std::string arch;
+
+    [[nodiscard]] bool has_version() const noexcept { return !version.empty(); }
+    [[nodiscard]] std::string cache_lookup_name() const {
+        if (arch.empty() || arch == "all" || arch == "any" || arch == "source") return name;
+        return name + ":" + arch;
+    }
+    [[nodiscard]] std::string apt_argument() const {
+        std::string q = cache_lookup_name();
+        if (!version.empty()) q += "=" + version;
+        return q;
+    }
+};
+
+// Parses "name", "name=version" or "name=version_arch" (e.g. "apt=3.0.3_amd64").
+// Returns false for local .deb paths and malformed specs.
+bool parse_package_spec(std::string_view raw, PackageSpec& out) {
+    out = {};
+    if (raw.empty() || raw.size() > 512) return false;
+    if (raw.ends_with(".deb")) return false;
+    auto eq = raw.find('=');
+    if (eq == std::string_view::npos) {
+        if (!is_valid_package_name(raw)) return false;
+        out.name = std::string{raw};
+        return true;
+    }
+    std::string_view name = raw.substr(0, eq);
+    std::string_view rest = raw.substr(eq + 1);
+    if (!is_valid_package_name(name)) return false;
+    if (rest.empty() || rest.size() > 256) return false;
+    for (char c : rest) {
+        if (c == '=' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\0' || c == '/' || c == ':') return false;
+    }
+    out.name = std::string{name};
+    static constexpr std::array<std::string_view, 12> kKnownArches = {
+        "amd64", "arm64", "i386", "armhf", "armel", "riscv64",
+        "ppc64el", "s390x", "x32", "all", "any", "source",
+    };
+    auto us = rest.rfind('_');
+    if (us != std::string_view::npos && us > 0 && us + 1 < rest.size()) {
+        std::string_view maybe_arch = rest.substr(us + 1);
+        for (std::string_view a : kKnownArches) {
+            if (a == maybe_arch) {
+                out.version = std::string{rest.substr(0, us)};
+                out.arch = std::string{maybe_arch};
+                break;
+            }
+        }
+    }
+    if (out.version.empty()) out.version = std::string{rest};
     return true;
 }
 
@@ -1569,6 +1627,7 @@ void show_help() {
 
     std::print("{}Transaction Commands:{}\n", kHdr, kReset);
     std::print("  {}install{}       <pkgs...>   Install packages or local .deb archives\n", kTx, kReset);
+    std::print("        {}version pins: pkg=1.2.3 or pkg=1.2.3_amd64{}\n", kDim, kReset);
     std::print("  {}remove{}        <pkgs...>   Remove packages from the system\n", kTx, kReset);
     std::print("  {}purge{}         <pkgs...>   Remove packages along with their configuration files\n", kTx, kReset);
     std::print("  {}upgrade{}       [pkgs...]   Upgrade all packages, or only those specified\n", kTx, kReset);
@@ -2179,11 +2238,36 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
 
     if (action == "install") {
         for (const auto& t : targets) {
-            std::string pkg_name = t.ends_with(".deb") ? local_pkg_names[t] : t;
+            std::string pkg_name;
+            PackageSpec spec;
+            bool is_spec = false;
+            if (t.ends_with(".deb")) {
+                pkg_name = local_pkg_names[t];
+            } else if (parse_package_spec(t, spec)) {
+                is_spec = true;
+                pkg_name = spec.cache_lookup_name();
+            } else {
+                pkg_name = t;
+            }
             pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
             if (pkg.end()) {
                 if (!quiet) log_error(std::format("package {} not found", pkg_name));
                 return false;
+            }
+            if (is_spec && spec.has_version()) {
+                bool matched = false;
+                for (pkgCache::VerIterator v = pkg.VersionList(); !v.end(); ++v) {
+                    if (spec.version == v.VerStr()) {
+                        dep_cache->SetCandidateVersion(v);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    if (!quiet) log_error(std::format("version {} is not available for package {}",
+                                                      spec.version, spec.name));
+                    return false;
+                }
             }
             fixer.Clear(pkg);
             fixer.Protect(pkg);
@@ -2197,7 +2281,9 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
         }
     } else if (action == "remove" || action == "purge") {
         bool purge = (action == "purge");
-        for (const auto& pkg_name : targets) {
+        for (const auto& pkg_target : targets) {
+            PackageSpec spec;
+            std::string pkg_name = parse_package_spec(pkg_target, spec) ? spec.name : pkg_target;
             pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
             if (pkg.end()) continue;
             fixer.Clear(pkg);
@@ -2349,6 +2435,147 @@ std::vector<WeldSource> load_weld_sources() {
     }
     return sources;
 #endif
+}
+
+void append_apt_list_file(const std::string& path, std::vector<std::string>& out) {
+    std::string content;
+    if (!read_text_file(path, content)) return;
+    std::istringstream ss(content);
+    std::string line;
+    while (std::getline(ss, line)) {
+        std::string l = trim(line);
+        if (l.empty() || l.starts_with('#')) continue;
+        if (l.starts_with("deb ") || l.starts_with("deb\t")) out.push_back(l);
+    }
+}
+
+void append_deb822_sources(const std::string& content, std::vector<std::string>& out) {
+    std::istringstream ss(content);
+    std::string line;
+    std::vector<std::string> uris, suites, components;
+    bool enabled = true;
+    auto flush = [&]() {
+        if (enabled) {
+            for (const auto& u : uris) {
+                for (const auto& s : suites) {
+                    std::string entry = "deb " + trim(u) + " " + trim(s);
+                    for (const auto& c : components) entry += " " + trim(c);
+                    if (std::find(out.begin(), out.end(), entry) == out.end()) out.push_back(entry);
+                }
+            }
+        }
+        uris.clear();
+        suites.clear();
+        components.clear();
+        enabled = true;
+    };
+    while (std::getline(ss, line)) {
+        std::string l = trim(line);
+        if (l.empty()) { flush(); continue; }
+        if (l.starts_with('#')) continue;
+        auto colon = l.find(':');
+        if (colon == std::string::npos) continue;
+        std::string field = to_lower_copy(l.substr(0, colon));
+        std::string value = trim(l.substr(colon + 1));
+        if (field == "types") {
+            enabled = false;
+            std::istringstream vs(value);
+            std::string v;
+            while (vs >> v) {
+                if (to_lower_copy(v) == "deb") { enabled = true; break; }
+            }
+        } else if (field == "uris") {
+            std::istringstream vs(value);
+            std::string v;
+            while (vs >> v) uris.push_back(v);
+        } else if (field == "suites") {
+            std::istringstream vs(value);
+            std::string v;
+            while (vs >> v) suites.push_back(v);
+        } else if (field == "components") {
+            std::istringstream vs(value);
+            std::string v;
+            while (vs >> v) components.push_back(v);
+        } else if (field == "enabled") {
+            std::string lv = to_lower_copy(value);
+            if (lv == "no" || lv == "false") enabled = false;
+        }
+    }
+    flush();
+}
+
+std::vector<std::string> collect_apt_sources_lines() {
+    std::vector<std::string> out;
+    append_apt_list_file("/etc/apt/sources.list", out);
+    if (path_is_directory("/etc/apt/sources.list.d")) {
+        DirPtr dir{opendir("/etc/apt/sources.list.d")};
+        if (dir) {
+            std::vector<std::string> files;
+            for (struct dirent* entry = readdir(dir.get()); entry != nullptr;
+                 entry = readdir(dir.get())) {
+                std::string name = entry->d_name;
+                if (name == "." || name == "..") continue;
+                files.push_back(std::move(name));
+            }
+            std::ranges::sort(files);
+            for (const auto& name : files) {
+                std::string path = "/etc/apt/sources.list.d/" + name;
+                if (name.ends_with(".sources")) {
+                    std::string content;
+                    if (read_text_file(path, content)) append_deb822_sources(content, out);
+                } else if (name.ends_with(".list")) {
+                    append_apt_list_file(path, out);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+void regenerate_packages_manifest() {
+    pkgCacheFile cache_file;
+    pkgCache* cache = cache_file.GetPkgCache();
+    if (cache == nullptr) return;
+
+    struct ManifestEntry {
+        std::string name;
+        std::string version;
+        std::string arch;
+    };
+    std::vector<ManifestEntry> entries;
+    for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
+        if (pkg->CurrentVer == 0) continue;
+        std::string name = pkg.Name();
+        if (name.empty()) continue;
+        pkgCache::VerIterator ver = pkg.CurrentVer();
+        ManifestEntry e;
+        e.name = name;
+        e.version = ver.VerStr();
+        e.arch = pkg.Arch();
+        entries.push_back(std::move(e));
+    }
+    std::ranges::sort(entries, [](const ManifestEntry& a, const ManifestEntry& b) { return a.name < b.name; });
+
+    std::string out = "# auto-generated by weld\nWld.st\n";
+    out += "\ngroup weld.repositories\n";
+    for (const auto& s : load_weld_sources()) {
+        out += std::format("    \"deb {} {}\"\n", s.base_url, s.release);
+    }
+    out += "end\n";
+    out += "\ngroup apt.repositories\n";
+    for (const auto& l : collect_apt_sources_lines()) {
+        out += std::format("    \"{}\"\n", l);
+    }
+    out += "end\n";
+    for (const auto& e : entries) {
+        out += std::format("\ngroup {}\n    Name: {}\n    Version: {}\n    Architecture: {}\nend\n",
+                           e.name, e.name, e.version, e.arch);
+    }
+    out += "Wld.end\n";
+
+    if (!write_text_file(g_weld_packages_file, out)) {
+        log_warning("could not update " + g_weld_packages_file);
+    }
 }
 
 bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& metadata, std::string& error_out) {
@@ -3295,30 +3522,30 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
     bool had_error = false;
     std::vector<PendingWeldDownload> pending_weld_downloads;
 
-    for (const auto& pkg_name : pkgs) {
-        if (pkg_name.ends_with(".deb")) {
-            if (pkg_name.find("..") != std::string::npos || pkg_name.find('\0') != std::string::npos) {
-                if (!quiet) log_error(std::format("suspicious path traversal in: {}", pkg_name));
+    for (const auto& pkg_target : pkgs) {
+        if (pkg_target.ends_with(".deb")) {
+            if (pkg_target.find("..") != std::string::npos || pkg_target.find('\0') != std::string::npos) {
+                if (!quiet) log_error(std::format("suspicious path traversal in: {}", pkg_target));
                 had_error = true;
                 continue;
             }
-            FdGuard probe_fd{open_no_follow(pkg_name, O_RDONLY)};
+            FdGuard probe_fd{open_no_follow(pkg_target, O_RDONLY)};
             if (!probe_fd) {
-                if (!quiet) log_error(std::format("unable to locate local package file: {}", pkg_name));
+                if (!quiet) log_error(std::format("unable to locate local package file: {}", pkg_target));
                 had_error = true;
                 continue;
             }
             struct stat st{};
             bool is_regular = (fstat(probe_fd.get(), &st) == 0 && S_ISREG(st.st_mode));
             if (!is_regular) {
-                if (!quiet) log_error(std::format("local package is not a regular file: {}", pkg_name));
+                if (!quiet) log_error(std::format("local package is not a regular file: {}", pkg_target));
                 had_error = true;
                 continue;
             }
             std::error_code ec;
-            fs::path abs_path = fs::absolute(pkg_name, ec);
+            fs::path abs_path = fs::absolute(pkg_target, ec);
             if (!ec) abs_path = fs::weakly_canonical(abs_path, ec);
-            std::string resolved_path = ec ? pkg_name : abs_path.string();
+            std::string resolved_path = ec ? pkg_target : abs_path.string();
 
             InstallDecision decision;
             decision.package_name = resolved_path;
@@ -3329,6 +3556,8 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
             continue;
         }
 
+        PackageSpec spec;
+        const std::string pkg_name = parse_package_spec(pkg_target, spec) ? spec.name : pkg_target;
         AptPackageState apt_state = get_apt_package_state(cache_file, pkg_name);
         WeldPackageCandidate weld_candidate = find_best_weld_candidate(repos, pkg_name);
 
@@ -3340,7 +3569,9 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
 
         bool use_weld = false;
         if (weld_candidate.found) {
-            if (weld_candidate.is_replacement) use_weld = true;
+            if (spec.has_version()) {
+                if (compare_versions(weld_candidate.version, spec.version) == 0) use_weld = true;
+            } else if (weld_candidate.is_replacement) use_weld = true;
             else if (!apt_state.found || apt_state.candidate_version.empty()) use_weld = true;
             else if (compare_versions(weld_candidate.version, apt_state.candidate_version) > 0) use_weld = true;
         }
@@ -3364,16 +3595,18 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
             continue;
         }
 
-        if (apt_state.installed && !g_force_reinstall
-            && compare_versions(apt_state.installed_version, apt_state.candidate_version) >= 0) {
-            if (!quiet) print_install_already_present_message(pkg_name, is_upgrade);
-            continue;
+        if (apt_state.installed && !g_force_reinstall) {
+            const std::string& target_version = spec.has_version() ? spec.version : apt_state.candidate_version;
+            if (compare_versions(apt_state.installed_version, target_version) >= 0) {
+                if (!quiet) print_install_already_present_message(pkg_name, is_upgrade);
+                continue;
+            }
         }
 
         InstallDecision decision;
         decision.package_name = pkg_name;
-        decision.apt_argument = pkg_name;
-        decision.selected_version = apt_state.candidate_version;
+        decision.apt_argument = spec.has_version() ? spec.apt_argument() : pkg_name;
+        decision.selected_version = spec.has_version() ? spec.version : apt_state.candidate_version;
         decision.from_weld = false;
         decisions.push_back(std::move(decision));
     }
@@ -3448,7 +3681,9 @@ void print_successful_install(const std::string& action, const std::vector<std::
     bool printed_any = false;
     for (const auto& t : targets) {
         if (t.ends_with(".deb")) continue;
-        pkgCache::PkgIterator pkg = cache->FindPkg(t);
+        PackageSpec spec;
+        std::string pkg_name = parse_package_spec(t, spec) ? spec.cache_lookup_name() : t;
+        pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
         if (pkg.end() || pkg->CurrentVer == 0) continue;
         pkgCache::VerIterator ver = pkg.CurrentVer();
         std::string version = ver.VerStr();
@@ -3978,6 +4213,7 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
         std::cout << render_weld_progress(100, "Applying Transaction") << "\n\n";
         create_snapshot("apt-post");
         print_successful_install(action, targets);
+        regenerate_packages_manifest();
     } else {
         std::print("\n\033[1;31mE:\033[0m Host transaction failed. Rolling back to previous snapshot...\n");
         g_config_backup.restore_orig();
@@ -4154,14 +4390,30 @@ PrecheckResult precheck_transaction(const std::string& action, const std::vector
 
     bool has_changes = false;
 
-    for (const auto& pkg_name : pkgs) {
-        pkgCache::PkgIterator pkg = cache->FindPkg(pkg_name);
+    for (const auto& pkg_target : pkgs) {
+        PackageSpec spec;
+        bool is_spec = parse_package_spec(pkg_target, spec);
+        std::string pkg_name = is_spec ? spec.name : pkg_target;
+        pkgCache::PkgIterator pkg = cache->FindPkg(is_spec ? spec.cache_lookup_name() : pkg_target);
         if (pkg.end()) {
             if (!quiet) log_error(std::format("package {} not found", pkg_name));
             return PrecheckResult::Failed;
         }
 
         if (action == "install") {
+            if (is_spec && spec.has_version()) {
+                bool available = false;
+                for (pkgCache::VerIterator v = pkg.VersionList(); !v.end(); ++v) {
+                    if (v.VerStr() == spec.version) { available = true; break; }
+                }
+                if (!available) {
+                    if (!quiet) log_error(std::format("version {} is not available for package {}",
+                                                      spec.version, spec.name));
+                    return PrecheckResult::Failed;
+                }
+                has_changes = true;
+                continue;
+            }
             pkgCache::VerIterator cand = dep_cache->GetCandidateVersion(pkg);
             if (pkg->CurrentVer != 0 && (cand.end() || cand == pkg.CurrentVer())) {
                 if (!quiet) std::print("{} is already the newest version.\n", pkg_name);
@@ -4676,7 +4928,8 @@ int main(int argc, char** argv) {
         } else if (command.empty() && !arg.empty() && arg[0] != '-') {
             command = arg;
         } else if (!arg.empty() && arg[0] != '-') {
-            if (!is_valid_package_name(arg) && !arg.ends_with(".deb")) {
+            PackageSpec spec;
+            if (!arg.ends_with(".deb") && !parse_package_spec(arg, spec)) {
                 log_error(std::format("invalid package name: {}", arg));
                 return 1;
             }
@@ -4750,7 +5003,7 @@ int main(int argc, char** argv) {
             pkgCacheFile cache_file;
             pkgSourceList* src_list = cache_file.GetSourceList();
             if (src_list != nullptr) {
-                WeldSyncStatus status("Syncing Debian Repositories");
+                WeldSyncStatus status("Syncing APT Repositories");
                 apt_ok = ListUpdate(status, *src_list);
                 if (!apt_ok) _error->DumpErrors();
             } else {
