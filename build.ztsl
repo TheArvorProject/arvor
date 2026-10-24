@@ -17,13 +17,11 @@ func "weld"
 sys.exec # compiles weld
 ```shell
 
- g++ -std=c++26 -O2 \
-    -Dallow_weld_repositories \
-    -Dnflinux \
-    usr/bin/weld.cpp -o ./usr/bin/weld \
-    -lapt-pkg -lcurl \
-    -freflection -fcontracts -O2 -Wall -Wextra \
-    -static-libgcc -static-libstdc++ \
+g++-16 -std=c++26 -O2 -fcontracts -Wall -Wextra \
+  -Dallow_weld_repositories -Dnflinux \
+  -static-libstdc++ -static-libgcc \
+  -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
+  -o weld weld.cpp -lapt-pkg -lcurl -lssl -lcrypto
 
 ```
 }
