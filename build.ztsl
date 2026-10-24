@@ -5,6 +5,7 @@
 # this code also can be compiled as an ELF and an .c,but it is not tha case here.
 # Hludwig (@hludwig-nf)
 # use it with ztc -ztv=p26
+# Minimum requirements: Debian 14 (Forky/Sid) with GCC 16.
 ztsl.start # start
 }
 func "nsm" 
