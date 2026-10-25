@@ -18,7 +18,7 @@ The system relies on a custom infrastructure to handle updates, snapshots, and s
 - **arvor-guard**: Background service monitoring Thin Pool storage, preventing out-of-space lockups by auto-cleaning stale snapshots.
 - **Weld**: C++26 transactional package manager featuring multithreading, package redirection, and pre-transaction snapshots.
 - **nsm**: Snapshot Manager responsible for creating, managing, and restoring system states.
-- **nflxs**: Container manager with Docker Hub integration..
+- **nflxs**: Container manager with Docker Hub integration.
 
 ---
 
@@ -36,7 +36,7 @@ arvorctl mark-ok
 
 ## Package Manager (`weld`)
 
-`weld` is the native package manager written in C++. It handles metadata synchronization, parallel downloads, and repository rules with built-in security hardening.
+`weld` is the native package manager written in C++26. It handles metadata synchronization, parallel downloads, and repository rules with built-in security hardening.
 
 **Features:**
 - Multi-threaded metadata sync and `.deb` batch downloading.
