@@ -210,8 +210,6 @@
 #define CAP_SETFCAP 31
 #endif
 
-// Invariant checks on pure helpers. Contracts are mandatory, not a build
-// option: the compiler must be invoked with -fcontracts (enforce mode).
 #define WELD_CONTRACT(cond) contract_assert(cond)
 
 namespace fs = std::filesystem;
@@ -310,7 +308,7 @@ void log_warning(std::string_view msg) {
 
 namespace {
 
-constexpr std::string_view kWeldVersion = "5.1";
+constexpr std::string_view kWeldVersion = "5.2";
 constexpr std::string_view kTreeRoot = "/nsm/weld/root";
 constexpr std::string_view kNfTreeBin = "/usr/bin/nsm";
 constexpr std::string_view kAutoSnapDir = "/nsm/snapshots/auto";
@@ -502,8 +500,6 @@ struct PackageSpec {
     }
 };
 
-// Parses "name", "name=version" or "name=version_arch" (e.g. "apt=3.0.3_amd64").
-// Returns false for local .deb paths and malformed specs.
 bool parse_package_spec(std::string_view raw, PackageSpec& out) {
     out = {};
     if (raw.empty() || raw.size() > 512) return false;
@@ -1627,7 +1623,6 @@ void show_help() {
 
     std::print("{}Transaction Commands:{}\n", kHdr, kReset);
     std::print("  {}install{}       <pkgs...>   Install packages or local .deb archives\n", kTx, kReset);
-    std::print("        {}version pins: pkg=1.2.3 or pkg=1.2.3_amd64{}\n", kDim, kReset);
     std::print("  {}remove{}        <pkgs...>   Remove packages from the system\n", kTx, kReset);
     std::print("  {}purge{}         <pkgs...>   Remove packages along with their configuration files\n", kTx, kReset);
     std::print("  {}upgrade{}       [pkgs...]   Upgrade all packages, or only those specified\n", kTx, kReset);
@@ -2532,29 +2527,261 @@ std::vector<std::string> collect_apt_sources_lines() {
     return out;
 }
 
-void regenerate_packages_manifest() {
+struct ManifestTargetName {
+    std::string name;
+    std::string arch;
+};
+
+struct ManifestPackageInfo {
+    std::string name;
+    std::string version;
+    std::string arch;
+    bool installed = false;
+};
+
+std::vector<ManifestTargetName> manifest_resolve_targets(const std::vector<std::string>& targets) {
+    std::vector<ManifestTargetName> out;
+    for (const auto& t : targets) {
+        if (t.empty()) continue;
+        if (t.ends_with(".deb")) {
+            std::string deb_name = local_deb_package_name(t);
+            if (!deb_name.empty()) out.push_back({std::move(deb_name), ""});
+            continue;
+        }
+        std::string base = t;
+        auto eq = base.find('=');
+        if (eq != std::string::npos) base = base.substr(0, eq);
+        if (base.empty() || base.front() == '/') continue;
+        if (base.find("..") != std::string::npos) continue;
+        auto colon = base.find(':');
+        if (colon != std::string::npos && colon > 0 && colon + 1 < base.size()) {
+            out.push_back({base.substr(0, colon), base.substr(colon + 1)});
+            continue;
+        }
+        PackageSpec spec;
+        if (parse_package_spec(t, spec)) {
+            out.push_back({spec.name, spec.arch});
+            continue;
+        }
+        if (is_valid_package_name(base)) out.push_back({base, ""});
+    }
+    return out;
+}
+
+bool manifest_current_state(pkgCache* cache, const std::string& name, const std::string& arch_hint,
+                            ManifestPackageInfo& info) {
+    if (cache == nullptr || name.empty()) return false;
+    std::array<std::string, 2> lookups{name, name};
+    if (!arch_hint.empty() && arch_hint != "all" && arch_hint != "any") {
+        lookups[0] = name + ":" + arch_hint;
+    }
+    for (const auto& lookup : lookups) {
+        pkgCache::PkgIterator pkg = cache->FindPkg(lookup);
+        if (pkg.end()) continue;
+        info = ManifestPackageInfo{};
+        info.name = name;
+        if (pkg->CurrentVer != 0) {
+            info.installed = true;
+            info.version = pkg.CurrentVer().VerStr();
+            info.arch = pkg.Arch();
+        }
+        return true;
+    }
+    return false;
+}
+
+std::string format_manifest_group_body(const std::string& name, const std::string& version,
+                                       const std::string& arch) {
+    return std::format("group {}\n    Name: {}\n    Version: {}\n    Architecture: {}\nend",
+                       name, name, version, arch);
+}
+
+void split_manifest_lines(const std::string& content, std::vector<std::string>& out) {
+    out.clear();
+    std::string current;
+    for (char c : content) {
+        if (c == '\n') {
+            out.push_back(current);
+            current.clear();
+        } else {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty()) out.push_back(current);
+}
+
+bool merge_packages_manifest(pkgCache* cache, const std::string& existing,
+                             const std::string& action, const std::vector<ManifestTargetName>& targets) {
+    if (trim(existing).empty()) return false;
+
+    std::vector<std::string> lines;
+    split_manifest_lines(existing, lines);
+
+    struct GroupSpan {
+        std::string name;
+        std::size_t begin = 0;
+        std::size_t end = 0;
+    };
+    std::vector<GroupSpan> groups;
+    bool in_group = false;
+    GroupSpan span;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        std::string t = trim(lines[i]);
+        if (!in_group) {
+            if (!t.starts_with("group") || t.size() == 5) continue;
+            char sep = t[5];
+            if (sep != ' ' && sep != '\t') continue;
+            std::string rest = trim(t.substr(6));
+            if (rest.empty()) continue;
+            span = GroupSpan{rest, i, i};
+            in_group = true;
+        } else if (t == "end") {
+            span.end = i;
+            groups.push_back(span);
+            in_group = false;
+        }
+    }
+    if (in_group) {
+        span.end = lines.empty() ? 0 : lines.size() - 1;
+        groups.push_back(span);
+    }
+    if (groups.empty()) return true;
+
+    auto is_reserved_group = [](const std::string& n) {
+        return n == "weld.repositories" || n == "apt.repositories";
+    };
+
+    std::map<std::string, std::string> upserts;
+    std::set<std::string> drops;
+
+    if (action == "upgrade" || action == "dist-upgrade") {
+        for (const auto& g : groups) {
+            if (is_reserved_group(g.name)) continue;
+            ManifestPackageInfo info;
+            if (!manifest_current_state(cache, g.name, "", info)) continue;
+            if (info.installed) {
+                upserts[g.name] = format_manifest_group_body(g.name, info.version, info.arch);
+            } else {
+                drops.insert(g.name);
+            }
+        }
+    } else {
+        for (const auto& t : targets) {
+            ManifestPackageInfo info;
+            if (!manifest_current_state(cache, t.name, t.arch, info)) continue;
+            if (info.installed) {
+                upserts[t.name] = format_manifest_group_body(t.name, info.version, info.arch);
+            } else {
+                drops.insert(t.name);
+            }
+        }
+    }
+
+    for (auto it = drops.begin(); it != drops.end();) {
+        if (upserts.contains(*it)) {
+            it = drops.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (upserts.empty() && drops.empty()) return true;
+
+    std::set<std::string> existing_names;
+    for (const auto& g : groups) existing_names.insert(g.name);
+    std::vector<std::string> new_names;
+    for (const auto& [group_name, body] : upserts) {
+        if (!existing_names.contains(group_name)) new_names.push_back(group_name);
+    }
+
+    std::vector<std::string> out;
+    out.reserve(lines.size() + new_names.size() * 6);
+
+    auto push_block = [&](const std::string& body) {
+        std::vector<std::string> block;
+        split_manifest_lines(body, block);
+        for (auto& l : block) out.push_back(std::move(l));
+    };
+
+    for (std::size_t i = 0; i < groups.front().begin; ++i) out.push_back(lines[i]);
+    std::size_t cursor = groups.front().begin;
+    std::size_t next_new = 0;
+    bool prev_dropped = false;
+
+    for (const auto& g : groups) {
+        if (drops.contains(g.name)) {
+            cursor = g.end + 1;
+            prev_dropped = true;
+            continue;
+        }
+        std::size_t gap_from = cursor;
+        if (prev_dropped) {
+            while (gap_from < g.begin && trim(lines[gap_from]).empty()) ++gap_from;
+        }
+        prev_dropped = false;
+        for (std::size_t i = gap_from; i < g.begin; ++i) out.push_back(lines[i]);
+        if (!is_reserved_group(g.name)) {
+            while (next_new < new_names.size() && new_names[next_new] < g.name) {
+                if (!out.empty() && !out.back().empty()) out.push_back("");
+                push_block(upserts.at(new_names[next_new]));
+                out.push_back("");
+                ++next_new;
+            }
+        }
+        auto it = upserts.find(g.name);
+        if (it != upserts.end()) {
+            push_block(it->second);
+        } else {
+            for (std::size_t i = g.begin; i <= g.end; ++i) out.push_back(lines[i]);
+        }
+        cursor = g.end + 1;
+    }
+
+    for (; next_new < new_names.size(); ++next_new) {
+        if (!out.empty() && !out.back().empty()) out.push_back("");
+        push_block(upserts.at(new_names[next_new]));
+    }
+
+    for (std::size_t i = cursor; i < lines.size(); ++i) out.push_back(lines[i]);
+
+    while (!out.empty() && out.back().empty()) out.pop_back();
+    if (out.empty()) return true;
+
+    std::string merged;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (i > 0) merged.push_back('\n');
+        merged += out[i];
+    }
+    merged.push_back('\n');
+
+    if (merged == existing) return true;
+    if (!write_text_file(g_weld_packages_file, merged)) {
+        log_warning("could not update " + g_weld_packages_file);
+    }
+    return true;
+}
+
+void regenerate_packages_manifest(const std::string& action, const std::vector<std::string>& targets) {
     pkgCacheFile cache_file;
     pkgCache* cache = cache_file.GetPkgCache();
     if (cache == nullptr) return;
 
-    struct ManifestEntry {
-        std::string name;
-        std::string version;
-        std::string arch;
-    };
-    std::vector<ManifestEntry> entries;
-    for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
-        if (pkg->CurrentVer == 0) continue;
-        std::string name = pkg.Name();
-        if (name.empty()) continue;
-        pkgCache::VerIterator ver = pkg.CurrentVer();
-        ManifestEntry e;
-        e.name = name;
-        e.version = ver.VerStr();
-        e.arch = pkg.Arch();
-        entries.push_back(std::move(e));
+    std::vector<ManifestTargetName> resolved = manifest_resolve_targets(targets);
+
+    if (path_is_regular_file(g_weld_packages_file)) {
+        std::string existing;
+        if (read_text_file(g_weld_packages_file, existing)
+            && merge_packages_manifest(cache, existing, action, resolved)) {
+            return;
+        }
     }
-    std::ranges::sort(entries, [](const ManifestEntry& a, const ManifestEntry& b) { return a.name < b.name; });
+
+    std::map<std::string, ManifestPackageInfo> touched;
+    for (const auto& t : resolved) {
+        ManifestPackageInfo info;
+        if (!manifest_current_state(cache, t.name, t.arch, info)) continue;
+        if (!info.installed) continue;
+        touched[info.name] = info;
+    }
 
     std::string out = "# auto-generated by weld\nWld.st\n";
     out += "\ngroup weld.repositories\n";
@@ -2567,9 +2794,9 @@ void regenerate_packages_manifest() {
         out += std::format("    \"{}\"\n", l);
     }
     out += "end\n";
-    for (const auto& e : entries) {
+    for (const auto& [name, info] : touched) {
         out += std::format("\ngroup {}\n    Name: {}\n    Version: {}\n    Architecture: {}\nend\n",
-                           e.name, e.name, e.version, e.arch);
+                           name, name, info.version, info.arch);
     }
     out += "Wld.end\n";
 
@@ -4213,7 +4440,7 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
         std::cout << render_weld_progress(100, "Applying Transaction") << "\n\n";
         create_snapshot("apt-post");
         print_successful_install(action, targets);
-        regenerate_packages_manifest();
+        regenerate_packages_manifest(action, targets);
     } else {
         std::print("\n\033[1;31mE:\033[0m Host transaction failed. Rolling back to previous snapshot...\n");
         g_config_backup.restore_orig();
