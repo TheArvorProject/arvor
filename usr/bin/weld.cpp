@@ -2579,15 +2579,11 @@ bool manifest_current_state(pkgCache* cache, const std::string& name, const std:
         pkgCache::PkgIterator pkg = cache->FindPkg(lookup);
         if (pkg.end()) continue;
         info = ManifestPackageInfo{};
-        // A chave do grupo no manifest é sempre o nome canônico do pacote no
-        // cache do APT (ex.: "libc6:amd64"), garantindo que a geração completa
-        // e as edições incrementais referenciem exatamente o mesmo grupo.
-        const char* canonical = pkg.Name();
-        info.name = (canonical != nullptr && *canonical != '\0') ? canonical : name;
+        info.name = name;
         if (pkg->CurrentVer != 0) {
             info.installed = true;
-            info.version = pkg.CurrentVer().VerStr() != nullptr ? pkg.CurrentVer().VerStr() : "";
-            info.arch = pkg.Arch() != nullptr ? pkg.Arch() : "";
+            info.version = pkg.CurrentVer().VerStr();
+            info.arch = pkg.Arch();
         }
         return true;
     }
@@ -2649,11 +2645,7 @@ bool merge_packages_manifest(pkgCache* cache, const std::string& existing,
         span.end = lines.empty() ? 0 : lines.size() - 1;
         groups.push_back(span);
     }
-    if (groups.empty()) {
-        // Manifest sem nenhum grupo válido: trata como inexistente para que a
-        // lista completa seja (re)gerada a partir do estado do sistema.
-        return false;
-    }
+    if (groups.empty()) return true;
 
     auto is_reserved_group = [](const std::string& n) {
         return n == "weld.repositories" || n == "apt.repositories";
@@ -2668,24 +2660,20 @@ bool merge_packages_manifest(pkgCache* cache, const std::string& existing,
             ManifestPackageInfo info;
             if (!manifest_current_state(cache, g.name, "", info)) continue;
             if (info.installed) {
-                upserts[info.name] = format_manifest_group_body(info.name, info.version, info.arch);
+                upserts[g.name] = format_manifest_group_body(g.name, info.version, info.arch);
             } else {
-                drops.insert(info.name);
+                drops.insert(g.name);
             }
-            // Renormaliza grupos gravados sem o nome canônico do cache.
-            if (info.name != g.name) drops.insert(g.name);
         }
     } else {
         for (const auto& t : targets) {
             ManifestPackageInfo info;
             if (!manifest_current_state(cache, t.name, t.arch, info)) continue;
             if (info.installed) {
-                upserts[info.name] = format_manifest_group_body(info.name, info.version, info.arch);
+                upserts[t.name] = format_manifest_group_body(t.name, info.version, info.arch);
             } else {
-                drops.insert(info.name);
+                drops.insert(t.name);
             }
-            // Renormaliza grupos gravados sem o nome canônico do cache.
-            if (info.name != t.name) drops.insert(t.name);
         }
     }
 
@@ -2779,9 +2767,6 @@ void regenerate_packages_manifest(const std::string& action, const std::vector<s
 
     std::vector<ManifestTargetName> resolved = manifest_resolve_targets(targets);
 
-    // Manifest já existe: apenas edita os grupos desta transação (adiciona ou
-    // atualiza os pacotes baixados e remove os desinstalados), sem reescrever
-    // a lista inteira.
     if (path_is_regular_file(g_weld_packages_file)) {
         std::string existing;
         if (read_text_file(g_weld_packages_file, existing)
@@ -2790,31 +2775,13 @@ void regenerate_packages_manifest(const std::string& action, const std::vector<s
         }
     }
 
-    // Primeira geração (ou manifest inválido): monta a lista completa a partir
-    // do estado instalado do sistema. O cache do APT reflete o dpkg status,
-    // ou seja, a mesma informação de `dpkg -l`, mas lida direto em memória —
-    // sem fork, sem parse textual e com as versões reais pós-transação.
-    struct InstalledEntry {
-        std::string name;
-        std::string version;
-        std::string arch;
-    };
-    std::vector<InstalledEntry> installed;
-    installed.reserve(4096);
-    for (pkgCache::PkgIterator pkg = cache->PkgBegin(); !pkg.end(); ++pkg) {
-        if (pkg->CurrentVer == 0) continue;  // apenas instalados ("ii" no dpkg -l)
-        const char* name = pkg.Name();
-        if (name == nullptr || *name == '\0') continue;
-        const char* ver = pkg.CurrentVer().VerStr();
-        const char* arch = pkg.Arch();
-        installed.push_back(InstalledEntry{
-            name,
-            (ver != nullptr ? ver : ""),
-            (arch != nullptr ? arch : "")});
+    std::map<std::string, ManifestPackageInfo> touched;
+    for (const auto& t : resolved) {
+        ManifestPackageInfo info;
+        if (!manifest_current_state(cache, t.name, t.arch, info)) continue;
+        if (!info.installed) continue;
+        touched[info.name] = info;
     }
-    std::ranges::sort(installed, [](const InstalledEntry& a, const InstalledEntry& b) {
-        return a.name < b.name;
-    });
 
     std::string out = "# auto-generated by weld\nWld.st\n";
     out += "\ngroup weld.repositories\n";
@@ -2827,9 +2794,9 @@ void regenerate_packages_manifest(const std::string& action, const std::vector<s
         out += std::format("    \"{}\"\n", l);
     }
     out += "end\n";
-    for (const auto& e : installed) {
+    for (const auto& [name, info] : touched) {
         out += std::format("\ngroup {}\n    Name: {}\n    Version: {}\n    Architecture: {}\nend\n",
-                           e.name, e.name, e.version, e.arch);
+                           name, name, info.version, info.arch);
     }
     out += "Wld.end\n";
 
