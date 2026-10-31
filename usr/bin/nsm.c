@@ -1,34 +1,55 @@
 #define _GNU_SOURCE
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <unistd.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
-#include <sys/mount.h>
-#include <fcntl.h>
 #include <time.h>
-#include <stdbool.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdarg.h>
+#include <unistd.h>
 
-#define SNAPSHOT_BASE           "/nsm/snapshots"
-#define AUTO_DIR                "/nsm/snapshots/auto"
-#define DAEMON_AUTO_DIR         "/nsm/snapshots/auto/daemon"
-#define MANUAL_DIR              "/nsm/snapshots/manual"
-#define ROOT_SOURCE             "/"
-#define HOME_SOURCE             "/home"
-#define STR_BUF                 512
-#define PATH_BUF                1024
-#define META_FILE               "meta"
-#define OUT_BUF                 8192
-#define MAX_ARGV                32
+#define NSM_BASE         "/nsm"
+#define SNAPSHOT_BASE    NSM_BASE "/snapshots"
+#define AUTO_DIR         SNAPSHOT_BASE "/auto"
+#define DAEMON_AUTO_DIR  AUTO_DIR "/daemon"
+#define MANUAL_DIR       SNAPSHOT_BASE "/manual"
+#define ROOT_SOURCE      "/"
+#define HOME_SOURCE      "/home"
+#define META_FILE        "meta"
+
+#define STR_BUF          512
+#define PATH_BUF         1024
+#define OUT_BUF          8192
+#define BIG_OUT_BUF      (1024 * 1024)
+
+#define KEEP_LATEST      6
+#define THINPOOL_LIMIT   93.0
+#define LV_NAME_MAX      127
+#define USER_NAME_MAX    64
+#define TS_LEN           19
+#define MAX_HOLDERS      4096
+#define EVICT_ATTEMPTS   5
+#define GIB              1073741824.0
+
+static const char *const SNAPSHOT_DIRS[] = { MANUAL_DIR, AUTO_DIR, DAEMON_AUTO_DIR };
+#define N_SNAPSHOT_DIRS  (sizeof(SNAPSHOT_DIRS) / sizeof(SNAPSHOT_DIRS[0]))
+
+static const char *const AUTO_DIRS[] = { AUTO_DIR, DAEMON_AUTO_DIR };
+#define N_AUTO_DIRS      (sizeof(AUTO_DIRS) / sizeof(AUTO_DIRS[0]))
 
 typedef struct {
-    int rc;
+    int  rc;
+    bool truncated;
     char out[OUT_BUF];
 } CmdResult;
 
@@ -53,12 +74,18 @@ typedef struct {
     char snapshot_lvpath[PATH_BUF];
 } SnapshotMeta;
 
-typedef struct {
-    char name[STR_BUF];
-    char dir[PATH_BUF];
-    char lvpath[PATH_BUF];
-    unsigned long long size;
-} SnapSizeInfo;
+typedef struct { char **v; size_t n, cap; } StrList;
+typedef struct { StrList roots, homes; } SnapNames;
+
+__attribute__((format(printf, 3, 4)))
+static bool fmt(char *dst, size_t sz, const char *f, ...)
+{
+    va_list ap;
+    va_start(ap, f);
+    int n = vsnprintf(dst, sz, f, ap);
+    va_end(ap);
+    return n >= 0 && (size_t)n < sz;
+}
 
 static void trim(char *s)
 {
@@ -69,123 +96,171 @@ static void trim(char *s)
     if (i > 0) memmove(s, s + i, strlen(s + i) + 1);
 }
 
-static int exec_abs_argv(char *const argv[])
+static bool valid_name(const char *s, size_t max)
 {
-    if (!argv || !argv[0]) return -1;
+    size_t len = strlen(s);
+    if (len == 0 || len > max || s[0] == '.') return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!isalnum(c) && c != '_' && c != '.' && c != '+' && c != '-') return false;
+    }
+    return true;
+}
+
+static const char *ts_part(const char *s)
+{
+    size_t n = strlen(s);
+    return n > TS_LEN ? s + n - TS_LEN : s;
+}
+
+static int cmp_by_timestamp(const void *a, const void *b)
+{
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+    int c = strcmp(ts_part(sa), ts_part(sb));
+    return c ? c : strcmp(sa, sb);
+}
+
+static bool strlist_push(StrList *l, const char *s)
+{
+    if (l->n == l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 16;
+        char **nv = realloc(l->v, nc * sizeof(*nv));
+        if (!nv) return false;
+        l->v = nv;
+        l->cap = nc;
+    }
+    char *d = strdup(s);
+    if (!d) return false;
+    l->v[l->n++] = d;
+    return true;
+}
+
+static void strlist_free(StrList *l)
+{
+    for (size_t i = 0; i < l->n; i++) free(l->v[i]);
+    free(l->v);
+    *l = (StrList){0};
+}
+
+static void strlist_sort(StrList *l)
+{
+    if (l->n > 1) qsort(l->v, l->n, sizeof(*l->v), cmp_by_timestamp);
+}
+
+static bool json_str(const char *json, const char *key, char *out, size_t sz)
+{
+    char pat[96];
+    if (!fmt(pat, sizeof(pat), "\"%s\"", key)) return false;
+
+    const char *p = json;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + strlen(pat);
+        p = q;
+        while (isspace((unsigned char)*q)) q++;
+        if (*q != ':') continue;
+        q++;
+        while (isspace((unsigned char)*q)) q++;
+        if (*q != '"') return false;
+        q++;
+
+        size_t n = 0;
+        while (*q && *q != '"') {
+            if (*q == '\\' && q[1]) q++;
+            if (n + 1 >= sz) return false;
+            out[n++] = *q++;
+        }
+        if (*q != '"') return false;
+        out[n] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static void exec_argv(const char *const argv[]) __attribute__((noreturn));
+static void exec_argv(const char *const argv[])
+{
+    char *const *av = (char *const *)argv;
+
     if (argv[0][0] == '/') {
-        execv(argv[0], argv);
+        execv(argv[0], av);
     } else {
-        const char *paths[] = {"/usr/bin", "/bin", "/usr/sbin", "/sbin"};
-        char fullpath[PATH_BUF];
-        for (size_t i = 0; i < 4; i++) {
-            snprintf(fullpath, sizeof(fullpath), "%s/%s", paths[i], argv[0]);
-            execv(fullpath, argv);
+        static const char *const dirs[] = { "/usr/bin", "/bin", "/usr/sbin", "/sbin" };
+        char full[PATH_BUF];
+        for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+            if (!fmt(full, sizeof(full), "%s/%s", dirs[i], argv[0])) continue;
+            execv(full, av);
+            if (errno != ENOENT && errno != ENOTDIR) break;
         }
     }
     _exit(127);
 }
 
-static int exec_capture(char *const argv[], char *out, size_t sz)
+static int spawn(const char *const argv[], char *out, size_t sz, bool *truncated, bool merge_err)
 {
-    int pfd[2];
-    if (pipe2(pfd, O_CLOEXEC) != 0) return -1;
+    int pfd[2] = { -1, -1 };
+    if (truncated) *truncated = false;
+
+    if (out && sz > 0) {
+        out[0] = '\0';
+        if (pipe2(pfd, O_CLOEXEC) != 0) return -1;
+    } else {
+        out = NULL;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
+        if (out) { close(pfd[0]); close(pfd[1]); }
         return -1;
     }
 
     if (pid == 0) {
-        close(pfd[0]);
-        dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
-        close(pfd[1]);
-        exec_abs_argv(argv);
-        _exit(127);
-    }
-
-    close(pfd[1]);
-    size_t total = 0;
-    ssize_t n;
-    while (total < sz - 1 &&
-           (n = read(pfd[0], out + total, sz - 1 - total)) > 0)
-        total += (size_t)n;
-    out[total] = '\0';
-    close(pfd[0]);
-
-    int st = 0;
-    waitpid(pid, &st, 0);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-}
-
-static int exec_silent(char *const argv[])
-{
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-
-    if (pid == 0) {
         int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
+        int so = out ? pfd[1] : devnull;
+        int se = (out && merge_err) ? pfd[1] : devnull;
+        if (so >= 0) dup2(so, STDOUT_FILENO);
+        if (se >= 0) dup2(se, STDERR_FILENO);
+        exec_argv(argv);
+    }
+
+    if (out) {
+        close(pfd[1]);
+        size_t total = 0;
+        char sink[512];
+        for (;;) {
+            bool full = total >= sz - 1;
+            ssize_t n = full ? read(pfd[0], sink, sizeof(sink))
+                             : read(pfd[0], out + total, sz - 1 - total);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            if (full) { if (truncated) *truncated = true; }
+            else total += (size_t)n;
         }
-        exec_abs_argv(argv);
-        _exit(127);
+        out[total] = '\0';
+        close(pfd[0]);
     }
 
     int st = 0;
-    waitpid(pid, &st, 0);
+    while (waitpid(pid, &st, 0) < 0)
+        if (errno != EINTR) return -1;
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-static CmdResult run_argv(char *const argv[])
+static CmdResult run_cmd(const char *const argv[], bool merge_err)
 {
-    CmdResult r = {-1, ""};
-    r.rc = exec_capture(argv, r.out, sizeof(r.out));
+    CmdResult r = { .rc = -1 };
+    r.rc = spawn(argv, r.out, sizeof(r.out), &r.truncated, merge_err);
     return r;
 }
 
-static CmdResult run_args(const char *first, ...)
-{
-    char *argv[MAX_ARGV];
-    int n = 0;
-    argv[n++] = (char *)first;
-
-    va_list ap;
-    va_start(ap, first);
-    const char *a;
-    while ((a = va_arg(ap, const char *)) != NULL && n < MAX_ARGV - 1)
-        argv[n++] = (char *)a;
-    va_end(ap);
-    argv[n] = NULL;
-
-    return run_argv(argv);
-}
-
-static int run_args_silent(const char *first, ...)
-{
-    char *argv[MAX_ARGV];
-    int n = 0;
-    argv[n++] = (char *)first;
-
-    va_list ap;
-    va_start(ap, first);
-    const char *a;
-    while ((a = va_arg(ap, const char *)) != NULL && n < MAX_ARGV - 1)
-        argv[n++] = (char *)a;
-    va_end(ap);
-    argv[n] = NULL;
-
-    return exec_silent(argv);
-}
+#define RUN(...)         run_cmd((const char *const[]){ __VA_ARGS__, NULL }, true)
+#define RUN_OUT(...)     run_cmd((const char *const[]){ __VA_ARGS__, NULL }, false)
+#define RUN_SILENT(...)  spawn((const char *const[]){ __VA_ARGS__, NULL }, NULL, 0, NULL, false)
 
 static bool ensure_dir(const char *path)
 {
     char tmp[PATH_BUF];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    if (!fmt(tmp, sizeof(tmp), "%s", path)) return false;
     size_t len = strlen(tmp);
     if (len == 0) return false;
     if (tmp[len - 1] == '/' && len > 1) tmp[--len] = '\0';
@@ -200,149 +275,178 @@ static bool ensure_dir(const char *path)
 
 static bool read_mount_field(const char *target, const char *field, char *out, size_t sz)
 {
-    CmdResult r = run_args("findmnt", "-no", field, "--target", target, NULL);
+    CmdResult r = RUN_OUT("findmnt", "-no", field, "--target", target);
     if (r.rc != 0) return false;
     trim(r.out);
     if (r.out[0] == '\0') return false;
-    snprintf(out, sz, "%s", r.out);
-    return true;
+    return fmt(out, sz, "%s", r.out);
+}
+
+static bool lvm_report(const char *tool, const char *target, const char *fields, CmdResult *r)
+{
+    *r = RUN_OUT(tool, "--reportformat", "json", "--units", "b", "--nosuffix",
+                 "-o", fields, target);
+    return r->rc == 0 && !r->truncated;
+}
+
+static bool lvm_field(const char *tool, const char *target, const char *field,
+                      char *out, size_t sz)
+{
+    CmdResult r;
+    return lvm_report(tool, target, field, &r) && json_str(r.out, field, out, sz);
 }
 
 static bool resolve_lvm_info(const char *source, LvmInfo *info)
 {
-    CmdResult r = run_args("lvs", "--noheadings", "--separator", "/",
-                           "-o", "vg_name,lv_name,segtype", source, NULL);
-    if (r.rc != 0) return false;
-    trim(r.out);
-    if (r.out[0] == '\0') return false;
-    char vg[STR_BUF] = "", lv[STR_BUF] = "", seg[STR_BUF] = "";
-    if (sscanf(r.out, "%511[^/]/%511[^/]/%511s", vg, lv, seg) != 3) return false;
-    trim(vg); trim(lv); trim(seg);
-    if (vg[0] == '\0' || lv[0] == '\0' || seg[0] == '\0') return false;
-    snprintf(info->vg,     sizeof(info->vg),     "%s", vg);
-    snprintf(info->lv,     sizeof(info->lv),     "%s", lv);
-    snprintf(info->segtype,sizeof(info->segtype), "%s", seg);
-    snprintf(info->lvpath, sizeof(info->lvpath),  "/dev/%s/%s", vg, lv);
+    CmdResult r;
+    char vg[STR_BUF], lv[STR_BUF], seg[STR_BUF];
+
+    if (!lvm_report("lvs", source, "vg_name,lv_name,segtype", &r)) return false;
+    if (!json_str(r.out, "vg_name", vg, sizeof(vg)) ||
+        !json_str(r.out, "lv_name", lv, sizeof(lv)) ||
+        !json_str(r.out, "segtype", seg, sizeof(seg)))
+        return false;
+    if (!vg[0] || !lv[0] || !seg[0]) return false;
+
+    memset(info, 0, sizeof(*info));
+    if (!fmt(info->vg, sizeof(info->vg), "%s", vg) ||
+        !fmt(info->lv, sizeof(info->lv), "%s", lv) ||
+        !fmt(info->segtype, sizeof(info->segtype), "%s", seg) ||
+        !fmt(info->lvpath, sizeof(info->lvpath), "/dev/%s/%s", vg, lv))
+        return false;
     info->is_thin = strstr(seg, "thin") != NULL;
     return true;
 }
 
 static double get_vg_free_gb(const char *vg)
 {
-    char out[256];
-    char *argv[] = {"vgs", "-o", "vg_free", "--noheadings", "--units", "g", (char *)vg, NULL};
-    if (exec_capture(argv, out, sizeof(out)) != 0) return 0.0;
-    trim(out);
-    double val = 0.0;
-    if (sscanf(out, "%lf", &val) != 1) return 0.0;
-    return val;
+    char val[64];
+    if (!lvm_field("vgs", vg, "vg_free", val, sizeof(val))) return 0.0;
+    return (double)strtoull(val, NULL, 10) / GIB;
 }
 
-
-static bool snapshot_mount_fstype(const char *mountpoint)
+static const char *classic_snapshot_size(double free_gb)
 {
+    if (free_gb >= 10.0) return "5G";
+    if (free_gb >= 5.0)  return "3G";
+    if (free_gb >= 2.0)  return "1.5G";
+    if (free_gb >= 1.0)  return "1G";
+    return NULL;
+}
+
+static bool fstype_supported(const char *mountpoint)
+{
+    static const char *const ok[] = { "xfs", "ext4", "ext3", "btrfs" };
     char fstype[64];
     if (!read_mount_field(mountpoint, "FSTYPE", fstype, sizeof(fstype))) return false;
-    return strcmp(fstype, "xfs") == 0  || strcmp(fstype, "ext4") == 0
-        || strcmp(fstype, "ext3") == 0 || strcmp(fstype, "btrfs") == 0;
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
+        if (strcmp(fstype, ok[i]) == 0) return true;
+    return false;
 }
 
-static bool freeze_mount(const char *mountpoint)
+static bool freeze_mount(const char *mp)   { return RUN("fsfreeze", "-f", mp).rc == 0; }
+static void unfreeze_mount(const char *mp) { RUN("fsfreeze", "-u", mp); }
+
+static bool delete_snapshot_lv(const char *lvpath)
 {
-    return run_args("fsfreeze", "-f", mountpoint, NULL).rc == 0;
+    return RUN("lvremove", "-fy", lvpath).rc == 0;
 }
 
-static void unfreeze_mount(const char *mountpoint)
+static bool lv_exists(const char *lvpath)
 {
-    run_args("fsfreeze", "-u", mountpoint, NULL);
+    return RUN_OUT("lvs", lvpath).rc == 0;
 }
+
+typedef struct { const char *key; size_t off; size_t size; } MetaField;
+
+#define MF(f) { #f, offsetof(SnapshotMeta, f), sizeof(((SnapshotMeta *)0)->f) }
+static const MetaField META_FIELDS[] = {
+    MF(kind), MF(type), MF(name), MF(timestamp),
+    MF(origin_mount), MF(origin_source), MF(origin_vg), MF(origin_lv),
+    MF(origin_lvpath), MF(snapshot_lvpath),
+};
+#undef MF
+#define N_META_FIELDS (sizeof(META_FIELDS) / sizeof(META_FIELDS[0]))
 
 static bool write_snapshot_meta(const char *dir, const SnapshotMeta *meta)
 {
     char path[PATH_BUF], tmp_path[PATH_BUF];
-    snprintf(path, sizeof(path), "%s/%s", dir, META_FILE);
-    snprintf(tmp_path, sizeof(tmp_path), "%s/%s.tmp.%d", dir, META_FILE, (int)getpid());
+    if (!fmt(path, sizeof(path), "%s/%s", dir, META_FILE) ||
+        !fmt(tmp_path, sizeof(tmp_path), "%s/%s.tmp.%d", dir, META_FILE, (int)getpid()))
+        return false;
+
     FILE *f = fopen(tmp_path, "w");
     if (!f) return false;
-    fprintf(f, "kind=%s\n",            meta->kind);
-    fprintf(f, "type=%s\n",            meta->type);
-    fprintf(f, "name=%s\n",            meta->name);
-    fprintf(f, "timestamp=%s\n",       meta->timestamp);
-    fprintf(f, "origin_mount=%s\n",    meta->origin_mount);
-    fprintf(f, "origin_source=%s\n",   meta->origin_source);
-    fprintf(f, "origin_vg=%s\n",       meta->origin_vg);
-    fprintf(f, "origin_lv=%s\n",       meta->origin_lv);
-    fprintf(f, "origin_lvpath=%s\n",   meta->origin_lvpath);
-    fprintf(f, "snapshot_lvpath=%s\n", meta->snapshot_lvpath);
-    fflush(f);
-    int fd = fileno(f);
-    if (fd >= 0) fsync(fd);
-    fclose(f);
-    if (rename(tmp_path, path) != 0) {
+
+    for (size_t i = 0; i < N_META_FIELDS; i++)
+        fprintf(f, "%s=%s\n", META_FIELDS[i].key,
+                (const char *)meta + META_FIELDS[i].off);
+
+    bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || rename(tmp_path, path) != 0) {
         unlink(tmp_path);
         return false;
     }
     return true;
 }
 
-static void set_meta_field(SnapshotMeta *meta, const char *key, const char *val)
-{
-    if (strcmp(key, "kind") == 0) snprintf(meta->kind, sizeof(meta->kind), "%s", val);
-    else if (strcmp(key, "type") == 0) snprintf(meta->type, sizeof(meta->type), "%s", val);
-    else if (strcmp(key, "name") == 0) snprintf(meta->name, sizeof(meta->name), "%s", val);
-    else if (strcmp(key, "timestamp") == 0) snprintf(meta->timestamp, sizeof(meta->timestamp), "%s", val);
-    else if (strcmp(key, "origin_mount") == 0) snprintf(meta->origin_mount, sizeof(meta->origin_mount), "%s", val);
-    else if (strcmp(key, "origin_source") == 0) snprintf(meta->origin_source, sizeof(meta->origin_source), "%s", val);
-    else if (strcmp(key, "origin_vg") == 0) snprintf(meta->origin_vg, sizeof(meta->origin_vg), "%s", val);
-    else if (strcmp(key, "origin_lv") == 0) snprintf(meta->origin_lv, sizeof(meta->origin_lv), "%s", val);
-    else if (strcmp(key, "origin_lvpath") == 0) snprintf(meta->origin_lvpath, sizeof(meta->origin_lvpath), "%s", val);
-    else if (strcmp(key, "snapshot_lvpath") == 0) snprintf(meta->snapshot_lvpath, sizeof(meta->snapshot_lvpath), "%s", val);
-}
-
 static bool read_snapshot_meta(const char *dir, SnapshotMeta *meta)
 {
     memset(meta, 0, sizeof(*meta));
     char path[PATH_BUF];
-    snprintf(path, sizeof(path), "%s/%s", dir, META_FILE);
+    if (!fmt(path, sizeof(path), "%s/%s", dir, META_FILE)) return false;
+
     FILE *f = fopen(path, "r");
     if (!f) return false;
+
     char line[PATH_BUF * 2];
-    while (fgets(line, sizeof(line), f)) {
+    bool ok = true;
+    while (ok && fgets(line, sizeof(line), f)) {
         trim(line);
         char *eq = strchr(line, '=');
         if (!eq) continue;
         *eq = '\0';
-        char *key = line, *val = eq + 1;
-        set_meta_field(meta, key, val);
+        const char *val = eq + 1;
+        for (size_t i = 0; i < N_META_FIELDS; i++) {
+            if (strcmp(line, META_FIELDS[i].key) != 0) continue;
+            ok = fmt((char *)meta + META_FIELDS[i].off, META_FIELDS[i].size, "%s", val);
+            break;
+        }
     }
     fclose(f);
-    return meta->kind[0] != '\0' && meta->snapshot_lvpath[0] != '\0';
+    return ok && meta->kind[0] != '\0' && meta->snapshot_lvpath[0] != '\0';
 }
 
 static void remove_snapshot_meta(const char *dir)
 {
     char path[PATH_BUF];
-    snprintf(path, sizeof(path), "%s/%s", dir, META_FILE);
-    unlink(path);
+    if (fmt(path, sizeof(path), "%s/%s", dir, META_FILE)) unlink(path);
     rmdir(dir);
 }
 
-static bool delete_snapshot_lv(const char *snapshot_lvpath)
+static bool remove_snapshot_at(const char *dir)
 {
-    return run_args("lvremove", "-fy", snapshot_lvpath, NULL).rc == 0;
+    SnapshotMeta meta;
+    if (read_snapshot_meta(dir, &meta) &&
+        !delete_snapshot_lv(meta.snapshot_lvpath) &&
+        lv_exists(meta.snapshot_lvpath)) {
+        fprintf(stderr, "Warning: failed to remove snapshot LV '%s'.\n", meta.snapshot_lvpath);
+        return false;
+    }
+    remove_snapshot_meta(dir);
+    return true;
 }
 
 static bool find_snapshot(const char *name, char *dir_out, size_t sz)
 {
-    const char *dirs[] = { MANUAL_DIR, AUTO_DIR, DAEMON_AUTO_DIR };
-    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-        char path[PATH_BUF], meta[PATH_BUF];
-        snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
-        snprintf(meta, sizeof(meta), "%s/%s", path, META_FILE);
-        if (access(meta, F_OK) == 0) {
-            snprintf(dir_out, sz, "%s", path);
-            return true;
-        }
+    if (!valid_name(name, STR_BUF - 1)) return false;
+    for (size_t i = 0; i < N_SNAPSHOT_DIRS; i++) {
+        char dir[PATH_BUF], meta[PATH_BUF];
+        if (!fmt(dir, sizeof(dir), "%s/%s", SNAPSHOT_DIRS[i], name) ||
+            !fmt(meta, sizeof(meta), "%s/%s", dir, META_FILE))
+            continue;
+        if (access(meta, F_OK) == 0) return fmt(dir_out, sz, "%s", dir);
     }
     return false;
 }
@@ -350,15 +454,16 @@ static bool find_snapshot(const char *name, char *dir_out, size_t sz)
 static bool delete_snapshot(const char *name)
 {
     char dir[PATH_BUF];
-    if (!find_snapshot(name, dir, sizeof(dir))) return false;
     SnapshotMeta meta;
+    if (!find_snapshot(name, dir, sizeof(dir))) return false;
     if (!read_snapshot_meta(dir, &meta)) return false;
-    if (!delete_snapshot_lv(meta.snapshot_lvpath)) return false;
-    char path[PATH_BUF];
-    snprintf(path, sizeof(path), "%s/%s", dir, META_FILE);
-    unlink(path);
-    rmdir(dir);
-    return true;
+    return remove_snapshot_at(dir);
+}
+
+static const char *snapshot_base_dir(const char *type, const char *name)
+{
+    if (strcmp(name, "nsmd") == 0) return DAEMON_AUTO_DIR;
+    return strcmp(type, "auto") == 0 ? AUTO_DIR : MANUAL_DIR;
 }
 
 static bool create_snapshot(const char *mountpoint, const char *prefix,
@@ -369,7 +474,7 @@ static bool create_snapshot(const char *mountpoint, const char *prefix,
         printf("Error: cannot resolve source for %s.\n", mountpoint);
         return false;
     }
-    if (!snapshot_mount_fstype(mountpoint)) {
+    if (!fstype_supported(mountpoint)) {
         printf("Error: %s filesystem is not supported (xfs/ext4/ext3/btrfs required).\n",
                mountpoint);
         return false;
@@ -380,46 +485,39 @@ static bool create_snapshot(const char *mountpoint, const char *prefix,
         return false;
     }
 
-    time_t t = time(NULL);
-    struct tm *tm = localtime(&t);
+    const char *snap_size = NULL;
+    if (!info.is_thin) {
+        double free_gb = get_vg_free_gb(info.vg);
+        snap_size = classic_snapshot_size(free_gb);
+        if (!snap_size) {
+            printf("Error: Insufficient free space in volume group %s "
+                   "(1.0G required, %.2fG available).\n", info.vg, free_gb);
+            return false;
+        }
+    }
+
     char ts[64];
-    strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", tm);
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tm);
 
-    char snapname[STR_BUF];
-    snprintf(snapname, sizeof(snapname), "%s-%s-%s-%s", prefix, type, name, ts);
-
-    const char *base = strcmp(type, "auto") == 0 ? AUTO_DIR : MANUAL_DIR;
-    if (strcmp(name, "nsmd") == 0) base = DAEMON_AUTO_DIR;
-
-    char snapdir[PATH_BUF];
-    snprintf(snapdir, sizeof(snapdir), "%s/%s", base, snapname);
-    if (!ensure_dir(snapdir)) {
+    char snapname[STR_BUF], snapdir[PATH_BUF];
+    if (!fmt(snapname, sizeof(snapname), "%s-%s-%s-%s", prefix, type, name, ts) ||
+        strlen(snapname) > LV_NAME_MAX) {
+        printf("Error: snapshot name is too long.\n");
+        return false;
+    }
+    if (!fmt(snapdir, sizeof(snapdir), "%s/%s", snapshot_base_dir(type, name), snapname) ||
+        !ensure_dir(snapdir)) {
         printf("Error: cannot create snapshot metadata directory.\n");
         return false;
     }
 
-    bool is_root = (strcmp(mountpoint, "/") == 0);
-    bool frozen  = !is_root && freeze_mount(mountpoint);
-
-    CmdResult r;
-    if (info.is_thin) {
-        r = run_args("lvcreate", "-s", "-n", snapname, info.lvpath, NULL);
-    } else {
-        double free_gb = get_vg_free_gb(info.vg);
-        if (free_gb < 1.0) {
-            printf("Error: Insufficient free space in volume group %s (1.0G required, %.2fG available).\n", info.vg, free_gb);
-            if (frozen) unfreeze_mount(mountpoint);
-            remove_snapshot_meta(snapdir);
-            return false;
-        }
-        const char *snap_size = "1G";
-        if (free_gb >= 10.0) snap_size = "5G";
-        else if (free_gb >= 5.0) snap_size = "3G";
-        else if (free_gb >= 2.0) snap_size = "1.5G";
-
-        r = run_args("lvcreate", "-L", snap_size, "-s", "-n", snapname, info.lvpath, NULL);
-    }
-
+    bool frozen = strcmp(mountpoint, "/") != 0 && freeze_mount(mountpoint);
+    CmdResult r = info.is_thin
+        ? RUN("lvcreate", "-s", "-n", snapname, info.lvpath)
+        : RUN("lvcreate", "-L", snap_size, "-s", "-n", snapname, info.lvpath);
     if (frozen) unfreeze_mount(mountpoint);
 
     if (r.rc != 0) {
@@ -430,19 +528,19 @@ static bool create_snapshot(const char *mountpoint, const char *prefix,
 
     SnapshotMeta meta;
     memset(&meta, 0, sizeof(meta));
-    snprintf(meta.kind,            sizeof(meta.kind),            "%s", prefix);
-    snprintf(meta.type,            sizeof(meta.type),            "%s", type);
-    snprintf(meta.name,            sizeof(meta.name),            "%s", snapname);
-    snprintf(meta.timestamp,       sizeof(meta.timestamp),       "%s", ts);
-    snprintf(meta.origin_mount,    sizeof(meta.origin_mount),    "%s", mountpoint);
-    snprintf(meta.origin_source,   sizeof(meta.origin_source),   "%s", source);
-    snprintf(meta.origin_vg,       sizeof(meta.origin_vg),       "%s", info.vg);
-    snprintf(meta.origin_lv,       sizeof(meta.origin_lv),       "%s", info.lv);
-    snprintf(meta.origin_lvpath,   sizeof(meta.origin_lvpath),   "%s", info.lvpath);
-    snprintf(meta.snapshot_lvpath, sizeof(meta.snapshot_lvpath),
-             "/dev/%s/%s", info.vg, snapname);
+    bool ok = fmt(meta.kind, sizeof(meta.kind), "%s", prefix)
+           && fmt(meta.type, sizeof(meta.type), "%s", type)
+           && fmt(meta.name, sizeof(meta.name), "%s", snapname)
+           && fmt(meta.timestamp, sizeof(meta.timestamp), "%s", ts)
+           && fmt(meta.origin_mount, sizeof(meta.origin_mount), "%s", mountpoint)
+           && fmt(meta.origin_source, sizeof(meta.origin_source), "%s", source)
+           && fmt(meta.origin_vg, sizeof(meta.origin_vg), "%s", info.vg)
+           && fmt(meta.origin_lv, sizeof(meta.origin_lv), "%s", info.lv)
+           && fmt(meta.origin_lvpath, sizeof(meta.origin_lvpath), "%s", info.lvpath)
+           && fmt(meta.snapshot_lvpath, sizeof(meta.snapshot_lvpath),
+                  "/dev/%s/%s", info.vg, snapname);
 
-    if (!write_snapshot_meta(snapdir, &meta)) {
+    if (!ok || !write_snapshot_meta(snapdir, &meta)) {
         printf("Error: snapshot was created, but metadata could not be written.\n");
         return false;
     }
@@ -452,60 +550,107 @@ static bool create_snapshot(const char *mountpoint, const char *prefix,
 
 static bool initramfs_has_lvm_hook(void)
 {
-    char kver[STR_BUF] = "";
-    {
-        CmdResult r = run_args("uname", "-r", NULL);
-        if (r.rc != 0) return false;
-        trim(r.out);
-        snprintf(kver, sizeof(kver), "%.*s", (int)(sizeof(kver) - 1), r.out);
-    }
-
+    struct utsname un;
     char initrd[PATH_BUF];
-    snprintf(initrd, sizeof(initrd), "/boot/initrd.img-%s", kver);
+    if (uname(&un) != 0) return false;
+    if (!fmt(initrd, sizeof(initrd), "/boot/initrd.img-%s", un.release)) return false;
 
-    CmdResult r = run_args("lsinitramfs", initrd, NULL);
-    if (r.rc != 0) return false;
-    return strstr(r.out, "lvm") != NULL;
+    char *buf = malloc(BIG_OUT_BUF);
+    if (!buf) return false;
+
+    const char *const argv[] = { "lsinitramfs", initrd, NULL };
+    bool found = spawn(argv, buf, BIG_OUT_BUF, NULL, false) == 0 && strstr(buf, "lvm") != NULL;
+    free(buf);
+    return found;
 }
 
-static bool rollback_home(const SnapshotMeta *meta)
+static pid_t parent_of(pid_t pid)
 {
-    run_args_silent("fuser", "-km", "/home", NULL);
+    char path[64], line[512];
+    if (!fmt(path, sizeof(path), "/proc/%d/stat", (int)pid)) return 0;
 
-    bool processes_cleared = false;
-    for (int attempt = 0; attempt < 5; ++attempt) {
-        usleep(500000);
-        CmdResult ck = run_args("fuser", "/home", NULL);
-        if (ck.rc != 0 || ck.out[0] == '\0') {
-            processes_cleared = true;
-            break;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char *got = fgets(line, sizeof(line), f);
+    fclose(f);
+    if (!got) return 0;
+
+    char *p = strrchr(line, ')');
+    int ppid = 0;
+    if (!p || sscanf(p + 1, " %*c %d", &ppid) != 1) return 0;
+    return (pid_t)ppid;
+}
+
+static bool in_own_chain(pid_t pid)
+{
+    for (pid_t p = getpid(); p > 1; p = parent_of(p))
+        if (p == pid) return true;
+    return false;
+}
+
+static size_t home_holders(pid_t *pids, size_t max)
+{
+    CmdResult r = RUN_OUT("fuser", "-m", HOME_SOURCE);
+    size_t n = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(r.out, " \t\n", &save); tok && n < max;
+         tok = strtok_r(NULL, " \t\n", &save)) {
+        char *end;
+        long v = strtol(tok, &end, 10);
+        if (end == tok || v <= 0) continue;
+        pids[n++] = (pid_t)v;
+    }
+    return n;
+}
+
+static void evict_holders(void)
+{
+    pid_t pids[MAX_HOLDERS];
+    for (int attempt = 0; attempt < EVICT_ATTEMPTS; attempt++) {
+        size_t n = home_holders(pids, MAX_HOLDERS);
+        size_t signalled = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (pids[i] <= 1 || in_own_chain(pids[i])) continue;
+            kill(pids[i], attempt < 2 ? SIGTERM : SIGKILL);
+            signalled++;
         }
-        run_args_silent("fuser", "-km", "/home", NULL);
+        if (!signalled) return;
+        usleep(500000);
     }
+}
 
-    if (!processes_cleared) {
-        printf("Rollback failed: processes still hold /home open after retries.\n");
-        return false;
-    }
-
+static bool rollback_home(const SnapshotMeta *meta, bool force)
+{
     sync();
-    if (umount(HOME_SOURCE) != 0)
-        run_args_silent("umount", "-l", "/home", NULL);
-    usleep(500000);
+    if (force) evict_holders();
 
-    sync();
-    run_args("lvchange", "-an", meta->origin_lvpath, NULL);
-    CmdResult r = run_args("lvconvert", "--merge", meta->snapshot_lvpath, NULL);
-    if (r.rc != 0) {
-        printf("Rollback failed: %s\n", r.out);
-        run_args("lvchange", "-ay", meta->origin_lvpath, NULL);
-        run_args_silent("mount", "/home", NULL);
-        return false;
+    bool unmounted = umount(HOME_SOURCE) == 0 || errno == EINVAL;
+    if (!unmounted) {
+        pid_t pids[MAX_HOLDERS];
+        size_t n = home_holders(pids, MAX_HOLDERS);
+        printf("Warning: /home is busy (%zu process(es) holding it); the merge will be deferred.\n", n);
+        if (force)
+            printf("Processes of your own session still hold it. Leave /home and run again, or reboot.\n");
+        else
+            printf("Run again with --force to stop them (your own session is never touched).\n");
+    } else {
+        RUN("lvchange", "-an", meta->origin_lvpath);
     }
 
-    run_args("lvchange", "-ay", meta->origin_lvpath, NULL);
-    run_args_silent("mount", "/home", NULL);
-    printf("SUCCESS: Home rollback complete. REBOOT may be required if the merge is pending.\n");
+    CmdResult r = RUN("lvconvert", "--merge", meta->snapshot_lvpath);
+    bool ok = r.rc == 0;
+    if (!ok) printf("Rollback failed: %s\n", r.out);
+
+    if (unmounted) {
+        RUN("lvchange", "-ay", meta->origin_lvpath);
+        RUN_SILENT("mount", HOME_SOURCE);
+    }
+
+    if (!ok) return false;
+    if (unmounted)
+        printf("SUCCESS: Home rollback complete. REBOOT may be required if the merge is pending.\n");
+    else
+        printf("SUCCESS: Home rollback scheduled. REBOOT REQUIRED.\n");
     return true;
 }
 
@@ -516,7 +661,7 @@ static bool rollback_root(const SnapshotMeta *meta)
         printf("The merge is scheduled but may not apply on reboot.\n");
         printf("Run: update-initramfs -u   then reboot.\n");
     }
-    CmdResult r = run_args("lvconvert", "--merge", meta->snapshot_lvpath, NULL);
+    CmdResult r = RUN("lvconvert", "--merge", meta->snapshot_lvpath);
     if (r.rc != 0) {
         printf("Rollback failed: %s\n", r.out);
         return false;
@@ -525,230 +670,258 @@ static bool rollback_root(const SnapshotMeta *meta)
     return true;
 }
 
-static bool rollback_snapshot(const char *name)
+static bool rollback_snapshot(const char *name, bool force)
 {
     char dir[PATH_BUF];
+    SnapshotMeta meta;
     if (!find_snapshot(name, dir, sizeof(dir))) {
         printf("Error: Snapshot '%s' not found.\n", name);
         return false;
     }
-    SnapshotMeta meta;
     if (!read_snapshot_meta(dir, &meta)) {
         printf("Error: Snapshot metadata could not be read.\n");
         return false;
     }
     if (strcmp(meta.kind, "root") == 0) return rollback_root(&meta);
-    if (strcmp(meta.kind, "home") == 0) return rollback_home(&meta);
+    if (strcmp(meta.kind, "home") == 0) return rollback_home(&meta, force);
     printf("Error: invalid snapshot kind.\n");
     return false;
 }
 
-static void list_dir(const char *dir)
+static void collect_snapshots(const char *dir, SnapNames *out)
 {
     DIR *d = opendir(dir);
     if (!d) return;
-    char *roots[256] = {0}, *homes[256] = {0};
-    int nr = 0, nh = 0;
+
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
         char meta[PATH_BUF];
-        snprintf(meta, sizeof(meta), "%s/%s/%s", dir, e->d_name, META_FILE);
+        if (!fmt(meta, sizeof(meta), "%s/%s/%s", dir, e->d_name, META_FILE)) continue;
         if (access(meta, F_OK) != 0) continue;
-        if (strncmp(e->d_name, "root-", 5) == 0) {
-            if (nr < 256) {
-                char *s = strdup(e->d_name);
-                if (s) roots[nr++] = s;
-            } else {
-                fprintf(stderr, "Warning: snapshot limit reached (256 roots)\n");
-            }
-        } else if (strncmp(e->d_name, "home-", 5) == 0) {
-            if (nh < 256) {
-                char *s = strdup(e->d_name);
-                if (s) homes[nh++] = s;
-            } else {
-                fprintf(stderr, "Warning: snapshot limit reached (256 homes)\n");
-            }
-        }
+
+        StrList *dst = NULL;
+        if (strncmp(e->d_name, "root-", 5) == 0)      dst = &out->roots;
+        else if (strncmp(e->d_name, "home-", 5) == 0) dst = &out->homes;
+        if (dst && !strlist_push(dst, e->d_name))
+            fprintf(stderr, "Warning: out of memory while listing %s\n", dir);
     }
     closedir(d);
+    strlist_sort(&out->roots);
+    strlist_sort(&out->homes);
+}
+
+static void snapnames_free(SnapNames *s)
+{
+    strlist_free(&s->roots);
+    strlist_free(&s->homes);
+}
+
+static void list_dir(const char *dir)
+{
+    SnapNames s = {0};
+    collect_snapshots(dir, &s);
+
     printf("  Snapshots:\n");
-    if (!nr && !nh) printf("    (none)\n");
-    for (int i = 0; i < nr; i++) { if (roots[i]) { printf("    %s\n", roots[i]); free(roots[i]); } }
-    for (int i = 0; i < nh; i++) { if (homes[i]) { printf("    %s\n", homes[i]); free(homes[i]); } }
+    if (!s.roots.n && !s.homes.n) printf("    (none)\n");
+    for (size_t i = 0; i < s.roots.n; i++) printf("    %s\n", s.roots.v[i]);
+    for (size_t i = 0; i < s.homes.n; i++) printf("    %s\n", s.homes.v[i]);
+    snapnames_free(&s);
 }
 
 static void list_snapshots(void)
 {
-    printf("\nManual Snapshots\n");    list_dir(MANUAL_DIR);
-    printf("\napt Snapshots\n");       list_dir(AUTO_DIR);
+    printf("\nManual Snapshots\n");     list_dir(MANUAL_DIR);
+    printf("\napt Snapshots\n");        list_dir(AUTO_DIR);
     printf("\nnsm Daemon Snapshots\n"); list_dir(DAEMON_AUTO_DIR);
     printf("\n");
 }
 
-static int cmp_str(const void *a, const void *b)
+static bool user_part(const char *snap, char *out, size_t sz)
 {
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
+    const char *p = snap;
+    if (strncmp(p, "root-", 5) != 0 && strncmp(p, "home-", 5) != 0) return false;
+    p += 5;
+    if (strncmp(p, "auto-", 5) == 0) p += 5;
+    else if (strncmp(p, "manual-", 7) == 0) p += 7;
+    else return false;
+
+    size_t n = strlen(p);
+    if (n <= TS_LEN + 1) return false;
+    n -= TS_LEN + 1;
+    if (p[n] != '-' || n >= sz) return false;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
 }
 
-static void drop_oldest(const char *dir, char **arr, int count)
+static void find_by_term(const char *term, StrList *out)
 {
-    if (count <= 6 || !arr || !arr[0]) return;
-    char path[PATH_BUF], metapath[PATH_BUF];
-    snprintf(path,     sizeof(path),     "%s/%s", dir, arr[0]);
-    snprintf(metapath, sizeof(metapath), "%s/%s", path, META_FILE);
-    SnapshotMeta sm;
-    if (read_snapshot_meta(path, &sm)) {
-        if (!delete_snapshot_lv(sm.snapshot_lvpath)) {
-            fprintf(stderr, "Warning: failed to remove snapshot LV '%s' (or already removed). Cleaning up metadata.\n", sm.snapshot_lvpath);
+    for (int pass = 0; pass < 2 && !out->n; pass++) {
+        for (size_t i = 0; i < N_SNAPSHOT_DIRS; i++) {
+            SnapNames s = {0};
+            StrList *lists[2] = { &s.roots, &s.homes };
+            collect_snapshots(SNAPSHOT_DIRS[i], &s);
+            for (size_t k = 0; k < 2; k++) {
+                for (size_t j = 0; j < lists[k]->n; j++) {
+                    const char *name = lists[k]->v[j];
+                    char part[STR_BUF], path[PATH_BUF];
+                    bool hit = pass == 0
+                        ? user_part(name, part, sizeof(part)) && strcmp(part, term) == 0
+                        : strstr(name, term) != NULL;
+                    if (hit && fmt(path, sizeof(path), "%s/%s", SNAPSHOT_DIRS[i], name))
+                        strlist_push(out, path);
+                }
+            }
+            snapnames_free(&s);
         }
     }
-    unlink(metapath);
-    rmdir(path);
+    strlist_sort(out);
+}
+
+static int cmd_delete(const char *term)
+{
+    char dir[PATH_BUF];
+    SnapshotMeta meta;
+
+    if (find_snapshot(term, dir, sizeof(dir))) {
+        if (delete_snapshot(term)) {
+            printf("Snapshot deleted successfully.\n");
+            return 0;
+        }
+        fprintf(stderr, "Error: snapshot deletion failed.\n");
+        return 1;
+    }
+
+    if (!valid_name(term, STR_BUF - 1)) {
+        fprintf(stderr, "Error: snapshot '%s' not found.\n", term);
+        return 1;
+    }
+
+    StrList m = {0};
+    find_by_term(term, &m);
+    if (!m.n) {
+        fprintf(stderr, "Error: no snapshot matches '%s'.\n", term);
+        return 1;
+    }
+
+    printf("Snapshots called \"%s\":\n", term);
+    for (size_t i = 0; i < m.n; i++)
+        printf("  %zu - %s\n", i + 1, strrchr(m.v[i], '/') + 1);
+
+    int rc = 1;
+    if (!isatty(STDIN_FILENO)) {
+        fprintf(stderr, "Not a terminal: run again with the full snapshot name.\n");
+    } else {
+        printf("Which one to delete? [1-%zu, empty to cancel]: ", m.n);
+        fflush(stdout);
+
+        char line[32];
+        if (!fgets(line, sizeof(line), stdin)) line[0] = '\0';
+        trim(line);
+
+        char *end;
+        long k = strtol(line, &end, 10);
+        if (!line[0]) {
+            printf("Cancelled.\n");
+        } else if (*end || k < 1 || (size_t)k > m.n) {
+            fprintf(stderr, "Error: invalid choice.\n");
+        } else if (read_snapshot_meta(m.v[k - 1], &meta) && remove_snapshot_at(m.v[k - 1])) {
+            printf("Snapshot deleted successfully.\n");
+            rc = 0;
+        } else {
+            fprintf(stderr, "Error: snapshot deletion failed.\n");
+        }
+    }
+    strlist_free(&m);
+    return rc;
+}
+
+static void drop_oldest(const char *dir, const StrList *names)
+{
+    for (size_t i = 0; names->n - i > KEEP_LATEST; i++) {
+        char path[PATH_BUF];
+        if (!fmt(path, sizeof(path), "%s/%s", dir, names->v[i])) continue;
+        remove_snapshot_at(path);
+    }
 }
 
 static void cleanup_dir(const char *dir)
 {
-    DIR *d = opendir(dir);
-    if (!d) return;
-    char *roots[256] = {0}, *homes[256] = {0};
-    int nr = 0, nh = 0;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char meta[PATH_BUF];
-        snprintf(meta, sizeof(meta), "%s/%s/%s", dir, e->d_name, META_FILE);
-        if (access(meta, F_OK) != 0) continue;
-        if (strncmp(e->d_name, "root-", 5) == 0) {
-            if (nr < 256) {
-                char *s = strdup(e->d_name);
-                if (s) roots[nr++] = s;
-            }
-        } else if (strncmp(e->d_name, "home-", 5) == 0) {
-            if (nh < 256) {
-                char *s = strdup(e->d_name);
-                if (s) homes[nh++] = s;
-            }
-        }
-    }
-    closedir(d);
-
-    qsort(roots, nr, sizeof(char *), cmp_str);
-    qsort(homes, nh, sizeof(char *), cmp_str);
-
-    drop_oldest(dir, roots, nr);
-    drop_oldest(dir, homes, nh);
-
-    for (int i = 0; i < nr; i++) if (roots[i]) free(roots[i]);
-    for (int i = 0; i < nh; i++) if (homes[i]) free(homes[i]);
+    SnapNames s = {0};
+    collect_snapshots(dir, &s);
+    drop_oldest(dir, &s.roots);
+    drop_oldest(dir, &s.homes);
+    snapnames_free(&s);
 }
 
 static void autodel_snapshots(void)
 {
-    cleanup_dir(AUTO_DIR);
-    cleanup_dir(DAEMON_AUTO_DIR);
-    cleanup_dir(MANUAL_DIR);
+    for (size_t i = 0; i < N_AUTO_DIRS; i++) cleanup_dir(AUTO_DIRS[i]);
 }
 
 static bool get_lv_pool(const char *lvpath, char *pool, size_t sz)
 {
-    CmdResult r = run_args("lvs", "-o", "pool_lv", "--noheadings", lvpath, NULL);
-    if (r.rc != 0) return false;
-    trim(r.out);
-    if (r.out[0] == '\0') return false;
-    snprintf(pool, sz, "%s", r.out);
-    return true;
+    return lvm_field("lvs", lvpath, "pool_lv", pool, sz) && pool[0] != '\0';
 }
 
 static double get_thinpool_usage(const char *vg, const char *pool)
 {
-    char target[PATH_BUF];
-    snprintf(target, sizeof(target), "%s/%s", vg, pool);
-    CmdResult r = run_args("lvs", "-o", "data_percent", "--noheadings", target, NULL);
-    if (r.rc != 0) return 0.0;
-    trim(r.out);
-    if (r.out[0] == '\0') return 0.0;
-    return atof(r.out);
+    char target[PATH_BUF], val[64];
+    if (!fmt(target, sizeof(target), "%s/%s", vg, pool)) return 0.0;
+    if (!lvm_field("lvs", target, "data_percent", val, sizeof(val))) return 0.0;
+    return atof(val);
 }
 
-static int gather_snapshots(const char *dir, SnapSizeInfo *list, int count, int max)
+static void push_paths(StrList *dst, const char *dir, const StrList *names)
 {
-    DIR *d = opendir(dir);
-    if (!d) return count;
-    struct dirent *e;
-    while ((e = readdir(d)) && count < max) {
-        if (e->d_name[0] == '.') continue;
+    for (size_t i = 0; i < names->n; i++) {
         char path[PATH_BUF];
-        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        SnapshotMeta meta;
-        if (read_snapshot_meta(path, &meta)) {
-            snprintf(list[count].name, sizeof(list[count].name), "%s", e->d_name);
-            snprintf(list[count].dir, sizeof(list[count].dir), "%s", path);
-            snprintf(list[count].lvpath, sizeof(list[count].lvpath), "%s", meta.snapshot_lvpath);
-            CmdResult r = run_args("lvs", "-o", "lv_size", "--noheadings", "--units", "b", meta.snapshot_lvpath, NULL);
-            if (r.rc == 0) {
-                trim(r.out);
-                list[count].size = strtoull(r.out, NULL, 10);
-            } else {
-                list[count].size = 0;
-            }
-            count++;
-        }
+        if (fmt(path, sizeof(path), "%s/%s", dir, names->v[i]))
+            strlist_push(dst, path);
     }
-    closedir(d);
-    return count;
 }
 
-static int cmp_snap_size(const void *a, const void *b)
+static void purge_auto_snapshots(const char *vg, const char *pool)
 {
-    unsigned long long sa = ((const SnapSizeInfo *)a)->size;
-    unsigned long long sb = ((const SnapSizeInfo *)b)->size;
-    if (sa < sb) return 1;
-    if (sa > sb) return -1;
-    return 0;
+    StrList paths = {0};
+    for (size_t i = 0; i < N_AUTO_DIRS; i++) {
+        SnapNames s = {0};
+        collect_snapshots(AUTO_DIRS[i], &s);
+        push_paths(&paths, AUTO_DIRS[i], &s.roots);
+        push_paths(&paths, AUTO_DIRS[i], &s.homes);
+        snapnames_free(&s);
+    }
+    strlist_sort(&paths);
+
+    double usage = get_thinpool_usage(vg, pool);
+    for (size_t i = 0; i < paths.n && usage >= THINPOOL_LIMIT; i++)
+        if (remove_snapshot_at(paths.v[i])) usage = get_thinpool_usage(vg, pool);
+    strlist_free(&paths);
+
+    if (usage >= THINPOOL_LIMIT)
+        printf("Warning: Thin pool %s/%s is still at %.2f%% with no automatic snapshots left. "
+               "Manual snapshots are never removed automatically; use 'delete <name>'.\n",
+               vg, pool, usage);
 }
 
 static void monitor_thinpool(const char *mountpoint)
 {
-    char source[PATH_BUF];
-    if (!read_mount_field(mountpoint, "SOURCE", source, sizeof(source))) return;
+    char source[PATH_BUF], pool[STR_BUF];
     LvmInfo info;
-    if (!resolve_lvm_info(source, &info)) return;
-    if (!info.is_thin) return;
-
-    char pool[STR_BUF];
+    if (!read_mount_field(mountpoint, "SOURCE", source, sizeof(source))) return;
+    if (!resolve_lvm_info(source, &info) || !info.is_thin) return;
     if (!get_lv_pool(info.lvpath, pool, sizeof(pool))) return;
 
     double usage = get_thinpool_usage(info.vg, pool);
-    if (usage >= 93.0) {
-        printf("Warning: Thin pool %s/%s usage is %.2f%% (threshold 93%% passed).\n", info.vg, pool, usage);
-        autodel_snapshots();
+    if (usage < THINPOOL_LIMIT) return;
 
-        usage = get_thinpool_usage(info.vg, pool);
-        if (usage >= 93.0) {
-            int max_snaps = 512;
-            SnapSizeInfo *snaps = calloc(max_snaps, sizeof(SnapSizeInfo));
-            if (!snaps) return;
+    printf("Warning: Thin pool %s/%s usage is %.2f%% (threshold %.0f%% passed).\n",
+           info.vg, pool, usage, THINPOOL_LIMIT);
+    autodel_snapshots();
 
-            int count = 0;
-            count = gather_snapshots(MANUAL_DIR, snaps, count, max_snaps);
-            count = gather_snapshots(AUTO_DIR, snaps, count, max_snaps);
-            count = gather_snapshots(DAEMON_AUTO_DIR, snaps, count, max_snaps);
-
-            qsort(snaps, count, sizeof(SnapSizeInfo), cmp_snap_size);
-
-            for (int i = 0; i < count && usage >= 93.0; i++) {
-                if (delete_snapshot_lv(snaps[i].lvpath)) {
-                    char metapath[PATH_BUF];
-                    snprintf(metapath, sizeof(metapath), "%s/%s", snaps[i].dir, META_FILE);
-                    unlink(metapath);
-                    rmdir(snaps[i].dir);
-                    usage = get_thinpool_usage(info.vg, pool);
-                }
-            }
-            free(snaps);
-        }
-    }
+    if (get_thinpool_usage(info.vg, pool) >= THINPOOL_LIMIT)
+        purge_auto_snapshots(info.vg, pool);
 }
 
 static void print_usage(const char *prog)
@@ -757,10 +930,33 @@ static void print_usage(const char *prog)
     printf("Commands:\n");
     printf("  create <name>    Create snapshots on XFS/ext4/LVM volumes\n");
     printf("                   Auto type if name matches 'apt', 'apt-*', or 'nsmd'\n");
-    printf("  rollback <name>  Roll back to named snapshot\n");
-    printf("  delete <name>    Delete a specific snapshot\n");
+    printf("  rollback <name> [--force]\n");
+    printf("                   Roll back to named snapshot\n");
+    printf("                   --force stops processes holding /home (never your own session)\n");
+    printf("  delete <name>    Delete a snapshot by full name, or by the name you gave it\n");
+    printf("                   (asks which one when several match)\n");
     printf("  list             List all snapshots\n");
-    printf("  autodel          Delete oldest snapshots, keeping the latest 6\n");
+    printf("  autodel          Delete oldest automatic snapshots, keeping the latest %d\n", KEEP_LATEST);
+}
+
+static int cmd_create(const char *name)
+{
+    if (!valid_name(name, USER_NAME_MAX)) {
+        fprintf(stderr, "Error: invalid snapshot name (use letters, digits, '_', '.', '+', '-'; "
+                        "max %d chars).\n", USER_NAME_MAX);
+        return 1;
+    }
+    if (!ensure_dir(AUTO_DIR) || !ensure_dir(DAEMON_AUTO_DIR) || !ensure_dir(MANUAL_DIR)) {
+        fprintf(stderr, "Error: cannot create %s.\n", SNAPSHOT_BASE);
+        return 1;
+    }
+
+    bool isauto = strcmp(name, "nsmd") == 0 || strncmp(name, "apt", 3) == 0;
+    bool ok = create_snapshot(ROOT_SOURCE, "root", isauto ? "auto" : "manual", name);
+    if (isauto) autodel_snapshots();
+    monitor_thinpool(ROOT_SOURCE);
+    monitor_thinpool(HOME_SOURCE);
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char *argv[])
@@ -769,53 +965,50 @@ int main(int argc, char *argv[])
         print_usage(argv[0]);
         return 1;
     }
-
-    const char *cmd = argv[1];
-
     if (geteuid() != 0) {
         fprintf(stderr, "Error: root privileges required.\n");
         return 1;
     }
+    setenv("LC_ALL", "C", 1);
 
-    if (strcmp(cmd, "create") == 0) {
-        if (argc < 3) { print_usage(argv[0]); return 1; }
-        ensure_dir("/nsm");
-        ensure_dir(SNAPSHOT_BASE);
-        ensure_dir(AUTO_DIR);
-        ensure_dir(DAEMON_AUTO_DIR);
-        ensure_dir(MANUAL_DIR);
-        bool isauto = (strcmp(argv[2], "nsmd") == 0 || strncmp(argv[2], "apt", 3) == 0);
-        const char *type = isauto ? "auto" : "manual";
-        create_snapshot(ROOT_SOURCE, "root", type, argv[2]);
-        if (isauto) autodel_snapshots();
-        monitor_thinpool(ROOT_SOURCE);
-        monitor_thinpool(HOME_SOURCE);
+    const char *cmd = argv[1];
+    const char *arg = argc > 2 ? argv[2] : NULL;
+    bool needs_arg = !strcmp(cmd, "create") || !strcmp(cmd, "rollback") || !strcmp(cmd, "delete");
 
-    } else if (strcmp(cmd, "rollback") == 0) {
-        if (argc < 3) { print_usage(argv[0]); return 1; }
-        rollback_snapshot(argv[2]);
-
-    } else if (strcmp(cmd, "delete") == 0) {
-        if (argc < 3) { print_usage(argv[0]); return 1; }
-        if (delete_snapshot(argv[2])) {
-            printf("Snapshot deleted successfully.\n");
-        } else {
-            fprintf(stderr, "Error: snapshot deletion failed.\n");
-            return 1;
-        }
-
-    } else if (strcmp(cmd, "list") == 0) {
-        list_snapshots();
-
-    } else if (strcmp(cmd, "autodel") == 0) {
-        autodel_snapshots();
-        monitor_thinpool(ROOT_SOURCE);
-        monitor_thinpool(HOME_SOURCE);
-
-    } else {
-        fprintf(stderr, "Error: unknown command '%s'\n\n", cmd);
+    if (needs_arg && !arg) {
         print_usage(argv[0]);
         return 1;
     }
-    return 0;
+
+    if (!strcmp(cmd, "create")) return cmd_create(arg);
+
+    if (!strcmp(cmd, "rollback")) {
+        bool force = false;
+        if (argc > 3) {
+            if (argc > 4 || strcmp(argv[3], "--force") != 0) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            force = true;
+        }
+        return rollback_snapshot(arg, force) ? 0 : 1;
+    }
+
+    if (!strcmp(cmd, "delete")) return cmd_delete(arg);
+
+    if (!strcmp(cmd, "list")) {
+        list_snapshots();
+        return 0;
+    }
+
+    if (!strcmp(cmd, "autodel")) {
+        autodel_snapshots();
+        monitor_thinpool(ROOT_SOURCE);
+        monitor_thinpool(HOME_SOURCE);
+        return 0;
+    }
+
+    fprintf(stderr, "Error: unknown command '%s'\n\n", cmd);
+    print_usage(argv[0]);
+    return 1;
 }
