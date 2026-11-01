@@ -56,7 +56,8 @@ FILES = [
     "/usr/bin/nsmd_start",
     "/etc/motd",
     "/usr/bin/arvor_sys_info",
-    "/etc/weld/trusted_keys/nextferret-keyring.pub"
+    "/etc/weld/trusted_keys/nextferret-keyring.pub",
+    "/usr/local/bin/arvor_enable_declaration"
 ]
 
 STYLES = """
@@ -1033,7 +1034,6 @@ touch /etc/default/grub
 sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX="rd.lvm.lv=arvor_vg/root"|' /etc/default/grub || true
 grep -q "rd.lvm.lv" /etc/default/grub || echo 'GRUB_CMDLINE_LINUX="rd.lvm.lv=arvor_vg/root"' >> /etc/default/grub
 
-# Recovery Mode has been moved to 8.1 (GRUB menuentry previously defined in /etc/grub.d/11_arvor_recovery)
 
 update-initramfs -c -k all || update-initramfs -u
 
@@ -1049,14 +1049,11 @@ grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arvor
 # own call so it never overwrites the named install above.
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck || true
 
-# Recovery Mode has been moved to 8.1 (EFI/arvor-recovery directory and grub.cfg previously created here)
-# Recovery Mode has been moved to 8.1 (efibootmgr "Arvor Linux Recovery" NVRAM entry previously created here)
 efibootmgr -c -d {self.conf["disk"]} -p 1 -L "Arvor Linux" -l "\\EFI\\arvor-linux\\grubx64.efi" || true
 update-grub
 
 weld sync
-weld upgrade --apply-host
-weld clean
+script -qec "weld upgrade -y -now" /dev/null
 apt-get clean
 rm /s.sh
 exit 0
