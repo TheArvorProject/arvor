@@ -4580,7 +4580,17 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
             apt_write.reset();
             err_write.reset();
 
-            CompactSpinner sandbox_spin("Installing on Separate Environment", " ... ", true);
+            std::string sandbox_verb = "Installing";
+            if (action == "remove") {
+                sandbox_verb = "Removing";
+            } else if (action == "purge") {
+                sandbox_verb = "Purging";
+            } else if (action == "upgrade" || action == "dist-upgrade") {
+                sandbox_verb = "Upgrading";
+            } else if (g_force_reinstall) {
+                sandbox_verb = "Reinstalling";
+            }
+            CompactSpinner sandbox_spin(sandbox_verb + " on Separate Environment", " ... ", true);
 
             std::atomic<int> apt_percent(-1);
             std::string child_stderr_output;
