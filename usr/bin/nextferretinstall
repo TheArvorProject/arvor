@@ -56,8 +56,7 @@ FILES = [
     "/usr/bin/nsmd_start",
     "/etc/motd",
     "/usr/bin/arvor_sys_info",
-    "/etc/weld/trusted_keys/nextferret-keyring.pub",
-    "/usr/local/bin/arvor_enable_declaration"
+    "/etc/weld/trusted_keys/nextferret-keyring.pub"
 ]
 
 STYLES = """
