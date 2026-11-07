@@ -1,6 +1,3 @@
-// © NextFerret, 2026, The Arvor License (TAL)
-// Maintainer: Hludwig (@hludwig-nf)
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,6 +20,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <meta>
 #include <mutex>
 #include <print>
 #include <set>
@@ -32,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -212,8 +211,6 @@
 #define CAP_SETFCAP 31
 #endif
 
-#define WELD_CONTRACT(cond) contract_assert(cond)
-
 namespace fs = std::filesystem;
 
 namespace {
@@ -378,8 +375,6 @@ std::string trim(std::string_view s) {
     if (start == std::string_view::npos) return {};
     auto end = s.find_last_not_of(kWhitespace);
     std::string r{s.substr(start, end - start + 1)};
-    WELD_CONTRACT(kWhitespace.find(r.front()) == std::string_view::npos
-                  && kWhitespace.find(r.back()) == std::string_view::npos);
     return r;
 }
 
@@ -403,7 +398,6 @@ std::string hex_encode(std::span<const unsigned char> data) {
         out.push_back(kHex[(b >> 4) & 0xF]);
         out.push_back(kHex[b & 0xF]);
     }
-    WELD_CONTRACT(out.size() == data.size() * 2);
     return out;
 }
 
@@ -822,8 +816,7 @@ std::string calculate_sha256(const std::string& file_path) {
     }
     std::array<unsigned char, EVP_MAX_MD_SIZE> hash{};
     unsigned int hash_len = 0;
-    if (EVP_DigestFinal_ex(ctx.get(), hash.data(), &hash_len) != 1 || hash_len == 0) return "";
-    WELD_CONTRACT(hash_len == 32);
+    if (EVP_DigestFinal_ex(ctx.get(), hash.data(), &hash_len) != 1 || hash_len != 32) return "";
     return hex_encode(std::span<const unsigned char>{hash.data(), hash_len});
 }
 
@@ -887,8 +880,6 @@ ArgzBuffer make_argv(std::initializer_list<std::string_view> args) {
         w += a.size() + 1;
     }
     out.argv.push_back(nullptr);
-    WELD_CONTRACT(out.data.size() == total && out.argv.size() == args.size() + 1
-                  && out.argv.back() == nullptr);
     return out;
 }
 
@@ -2121,9 +2112,6 @@ bool terminal_is_utf8() {
     return false;
 }
 
-// Compact single-glyph spinner used by the transaction phases. While work is
-// in flight it renders a spinning frame; finish() replaces it with a single
-// "<label><dots> OK" line.
 class CompactSpinner {
 public:
     CompactSpinner(std::string label, std::string dots, bool keep_frame)
@@ -2192,7 +2180,6 @@ private:
     }
 
     std::string current_frame_glyph() {
-        // Braille spinner frames (UTF-8 bytes), with an ASCII fallback.
         static constexpr std::array<std::string_view, 10> kBraille = {
             "\xE2\xA0\x8B", "\xE2\xA0\x99", "\xE2\xA0\xB9", "\xE2\xA0\xB8", "\xE2\xA0\xBC",
             "\xE2\xA0\xB4", "\xE2\xA0\xA6", "\xE2\xA0\xA7", "\xE2\xA0\x87", "\xE2\xA0\x8F",
@@ -2355,11 +2342,6 @@ bool run_libapt_transaction(const std::string& action, const std::vector<std::st
             fixer.Clear(pkg);
             fixer.Protect(pkg);
             dep_cache->MarkInstall(pkg, true);
-            // MarkInstall leaves a package that is already installed at the
-            // candidate version in Keep state, so a forced reinstall is
-            // expressed as Keep + the ReInstall flag - the exact state apt
-            // produces for "apt-get install --reinstall" - which the package
-            // manager still executes.
             const pkgDepCache::StateCache& mark_state = (*dep_cache)[pkg];
             if (mark_state.Install()) {
                 if (g_force_reinstall) dep_cache->SetReInstall(pkg, true);
@@ -2529,6 +2511,38 @@ std::vector<WeldSource> load_weld_sources() {
 #endif
 }
 
+struct TempRepoInfo {
+    std::string name;
+    std::string maintainer;
+};
+
+struct TempPkg {
+    std::string name;
+    std::string description;
+    std::string sha256;
+    std::string deb;
+};
+
+struct TempReplaces {
+    std::string name;
+    std::string replaces;
+};
+
+struct TempRequired {
+    std::string name;
+};
+
+template <typename T>
+constexpr void set_record_field(T& record, std::string_view key, std::string_view value) {
+    template for (constexpr auto member : std::define_static_array(
+                     std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()))) {
+        if (key == std::meta::identifier_of(member)) {
+            record.[:member:] = std::string{value};
+            break;
+        }
+    }
+}
+
 bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& metadata, std::string& error_out) {
     metadata.packages.clear();
     metadata.required_packages.clear();
@@ -2545,20 +2559,8 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
     bool seen_replaces = false;
     bool seen_required = false;
 
-    struct TempPkg {
-        std::string name;
-        std::string description;
-        std::string sha256;
-        std::string deb;
-    };
-    struct TempReplaces {
-        std::string name;
-        std::string replaces;
-    };
-    struct TempRequired {
-        std::string name;
-    };
-
+    TempRepoInfo pending_repo;
+    bool has_pending_repo = false;
     TempPkg pending_pkg;
     bool has_pending_pkg = false;
     TempReplaces pending_rep;
@@ -2566,28 +2568,24 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
     TempRequired pending_req;
     bool has_pending_req = false;
 
-    std::string cur_repo_name;
-    std::string cur_repo_maintainer;
-    bool has_pending_repo = false;
-
     auto flush_repo = [&]() -> bool {
         if (!has_pending_repo) return true;
-        if (cur_repo_name.empty() && cur_repo_maintainer.empty()) {
+        if (pending_repo.name.empty() && pending_repo.maintainer.empty()) {
+            pending_repo = TempRepoInfo();
             has_pending_repo = false;
             return true;
         }
-        if (cur_repo_name.empty()) {
+        if (pending_repo.name.empty()) {
             error_out = "repoinfo record missing required field: name";
             return false;
         }
-        if (cur_repo_maintainer.empty()) {
+        if (pending_repo.maintainer.empty()) {
             error_out = "repoinfo record missing required field: maintainer";
             return false;
         }
-        metadata.name = cur_repo_name;
-        metadata.maintainer = cur_repo_maintainer;
-        cur_repo_name.clear();
-        cur_repo_maintainer.clear();
+        metadata.name = pending_repo.name;
+        metadata.maintainer = pending_repo.maintainer;
+        pending_repo = TempRepoInfo();
         has_pending_repo = false;
         return true;
     };
@@ -2654,8 +2652,7 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
         if (trimmed == "[repoinfo_st]") {
             current_section = Section::RepoInfo;
             has_pending_repo = false;
-            cur_repo_name.clear();
-            cur_repo_maintainer.clear();
+            pending_repo = TempRepoInfo();
             seen_repoinfo = true;
             continue;
         }
@@ -2744,21 +2741,16 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
 
         if (current_section == Section::RepoInfo) {
             if (!has_pending_repo) continue;
-            if (key == "name") cur_repo_name = value;
-            else if (key == "maintainer") cur_repo_maintainer = value;
+            set_record_field(pending_repo, key, value);
         } else if (current_section == Section::Packages) {
             if (!has_pending_pkg) continue;
-            if (key == "name") pending_pkg.name = value;
-            else if (key == "description") pending_pkg.description = value;
-            else if (key == "sha256") pending_pkg.sha256 = value;
-            else if (key == "deb") pending_pkg.deb = value;
+            set_record_field(pending_pkg, key, value);
         } else if (current_section == Section::Replaces) {
             if (!has_pending_rep) continue;
-            if (key == "name") pending_rep.name = value;
-            else if (key == "replaces") pending_rep.replaces = value;
+            set_record_field(pending_rep, key, value);
         } else if (current_section == Section::Required) {
             if (!has_pending_req) continue;
-            if (key == "name") pending_req.name = value;
+            set_record_field(pending_req, key, value);
         }
     }
 
@@ -3342,18 +3334,6 @@ std::string build_weld_download_url(const WeldPackageCandidate& candidate) {
     return std::format("{}/releases/{}/{}", candidate.base_url, candidate.release, file_name);
 }
 
-// Decides whether a package request is served from the Weld repositories
-// (fetched silently into the Weld cache and installed like any other
-// package) or from the regular APT repositories.
-//
-// Reinstalling is special: an installed package ALWAYS reports a candidate
-// version through the APT cache, because libapt falls back to the installed
-// version when no repository provides it. The usual "no APT candidate"
-// test therefore never fires for an installed package, which used to send
-// Weld-repository packages (e.g. `weld reinstall weld`) down the APT path,
-// where no source provides them at all. Reinstalls now prefer the Weld
-// cache whenever the Weld repositories carry the package; the APT
-// repositories are only used when they do not.
 bool should_use_weld_candidate(const WeldPackageCandidate& weld_candidate,
                                const AptPackageState& apt_state,
                                const PackageSpec& spec, bool force_reinstall) {
@@ -3379,9 +3359,6 @@ bool cache_weld_package(const WeldPackageCandidate& candidate, std::string& loca
     std::string release_dir = g_weld_cache_dir + "/" + safe_release;
     if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) return false;
     local_path = release_dir + "/" + safe_file;
-    // Cache hit: a copy that is already in the Weld cache and matches the
-    // published SHA256 is reused as-is, so reinstalls install straight
-    // from the cache without touching the network.
     if (path_is_regular_file(local_path) && !candidate.sha256.empty()
         && calculate_sha256(local_path) == candidate.sha256) {
         return true;
@@ -3442,9 +3419,6 @@ bool download_weld_packages(std::vector<PendingWeldDownload>& pending_weld_downl
                     continue;
                 }
 
-                // Weld repository downloads are silent: Weld packages are
-                // reported through the standard transaction flow exactly like
-                // repository packages.
                 pending.success = true;
             }
         });
@@ -3588,7 +3562,6 @@ std::string parse_arvor_ua_version(const std::string& page) {
         }
     }
     while (!ver.empty() && ver.back() == '.') ver.pop_back();
-    WELD_CONTRACT(ver.find_first_not_of("0123456789.") == std::string::npos);
     return ver;
 }
 
@@ -3611,9 +3584,6 @@ int compare_arvor_versions(const std::string& a, const std::string& b) {
     return 0;
 }
 
-// Every successful transaction (repo install, local .deb install, remove,
-// purge, upgrade, dist-upgrade, reinstall) ends with the same standard
-// confirmation line.
 void print_successful_install() {
     constexpr std::string_view kGreen = "\033[38;5;114m";
     constexpr std::string_view kReset = "\033[0m";
@@ -3751,8 +3721,6 @@ struct PlannedPackageChange {
 
 enum class PlanOutcome { Proceed, NoChanges, Failed };
 
-// Prints "name (version) (arch)" tokens two spaces apart, wrapping at the
-// terminal width.
 void print_wrapped_package_list(const std::vector<PlannedPackageChange>& items, std::string_view color) {
     constexpr std::string_view kReset = "\033[0m";
     const int width = terminal_width();
@@ -3775,9 +3743,6 @@ void print_wrapped_package_list(const std::vector<PlannedPackageChange>& items, 
     std::print("\n");
 }
 
-// Resolves the transaction on a scratch cache to determine the full set of
-// packages that would be touched (targets plus pulled dependencies), showing
-// the "Getting Package list" and "Building Dependency Tree" steps.
 PlanOutcome compute_transaction_plan(const std::string& action, const std::vector<std::string>& targets,
                                      std::vector<PlannedPackageChange>& installs,
                                      std::vector<PlannedPackageChange>& removals) {
@@ -3922,8 +3887,6 @@ PlanOutcome compute_transaction_plan(const std::string& action, const std::vecto
     return PlanOutcome::Proceed;
 }
 
-// Shows the yellow summary, the green package list and the "Proceed? (y/n)"
-// prompt that gates every transaction.
 bool confirm_transaction_plan(const std::string& action,
                               const std::vector<PlannedPackageChange>& installs,
                               const std::vector<PlannedPackageChange>& removals) {
@@ -4375,8 +4338,6 @@ void perform_transaction_argv(const std::string& action, const std::vector<std::
 }
 
 void perform_transaction(const std::string& action, const std::vector<std::string>& pkgs, bool apply_host) {
-    // Upgrade actions report "no changes" through the transaction plan, so
-    // the precheck stays quiet for them.
     const bool quiet_precheck = (action == "upgrade" || action == "dist-upgrade");
     PrecheckResult precheck = precheck_transaction(action, pkgs, quiet_precheck);
     if (precheck == PrecheckResult::Failed) return;
@@ -5036,6 +4997,103 @@ void simulate_transaction(const std::string& action, const std::vector<std::stri
     std::print("Simulation only - no packages were actually changed, downloaded, or installed.\n");
 }
 
+struct CliOptions {
+    bool help = false;
+    bool version = false;
+    bool debug_acquire = false;
+    bool apply_host = false;
+    bool assume_yes = false;
+    bool reinstall = false;
+    bool simulate = false;
+    int search_page = 1;
+};
+
+struct CliAlias {
+    std::string_view flag;
+    std::string_view member;
+};
+
+constexpr std::array<CliAlias, 11> kCliAliases{{
+    {"-h", "help"},
+    {"-v", "version"},
+    {"--v", "version"},
+    {"--vb", "debug_acquire"},
+    {"-now", "apply_host"},
+    {"-y", "assume_yes"},
+    {"--yes", "assume_yes"},
+    {"-s", "simulate"},
+    {"--dry-run", "simulate"},
+    {"--just-print", "simulate"},
+    {"-p", "search_page"},
+}};
+
+template <typename T>
+constexpr bool cli_option_expects_value(std::string_view member) {
+    template for (constexpr auto m : std::define_static_array(
+                     std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()))) {
+        if (member == std::meta::identifier_of(m)) {
+            constexpr auto field_type = std::meta::type_of(m);
+            using field_t = [:field_type:];
+            return std::is_same_v<field_t, int>;
+        }
+    }
+    return false;
+}
+
+template <typename T>
+bool apply_cli_option(T& opts, std::string_view member, std::string_view value, bool has_value) {
+    template for (constexpr auto m : std::define_static_array(
+                     std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()))) {
+        if (member == std::meta::identifier_of(m)) {
+            constexpr auto field_type = std::meta::type_of(m);
+            using field_t = [:field_type:];
+            if constexpr (std::is_same_v<field_t, bool>) {
+                opts.[:m:] = true;
+            } else if constexpr (std::is_same_v<field_t, int>) {
+                if (!has_value) return false;
+                try {
+                    opts.[:m:] = std::stoi(std::string{value});
+                } catch (...) {
+                    opts.[:m:] = 1;
+                }
+            } else {
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string cli_member_name(std::string_view long_flag_body) {
+    std::string name{long_flag_body};
+    std::ranges::replace(name, '-', '_');
+    return name;
+}
+
+const CliAlias* find_cli_alias(std::string_view flag) {
+    for (const CliAlias& alias : kCliAliases) {
+        if (alias.flag == flag) return &alias;
+    }
+    return nullptr;
+}
+
+consteval bool cli_aliases_resolve_to_members() {
+    bool all = true;
+    for (const CliAlias& alias : kCliAliases) {
+        bool found = false;
+        template for (constexpr auto m : std::define_static_array(
+                         std::meta::nonstatic_data_members_of(
+                             ^^CliOptions, std::meta::access_context::current()))) {
+            if (alias.member == std::meta::identifier_of(m)) found = true;
+        }
+        all = all && found;
+    }
+    return all;
+}
+
+static_assert(cli_aliases_resolve_to_members());
+
 int main(int argc, char** argv) {
     setup_safety_handlers();
 
@@ -5054,44 +5112,67 @@ int main(int argc, char** argv) {
 
     std::string command;
     std::vector<std::string> pkgs;
-    bool apply_host = false;
-    int search_page = 1;
+    CliOptions cli_options;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            show_help();
-            return 0;
-        } else if (arg == "--v" || arg == "-v" || arg == "--version") {
-            std::print("{}\n", weld_version_str());
-            return 0;
-        } else if (arg == "--vb") {
-            _config->Set("Debug::pkgAcquire", "true");
-        } else if (arg == "-now" || arg == "--apply-host") {
-            apply_host = true;
-        } else if (arg == "-y" || arg == "--yes" || arg == "--assume-yes") {
-            g_assume_yes = true;
-        } else if (arg == "--reinstall") {
-            g_force_reinstall = true;
-        } else if (arg == "-s" || arg == "--simulate" || arg == "--dry-run" || arg == "--just-print") {
-            g_simulate_mode = true;
-        } else if (arg == "-p" && i + 1 < argc) {
-            try {
-                search_page = std::stoi(argv[++i]);
-            } catch (...) {
-                search_page = 1;
+        std::string member;
+        std::string value;
+        bool has_value = false;
+
+        if (const CliAlias* alias = find_cli_alias(arg)) {
+            member = std::string{alias->member};
+        } else if (arg.starts_with("--")) {
+            std::string_view body = std::string_view{arg}.substr(2);
+            if (auto eq = body.find('='); eq != std::string_view::npos) {
+                value = std::string{body.substr(eq + 1)};
+                has_value = true;
+                body = body.substr(0, eq);
             }
-        } else if (command.empty() && !arg.empty() && arg[0] != '-') {
-            command = arg;
-        } else if (!arg.empty() && arg[0] != '-') {
-            PackageSpec spec;
-            if (!arg.ends_with(".deb") && !parse_package_spec(arg, spec)) {
-                log_error(std::format("invalid package name: {}", arg));
-                return 1;
+            member = cli_member_name(body);
+        }
+
+        if (!member.empty() && cli_option_expects_value<CliOptions>(member) && !has_value) {
+            if (i + 1 < argc) {
+                value = argv[++i];
+                has_value = true;
+            } else {
+                member.clear();
             }
-            pkgs.push_back(std::move(arg));
+        }
+
+        if (!member.empty() && apply_cli_option(cli_options, member, value, has_value)) {
+            if (cli_options.help) {
+                show_help();
+                return 0;
+            }
+            if (cli_options.version) {
+                std::print("{}\n", weld_version_str());
+                return 0;
+            }
+            continue;
+        }
+
+        if (!arg.empty() && arg[0] != '-') {
+            if (command.empty()) {
+                command = arg;
+            } else {
+                PackageSpec spec;
+                if (!arg.ends_with(".deb") && !parse_package_spec(arg, spec)) {
+                    log_error(std::format("invalid package name: {}", arg));
+                    return 1;
+                }
+                pkgs.push_back(std::move(arg));
+            }
         }
     }
+
+    if (cli_options.debug_acquire) _config->Set("Debug::pkgAcquire", "true");
+    g_assume_yes = cli_options.assume_yes;
+    g_force_reinstall = cli_options.reinstall;
+    g_simulate_mode = cli_options.simulate;
+    bool apply_host = cli_options.apply_host;
+    int search_page = cli_options.search_page;
 
     if (command.empty()) {
         show_help();
