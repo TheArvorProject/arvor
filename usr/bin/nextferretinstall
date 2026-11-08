@@ -19,7 +19,7 @@ try:
                                  QLineEdit, QCheckBox, QStackedWidget, QMessageBox,
                                  QTextEdit, QListWidget, QListWidgetItem, QFrame,
                                  QGraphicsDropShadowEffect, QProgressBar, QListView,
-                                 QGridLayout, QScrollArea, QRadioButton, QButtonGroup)
+                                 QGridLayout, QScrollArea, QRadioButton, QButtonGroup, QSpinBox)
     from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase
     from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QEvent, QTimer, QByteArray, QRectF, QSize,
                               QPropertyAnimation, QEasingCurve)
@@ -30,7 +30,7 @@ except ImportError:
                                  QLineEdit, QCheckBox, QStackedWidget, QMessageBox,
                                  QTextEdit, QListWidget, QListWidgetItem, QFrame,
                                  QGraphicsDropShadowEffect, QProgressBar, QListView,
-                                 QGridLayout, QScrollArea, QRadioButton, QButtonGroup)
+                                 QGridLayout, QScrollArea, QRadioButton, QButtonGroup, QSpinBox)
     from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase
     from PySide6.QtCore import (Qt, QThread, Signal as pyqtSignal, QEvent, QTimer, QByteArray, QRectF, QSize,
                                 QPropertyAnimation, QEasingCurve)
@@ -174,6 +174,10 @@ ICONS_SVG = {
     "terminal": '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
     "x-circle": '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
     "alert-triangle": '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+    "wifi": '<path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 15.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>',
+    "wifi-off": '<line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>',
+    "lock": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    "network": '<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',
 }
 
 
@@ -292,6 +296,10 @@ _EXTRA_RAW = {
     "ui_part_bootfiles": ("Boot files", "Arquivos de boot", "Archivos de arranque", "Fichiers de démarrage", "Startdateien", "Ficheiros de arranque"),
     "ui_sec_result": ("What will be created", "O que será criado", "Qué se creará", "Ce qui sera créé", "Was erstellt wird", "O que se creará"),
     "ui_disk_none": ("No disks detected.", "Nenhum disco detectado.", "No se detectaron discos.", "Aucun disque détecté.", "Keine Datenträger gefunden.", "Non se detectaron discos."),
+    "ui_net_wired_d": ("Cable connection via Ethernet", "Conexão por cabo Ethernet", "Conexión por cable Ethernet", "Connexion filaire Ethernet", "Kabelverbindung über Ethernet", "Conexión por cable Ethernet"),
+    "ui_net_wifi_d": ("Connect to a wireless network", "Conectar a uma rede sem fio", "Conectar a una red inalámbrica", "Se connecter à un réseau sans fil", "Mit einem WLAN verbinden", "Conectar a unha rede sen fíos"),
+    "ui_split_auto_d": ("Sized automatically from the disk capacity", "Calculada automaticamente pela capacidade do disco", "Calculado automáticamente según la capacidad del disco", "Calculé automatiquement selon la capacité du disque", "Automatisch nach Datenträgergröße berechnet", "Calculado automaticamente pola capacidade do disco"),
+    "ui_split_manual_d": ("Choose the share for the system yourself", "Escolha você mesmo a fatia do sistema", "Elija usted mismo la parte del sistema", "Choisissez vous-même la part du système", "Anteil für das System selbst festlegen", "Escolla vostede a parte do sistema"),
     "ui_sum_none": ("None", "Nenhum", "Ninguno", "Aucun", "Keine", "Ningún"),
 }
 EXTRA_TEXT = {lg: {k: v[i] for k, v in _EXTRA_RAW.items()} for i, lg in enumerate(_LANGS)}
@@ -314,7 +322,7 @@ def guess_ui_lang():
 
 
 TITLE_ICONS = {
-    "welcome_msg": "smile", "step_location": "map-pin", "step_keyboard": "grid",
+    "welcome_msg": "smile", "step_network": "wifi", "step_location": "map-pin", "step_keyboard": "grid",
     "step_desktop": "package", "zram_title": "zap", "step_partitions": "hard-drive",
     "step_users": "users", "step_summary": "file-text", "step_install": "download-cloud",
 }
@@ -323,9 +331,19 @@ AUTO_SUB = {
     "step_desktop": "ui_sub_desktop", "step_partitions": "ui_sub_partitions",
     "step_users": "ui_sub_users", "step_summary": "ui_sub_summary", "step_install": "ui_sub_install",
 }
-MIN_DISK_GIB = 20
+MIN_DISK_GIB = 36
 PHASE_THRESHOLDS = (0, 15, 25, 55, 90)
 PHASE_KEYS = ("ui_phase_disk", "ui_phase_format", "ui_phase_base", "ui_phase_config", "ui_phase_finish")
+
+
+def root_share_for_gib(gib):
+    if gib < 64:
+        return 75
+    if gib < 128:
+        return 80
+    if gib < 256:
+        return 85
+    return 90
 
 
 class Spinner(QWidget):
@@ -487,6 +505,20 @@ class NetCheckWorker(QThread):
         self.result.emit(NetUtils.check_connection())
 
 
+class NetConnectWorker(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.result.emit(self.fn())
+        except Exception:
+            self.result.emit(None)
+
+
 class LoadingOverlay(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
@@ -532,6 +564,23 @@ class NetUtils:
         except:
             return None
 
+def _nmcli_split(line):
+    fields, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            fields.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    fields.append(cur)
+    return fields
+
+
 class Sys:
     @staticmethod
     def run(cmd, input_text=None, check=True):
@@ -553,6 +602,77 @@ class Sys:
             return r.stdout.strip()
         except Exception:
             return None
+
+    @staticmethod
+    def run_result(args):
+        try:
+            r = subprocess.run(args, shell=False, check=False, text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+        except Exception as e:
+            return 1, str(e)
+
+    @staticmethod
+    def nmcli_available():
+        return SIMULATE or shutil.which("nmcli") is not None
+
+    @staticmethod
+    def list_net_devices():
+        if SIMULATE:
+            return [
+                {"device": "eth0", "type": "ethernet", "state": "disconnected"},
+                {"device": "wlan0", "type": "wifi", "state": "disconnected"},
+            ]
+        out = Sys.run_args(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"])
+        devs = []
+        if out:
+            for line in out.splitlines():
+                parts = _nmcli_split(line)
+                if len(parts) >= 3 and parts[0]:
+                    devs.append({"device": parts[0], "type": parts[1], "state": parts[2]})
+        return devs
+
+    @staticmethod
+    def list_wifi_networks():
+        if SIMULATE:
+            return [
+                {"ssid": "NextFerret-5G", "signal": 92, "security": "WPA2"},
+                {"ssid": "CasaNet-2.4G", "signal": 71, "security": "WPA2"},
+                {"ssid": "ARVOR-LAB", "signal": 54, "security": "WPA3"},
+                {"ssid": "Cafe-Free", "signal": 38, "security": ""},
+            ]
+        Sys.run_args(["nmcli", "radio", "wifi", "on"])
+        out = Sys.run_args(["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes"])
+        nets = {}
+        if out:
+            for line in out.splitlines():
+                parts = _nmcli_split(line)
+                if len(parts) >= 3 and parts[0]:
+                    try:
+                        signal = int(parts[1])
+                    except ValueError:
+                        signal = 0
+                    nets[parts[0]] = {"ssid": parts[0], "signal": signal, "security": parts[2]}
+        return sorted(nets.values(), key=lambda n: -n["signal"])
+
+    @staticmethod
+    def wifi_connect(ssid, password):
+        if SIMULATE:
+            time.sleep(0.8)
+            return True
+        args = ["nmcli", "device", "wifi", "connect", ssid]
+        if password:
+            args += ["password", password]
+        rc, _ = Sys.run_result(args)
+        return rc == 0
+
+    @staticmethod
+    def wired_connect(iface):
+        if SIMULATE:
+            time.sleep(0.8)
+            return True
+        rc, _ = Sys.run_result(["nmcli", "device", "connect", iface])
+        return rc == 0
 
     @staticmethod
     def list_disks():
@@ -677,6 +797,23 @@ class InstallWorker(QThread):
         self.mount = "/mnt/arvor"
         self.mapper = "cryptarvor"
 
+    def target_disk_gib(self):
+        name = os.path.basename(self.conf.get("disk") or "")
+        try:
+            with open(f"/sys/block/{name}/size", "r") as f:
+                return int(f.read().strip()) * 512 / (1 << 30)
+        except Exception:
+            return 0
+
+    def conf_root_pct(self):
+        try:
+            pct = int(self.conf.get("split_root_pct") or 0)
+        except (TypeError, ValueError):
+            pct = 0
+        if 50 <= pct <= 95:
+            return pct
+        return root_share_for_gib(self.target_disk_gib())
+
     def run_cmd(self, cmd, input_text=None):
         self.log_msg.emit(f"== {cmd}")
         if SIMULATE: return True
@@ -748,11 +885,13 @@ class InstallWorker(QThread):
             vg_size_bytes = int(float(clean_str))
             if vg_size_bytes <= 0:
                 raise ValueError(f"Invalid VG size: {vg_size_bytes}")
-            pool_bytes = int(vg_size_bytes * 0.78)
+            root_pct = self.conf_root_pct()
+            pool_bytes = int(vg_size_bytes * root_pct / 100)
             pool_mb = pool_bytes // (1024 * 1024)
             if pool_mb <= 0:
                 raise ValueError(f"Calculated thin pool size is too small: {pool_mb}MB")
             pool_vsize = f"{pool_mb}M"
+            self.log_msg.emit(f"LVM split: root {root_pct}% / VG free {100 - root_pct}%")
         except Exception as e:
             self.log_msg.emit(f"ERROR: Failed to calculate VG thin pool size ({e}). Aborting installation.")
             self.finished.emit(False)
@@ -1028,11 +1167,14 @@ chmod +x /etc/grub.d/10_arvor_snapshots || true
 systemctl enable arvor-boot-success.service || true
 systemctl enable arvor-guard.timer || true
 
-touch /etc/default/grub
-
-sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX="rd.lvm.lv=arvor_vg/root"|' /etc/default/grub || true
-grep -q "rd.lvm.lv" /etc/default/grub || echo 'GRUB_CMDLINE_LINUX="rd.lvm.lv=arvor_vg/root"' >> /etc/default/grub
-
+mkdir -p /etc/default
+cat > /etc/default/grub <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="Arvor"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX="rd.lvm.lv=arvor_vg/root"
+EOF
 
 update-initramfs -c -k all || update-initramfs -u
 
@@ -1126,8 +1268,11 @@ class InstallerGUI(QMainWindow):
             "keymap": auto_keymap if auto_keymap in self.list_of_keymaps else default_keymap,
             "timezone": auto_tz if auto_tz in self.list_of_timezones else default_tz,
             "de_name": "None", "de_pkgs": "", "extra_pkgs": "", "driver_pkgs": "",
-            "swap_mode": "zram", "use_ext4": False
+            "swap_mode": "zram", "use_ext4": False,
+            "split_mode": "auto", "split_root_pct": 0
         }
+        self.net_ok = None
+        self.net_busy = False
         self.user_manually_edited = False
         self.desktops = [
             ("None (CLI)", ""), ("XFCE", "xfce4 xfce4-goodies lightdm"), ("GNOME", "gnome-core gdm3"),
@@ -1137,9 +1282,9 @@ class InstallerGUI(QMainWindow):
         self.icon_cache = {}
         self.sidebar_icon_cache = {}
 
-        self.steps = ["step_welcome", "step_location", "step_keyboard", "step_desktop",
+        self.steps = ["step_welcome", "step_network", "step_location", "step_keyboard", "step_desktop",
                       "step_zram", "step_partitions", "step_users", "step_summary", "step_install", "step_finish"]
-        self.step_keys = ["welcome", "location", "keyboard", "software", "zram", "disk", "users", "summary", "install", "finish"]
+        self.step_keys = ["welcome", "network", "location", "keyboard", "software", "zram", "disk", "users", "summary", "install", "finish"]
 
         self.preload_icons()
         self.init_ui()
@@ -1148,7 +1293,7 @@ class InstallerGUI(QMainWindow):
         return tr(self.ui_lang, key)
 
     def preload_icons(self):
-        self.sidebar_icon_names = {"welcome": "smile", "location": "map-pin", "keyboard": "grid", "software": "package",
+        self.sidebar_icon_names = {"welcome": "smile", "network": "wifi", "location": "map-pin", "keyboard": "grid", "software": "package",
                                    "zram": "zap", "disk": "hard-drive", "users": "users", "summary": "file-text",
                                    "install": "download-cloud", "finish": "check-circle"}
         self.icon_cache = {
@@ -1254,6 +1399,7 @@ class InstallerGUI(QMainWindow):
 
     def build_pages(self):
         self.stack.addWidget(self.create_welcome_page())
+        self.stack.addWidget(self.create_network_page())
         self.stack.addWidget(self.create_location_page())
         self.stack.addWidget(self.create_keyboard_page())
         self.stack.addWidget(self.create_desktop_page())
@@ -1318,16 +1464,16 @@ class InstallerGUI(QMainWindow):
             return
         idx = max(0, self.stack.currentIndex())
         self.btn_back.setEnabled(idx > 0)
-        self.btn_back.setVisible(idx != 9)
-        self.btn_quit.setVisible(idx < 8)
+        self.btn_back.setVisible(idx != 10)
+        self.btn_quit.setVisible(idx < 9)
         self.btn_next.show()
-        if idx == 7:
+        if idx == 8:
             self.btn_next.setText(self.t("install"))
             self.btn_next.setIcon(self.get_nav_icon("install_btn"))
-        elif idx == 8:
+        elif idx == 9:
             self.btn_next.setText(self.t("ui_retry"))
             self.btn_next.setIcon(self.get_nav_icon("retry"))
-        elif idx == 9:
+        elif idx == 10:
             self.btn_next.setText(self.t("quit"))
             self.btn_next.setIcon(self.get_nav_icon("check_btn"))
         else:
@@ -1489,6 +1635,22 @@ class InstallerGUI(QMainWindow):
         if hasattr(self, 'chk_nvidia'): self.chk_nvidia.setText(self.t("drv_nvidia"))
         if hasattr(self, 'chk_firmware'): self.chk_firmware.setText(self.t("drv_firmware"))
         if hasattr(self, 'chk_mediatek'): self.chk_mediatek.setText(self.t("drv_mediatek"))
+        if hasattr(self, 'rb_net_wired'): self.rb_net_wired.setText(self.t("net_wired"))
+        if hasattr(self, 'rb_net_wifi'): self.rb_net_wifi.setText(self.t("net_wifi"))
+        if hasattr(self, 'lbl_net_wired_hint'): self.lbl_net_wired_hint.setText(self.t("net_wired_hint"))
+        if hasattr(self, 'lbl_wired_iface'): self.lbl_wired_iface.setText(self.t("net_iface"))
+        if hasattr(self, 'btn_wired_connect'): self.btn_wired_connect.setText(self.t("net_connect"))
+        if hasattr(self, 'btn_net_scan'): self.btn_net_scan.setText(self.t("net_scan"))
+        if hasattr(self, 'lbl_net_pass'): self.lbl_net_pass.setText(self.t("net_pass"))
+        if hasattr(self, 'i_net_pass'): self.i_net_pass.setPlaceholderText(self.t("net_pass"))
+        if hasattr(self, 'btn_wifi_connect'): self.btn_wifi_connect.setText(self.t("net_connect"))
+        if hasattr(self, 'btn_net_recheck'): self.btn_net_recheck.setText(self.t("net_recheck"))
+        if hasattr(self, 'lbl_split'): self.lbl_split.setText(self.t("lbl_split"))
+        if hasattr(self, 'rb_split_auto'): self.rb_split_auto.setText(self.t("split_auto"))
+        if hasattr(self, 'rb_split_manual'): self.rb_split_manual.setText(self.t("split_manual"))
+        if hasattr(self, 'lbl_split_root'): self.lbl_split_root.setText(self.t("split_root"))
+        if hasattr(self, 'update_split_hint'): self.update_split_hint()
+        if hasattr(self, 'lbl_net_status'): self.refresh_net_status()
 
         if hasattr(self, 'btn_back'): self.btn_back.setText(self.t("back"))
         if hasattr(self, 'btn_quit'): self.btn_quit.setText(self.t("ui_cancel"))
@@ -1508,6 +1670,322 @@ class InstallerGUI(QMainWindow):
                 for child in target.findChildren(QLabel):
                     if child.property("text_key"):
                         child.setText(self.t(child.property("text_key")))
+
+    def create_network_page(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;background:transparent;} QWidget#network_container{background:transparent;}")
+
+        w = QWidget()
+        w.setObjectName("network_container")
+        l = QVBoxLayout(w)
+        l.setContentsMargins(0, 0, 8, 0)
+        l.addWidget(self.create_title("step_network", "net_sub"))
+
+        card, cl = self._create_card()
+        cl.setSpacing(10)
+
+        self.net_status_frame = QFrame()
+        self.net_status_frame.setObjectName("net_status")
+        sh = QHBoxLayout(self.net_status_frame)
+        sh.setContentsMargins(16, 10, 16, 10)
+        sh.setSpacing(12)
+        self.net_status_icon = QLabel()
+        self.net_status_icon.setFixedSize(28, 28)
+        self.net_status_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_net_status = QLabel(self.t("net_checking"))
+        self.lbl_net_status.setStyleSheet("font-size:14px;font-weight:700;background:transparent;border:none;")
+        self.net_spinner = Spinner(24, "#4a78ff", "#dbe4f5", 3)
+        self.net_spinner.hide()
+        self.btn_net_recheck = QPushButton(self.t("net_recheck"))
+        self.btn_net_recheck.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_net_recheck.setIcon(svg_icon("rotate-cw", "#ffffff", 15))
+        self.btn_net_recheck.setIconSize(QSize(15, 15))
+        self.btn_net_recheck.setStyleSheet("QPushButton{background:#4a78ff;color:#fff;border:none;border-radius:10px;padding:8px 16px;font-size:12px;font-weight:700;}"
+                                           "QPushButton:hover{background:#3868ef;}"
+                                           "QPushButton:disabled{background:#c9d6f2;}")
+        self.btn_net_recheck.clicked.connect(self.run_net_check)
+        sh.addWidget(self.net_status_icon)
+        sh.addWidget(self.lbl_net_status, 1)
+        sh.addWidget(self.net_spinner)
+        sh.addWidget(self.btn_net_recheck)
+        cl.addWidget(self.net_status_frame)
+
+        self.rb_net_wired = QRadioButton()
+        self.rb_net_wifi = QRadioButton()
+        self.rb_net_wifi.setChecked(True)
+        self.net_mode_group = QButtonGroup(self)
+        self.net_mode_group.addButton(self.rb_net_wired)
+        self.net_mode_group.addButton(self.rb_net_wifi)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(14)
+        mode_row.addWidget(self._make_fs_card(self.rb_net_wired, self.t("net_wired"), "ui_net_wired_d"), 1)
+        mode_row.addWidget(self._make_fs_card(self.rb_net_wifi, self.t("net_wifi"), "ui_net_wifi_d"), 1)
+        cl.addLayout(mode_row)
+
+        self.net_stack = QStackedWidget()
+
+        wired_box = QFrame()
+        wired_box.setObjectName("net_box")
+        wired_box.setStyleSheet("QFrame#net_box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;}")
+        wv = QVBoxLayout(wired_box)
+        wv.setContentsMargins(16, 14, 16, 14)
+        wv.setSpacing(8)
+        self.lbl_net_wired_hint = QLabel(self.t("net_wired_hint"))
+        self.lbl_net_wired_hint.setWordWrap(True)
+        self.lbl_net_wired_hint.setStyleSheet("color:#64748b;font-size:12px;background:transparent;border:none;")
+        self.lbl_wired_iface = QLabel(self.t("net_iface"))
+        self.lbl_wired_iface.setStyleSheet("font-weight:600;color:#334155;margin-top:4px;background:transparent;border:none;")
+        self.c_wired_if = self._make_combo()
+        self.btn_wired_connect = QPushButton(self.t("net_connect"))
+        self.btn_wired_connect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_wired_connect.setStyleSheet("QPushButton{background:#4a78ff;color:#fff;border:none;border-radius:12px;padding:11px 24px;font-weight:600;}"
+                                             "QPushButton:hover{background:#3868ef;}"
+                                             "QPushButton:disabled{background:#c9d6f2;color:#fff;}")
+        self.btn_wired_connect.clicked.connect(self.connect_wired)
+        wv.addWidget(self.lbl_net_wired_hint)
+        wv.addWidget(self.lbl_wired_iface)
+        wv.addWidget(self.c_wired_if)
+        wv.addWidget(self.btn_wired_connect)
+
+        wifi_box = QFrame()
+        wifi_box.setObjectName("net_box2")
+        wifi_box.setStyleSheet("QFrame#net_box2{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;}")
+        wiv = QVBoxLayout(wifi_box)
+        wiv.setContentsMargins(16, 14, 16, 14)
+        wiv.setSpacing(8)
+        self.btn_net_scan = QPushButton(self.t("net_scan"))
+        self.btn_net_scan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_net_scan.setIcon(svg_icon("rotate-cw", "#4a78ff", 15))
+        self.btn_net_scan.setIconSize(QSize(15, 15))
+        self.btn_net_scan.setStyleSheet("QPushButton{background:#fff;border:1px solid #d9e1eb;border-radius:10px;padding:8px 16px;color:#314056;font-weight:600;font-size:12px;}"
+                                        "QPushButton:hover{border-color:#4a78ff;color:#4a78ff;}"
+                                        "QPushButton:disabled{color:#a3afc2;border-color:#e5ebf3;}")
+        self.btn_net_scan.clicked.connect(self.scan_wifi)
+        self.wifi_list = QListWidget()
+        self.wifi_nets = []
+        self.wifi_list.setMinimumHeight(190)
+        self.wifi_list.setStyleSheet("QListWidget{background:#fff;border:1px solid #d9e1eb;border-radius:12px;padding:6px;font-size:13px;outline:none;}"
+                                     "QListWidget::item{min-height:36px;border-radius:8px;padding:4px 10px;}"
+                                     "QListWidget::item:selected{background:#4a78ff;color:#fff;}"
+                                     "QListWidget::item:hover{background:#f0f5ff;}")
+        self.wifi_list.itemDoubleClicked.connect(lambda _item: self.connect_wifi())
+        self.wifi_list.currentRowChanged.connect(self.on_wifi_selected)
+        self.lbl_net_pass = QLabel(self.t("net_pass"))
+        self.lbl_net_pass.setStyleSheet("font-weight:600;color:#334155;margin-top:4px;background:transparent;border:none;")
+        self.net_pass_wrapper, self.i_net_pass = self._make_password_field()
+        self.i_net_pass.setPlaceholderText(self.t("net_pass"))
+        self.btn_wifi_connect = QPushButton(self.t("net_connect"))
+        self.btn_wifi_connect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_wifi_connect.setStyleSheet("QPushButton{background:#4a78ff;color:#fff;border:none;border-radius:12px;padding:11px 24px;font-weight:600;}"
+                                            "QPushButton:hover{background:#3868ef;}"
+                                            "QPushButton:disabled{background:#c9d6f2;color:#fff;}")
+        self.btn_wifi_connect.clicked.connect(self.connect_wifi)
+        wiv.addWidget(self.btn_net_scan)
+        wiv.addWidget(self.wifi_list)
+        wiv.addWidget(self.lbl_net_pass)
+        wiv.addWidget(self.net_pass_wrapper)
+        wiv.addWidget(self.btn_wifi_connect)
+
+        self.net_stack.addWidget(wired_box)
+        self.net_stack.addWidget(wifi_box)
+        cl.addWidget(self.net_stack)
+
+        self.rb_net_wired.toggled.connect(lambda on: self.net_stack.setCurrentIndex(0 if on else 1))
+        self.rb_net_wifi.toggled.connect(self.on_wifi_tab)
+        self.net_stack.setCurrentIndex(0 if self.rb_net_wired.isChecked() else 1)
+
+        if not Sys.nmcli_available():
+            alert = self._create_alert("net_err_nmcli", "danger")
+            alert_lbl = alert.findChild(QLabel)
+            if alert_lbl:
+                alert_lbl.setWordWrap(True)
+            cl.addWidget(alert)
+            self.btn_net_scan.setEnabled(False)
+            self.btn_wifi_connect.setEnabled(False)
+
+        self.refresh_net_ifaces()
+        self.refresh_net_status()
+        has_wifi = any(d.get("type") == "wifi" for d in getattr(self, 'net_devices', []))
+        if not has_wifi and self.c_wired_if.currentData():
+            self.rb_net_wired.setChecked(True)
+        if Sys.nmcli_available():
+            self.scan_wifi()
+
+        l.addWidget(card)
+        l.addStretch()
+        scroll.setWidget(w)
+        return scroll
+
+    def refresh_net_status(self, ok="keep"):
+        if ok != "keep":
+            self.net_ok = ok
+        if not hasattr(self, 'lbl_net_status'):
+            return
+        if self.net_ok is True:
+            self.net_status_frame.setStyleSheet("QFrame#net_status{background:#effaf3;border:1px solid #bbf0cf;border-radius:12px;}")
+            self.net_status_icon.setPixmap(svg_pixmap("check-circle", "#16a34a", 26, 2))
+            self.net_status_icon.show()
+            self.lbl_net_status.setText(self.t("net_connected"))
+            self.lbl_net_status.setStyleSheet("color:#166534;font-size:14px;font-weight:700;background:transparent;border:none;")
+        elif self.net_ok is False:
+            self.net_status_frame.setStyleSheet("QFrame#net_status{background:#fff1f1;border:1px solid #f3b7b7;border-radius:12px;}")
+            self.net_status_icon.setPixmap(svg_pixmap("wifi-off", "#dc2626", 26, 2))
+            self.net_status_icon.show()
+            self.lbl_net_status.setText(self.t("net_offline"))
+            self.lbl_net_status.setStyleSheet("color:#b02b2b;font-size:14px;font-weight:700;background:transparent;border:none;")
+        else:
+            self.net_status_frame.setStyleSheet("QFrame#net_status{background:#f0f5ff;border:1px solid #c7d7fe;border-radius:12px;}")
+            self.net_status_icon.hide()
+            self.lbl_net_status.setText(self.t("net_checking"))
+            self.lbl_net_status.setStyleSheet("color:#1e3a8a;font-size:14px;font-weight:700;background:transparent;border:none;")
+
+    def run_net_check(self):
+        if not hasattr(self, 'lbl_net_status') or self.net_busy:
+            return
+        self.net_busy = True
+        self.btn_net_recheck.setEnabled(False)
+        self.net_spinner.start()
+        self.net_spinner.show()
+        self.lbl_net_status.setText(self.t("net_checking"))
+        self.lbl_net_status.setStyleSheet("color:#1e3a8a;font-size:14px;font-weight:700;background:transparent;border:none;")
+
+        def done(ok):
+            self.net_busy = False
+            self.btn_net_recheck.setEnabled(True)
+            self.net_spinner.stop()
+            self.net_spinner.hide()
+            self.refresh_net_status(ok)
+
+        self.net_check_worker = NetConnectWorker(NetUtils.check_connection)
+        self.net_check_worker.result.connect(done)
+        self.net_check_worker.start()
+
+    def refresh_net_ifaces(self):
+        if not hasattr(self, 'c_wired_if'):
+            return
+        self.net_devices = Sys.list_net_devices()
+        self.c_wired_if.blockSignals(True)
+        self.c_wired_if.clear()
+        for d in self.net_devices:
+            if d.get("type") == "ethernet":
+                self.c_wired_if.addItem(f"{d['device']} · {d.get('state', '')}", d["device"])
+        if self.c_wired_if.count() == 0:
+            self.c_wired_if.addItem(self.t("net_no_iface"), "")
+        self.c_wired_if.blockSignals(False)
+        self.btn_wired_connect.setEnabled(bool(self.c_wired_if.currentData()) and Sys.nmcli_available())
+
+    def on_wifi_tab(self, active):
+        if active and self.wifi_list.count() == 0 and Sys.nmcli_available():
+            self.scan_wifi()
+
+    def scan_wifi(self):
+        if not hasattr(self, 'wifi_list') or self.net_busy:
+            return
+        self.net_busy = True
+        self.btn_net_scan.setEnabled(False)
+        self.wifi_list.clear()
+        self.wifi_nets = []
+        loading = QListWidgetItem(self.t("net_scanning"))
+        loading.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.wifi_list.addItem(loading)
+
+        def done(nets):
+            self.net_busy = False
+            if Sys.nmcli_available():
+                self.btn_net_scan.setEnabled(True)
+            self.populate_wifi_list(nets)
+
+        self.net_scan_worker = NetConnectWorker(Sys.list_wifi_networks)
+        self.net_scan_worker.result.connect(done)
+        self.net_scan_worker.start()
+
+    def populate_wifi_list(self, nets):
+        self.wifi_list.clear()
+        nets = nets or []
+        self.wifi_nets = nets
+        for n in nets:
+            sec = (n.get("security") or "").strip()
+            suffix = sec if sec else self.t("net_open")
+            it = QListWidgetItem(f"{n.get('ssid', '')}   ·   {n.get('signal', 0)}%   ·   {suffix}")
+            it.setIcon(QIcon(svg_pixmap("lock" if sec else "wifi", "#64748b", 15, 2)))
+            self.wifi_list.addItem(it)
+        if not nets:
+            empty = QListWidgetItem(self.t("net_no_wifi"))
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.wifi_list.addItem(empty)
+
+    def on_wifi_selected(self, row):
+        nets = getattr(self, 'wifi_nets', None) or []
+        if 0 <= row < len(nets):
+            self.i_net_pass.setEnabled(bool(nets[row].get("security")))
+
+    def connect_wifi(self):
+        if not hasattr(self, 'wifi_list') or self.net_busy:
+            return
+        nets = getattr(self, 'wifi_nets', None) or []
+        row = self.wifi_list.currentRow()
+        if not (0 <= row < len(nets)):
+            QMessageBox.warning(self, "Wi-Fi", self.t("net_pick"))
+            return
+        net = nets[row]
+        ssid = net.get("ssid") or ""
+        password = self.i_net_pass.text() if net.get("security") else ""
+        self.net_busy = True
+        self.btn_wifi_connect.setEnabled(False)
+        self.btn_net_scan.setEnabled(False)
+        self.net_spinner.start()
+        self.net_spinner.show()
+        self.lbl_net_status.setText(self.t("net_connecting"))
+        self.lbl_net_status.setStyleSheet("color:#1e3a8a;font-size:14px;font-weight:700;background:transparent;border:none;")
+
+        def done(ok):
+            self.net_busy = False
+            self.btn_wifi_connect.setEnabled(True)
+            if Sys.nmcli_available():
+                self.btn_net_scan.setEnabled(True)
+            self.net_spinner.stop()
+            self.net_spinner.hide()
+            if ok:
+                self.i_net_pass.clear()
+                self.refresh_net_ifaces()
+                self.run_net_check()
+            else:
+                self.refresh_net_status(False)
+                QMessageBox.warning(self, "Wi-Fi", self.t("net_fail"))
+
+        self.net_conn_worker = NetConnectWorker(lambda: Sys.wifi_connect(ssid, password))
+        self.net_conn_worker.result.connect(done)
+        self.net_conn_worker.start()
+
+    def connect_wired(self):
+        if not hasattr(self, 'c_wired_if') or self.net_busy:
+            return
+        iface = self.c_wired_if.currentData()
+        if not iface:
+            return
+        self.net_busy = True
+        self.btn_wired_connect.setEnabled(False)
+        self.net_spinner.start()
+        self.net_spinner.show()
+        self.lbl_net_status.setText(self.t("net_connecting"))
+        self.lbl_net_status.setStyleSheet("color:#1e3a8a;font-size:14px;font-weight:700;background:transparent;border:none;")
+
+        def done(ok):
+            self.net_busy = False
+            self.btn_wired_connect.setEnabled(True)
+            self.net_spinner.stop()
+            self.net_spinner.hide()
+            if ok:
+                self.refresh_net_ifaces()
+                self.run_net_check()
+            else:
+                self.refresh_net_status(False)
+                QMessageBox.warning(self, "Ethernet", self.t("net_fail"))
+
+        self.net_conn_worker = NetConnectWorker(lambda: Sys.wired_connect(iface))
+        self.net_conn_worker.result.connect(done)
+        self.net_conn_worker.start()
 
     def create_location_page(self):
         w = QWidget()
@@ -1943,6 +2421,58 @@ class InstallerGUI(QMainWindow):
         cl.addWidget(rows_box)
         cl.addSpacing(12)
 
+        split_box = QFrame()
+        split_box.setObjectName("split_box")
+        split_box.setStyleSheet("QFrame#split_box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;}")
+        sv = QVBoxLayout(split_box)
+        sv.setContentsMargins(16, 12, 16, 12)
+        sv.setSpacing(8)
+        self.lbl_split = QLabel(self.t("lbl_split"))
+        self.lbl_split.setStyleSheet("font-size:14px;font-weight:700;color:#1e293b;background:transparent;border:none;")
+        self.rb_split_auto = QRadioButton()
+        self.rb_split_auto.setChecked(True)
+        self.rb_split_manual = QRadioButton()
+        self.split_group = QButtonGroup(self)
+        self.split_group.addButton(self.rb_split_auto)
+        self.split_group.addButton(self.rb_split_manual)
+        self.lbl_split_root = QLabel(self.t("split_root"))
+        self.lbl_split_root.setStyleSheet("color:#64748b;font-size:12px;font-weight:600;background:transparent;border:none;")
+        self.lbl_split_root.hide()
+        self.sp_split = QSpinBox()
+        self.sp_split.setRange(50, 95)
+        self.sp_split.setValue(85)
+        self.sp_split.setSuffix("%")
+        self.sp_split.setEnabled(False)
+        self.sp_split.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
+        self.sp_split.hide()
+        self.sp_split.setFixedHeight(38)
+        self.sp_split.setStyleSheet("QSpinBox{background:#fff;border:1px solid #d9e1eb;border-radius:10px;padding:0 12px;font-size:14px;font-weight:700;color:#243042;min-width:90px;selection-background-color:#4a78ff;}"
+                                    "QSpinBox:enabled{border:1px solid #4a78ff;}"
+                                    "QSpinBox:disabled{color:#a3afc2;background:#f1f4f9;border:1px solid #e5ebf3;}"
+                                    "QSpinBox::up-button,QSpinBox::down-button{width:0;height:0;border:none;}")
+        split_row = QHBoxLayout()
+        split_row.setSpacing(14)
+        split_row.addWidget(self._make_fs_card(self.rb_split_auto, self.t("split_auto"), "ui_split_auto_d"), 1)
+        split_row.addWidget(self._make_fs_card(self.rb_split_manual, self.t("split_manual"), "ui_split_manual_d"), 1)
+        spin_row = QHBoxLayout()
+        spin_row.addStretch()
+        spin_row.addWidget(self.lbl_split_root)
+        spin_row.addWidget(self.sp_split)
+        self.lbl_split_info = QLabel()
+        self.lbl_split_info.setStyleSheet("font-size:13px;font-weight:700;color:#4a78ff;background:transparent;border:none;")
+        self.lbl_split_tiers = QLabel(self.t("split_tiers"))
+        self.lbl_split_tiers.setWordWrap(True)
+        self.lbl_split_tiers.setStyleSheet("color:#94a3b8;font-size:11.5px;background:transparent;border:none;")
+        sv.addWidget(self.lbl_split)
+        sv.addLayout(split_row)
+        sv.addLayout(spin_row)
+        sv.addWidget(self.lbl_split_info)
+        sv.addWidget(self.lbl_split_tiers)
+        self.rb_split_manual.toggled.connect(self.on_split_mode_changed)
+        self.sp_split.valueChanged.connect(self.update_disk_preview)
+        cl.addWidget(split_box)
+        cl.addSpacing(12)
+
         self.adv_box = QWidget()
         adv = QVBoxLayout(self.adv_box)
         adv.setContentsMargins(0, 0, 0, 0)
@@ -2037,6 +2567,43 @@ class InstallerGUI(QMainWindow):
     def disk_too_small(self):
         return self.selected_disk_bytes() < MIN_DISK_GIB * (1 << 30)
 
+    def auto_root_share(self):
+        return root_share_for_gib(self.selected_disk_bytes() / (1 << 30))
+
+    def current_root_share(self):
+        if getattr(self, 'rb_split_manual', None) is not None and self.rb_split_manual.isChecked():
+            return self.sp_split.value()
+        return self.auto_root_share()
+
+    def on_split_mode_changed(self, manual):
+        self.sp_split.setEnabled(manual)
+        self.sp_split.setVisible(manual)
+        self.lbl_split_root.setVisible(manual)
+        if manual:
+            self.sp_split.setValue(self.auto_root_share())
+        self.update_split_hint()
+        self.update_disk_preview()
+
+    def update_split_hint(self):
+        if not hasattr(self, 'lbl_split_tiers'):
+            return
+        if self.rb_split_manual.isChecked():
+            self.lbl_split_tiers.setText(self.t("split_manual_hint"))
+        else:
+            self.lbl_split_tiers.setText(self.t("split_tiers"))
+
+    def split_summary_text(self):
+        try:
+            share = self.current_root_share()
+            total = self.selected_disk_bytes()
+            esp, boot = 512 << 20, 1024 << 20
+            rest = max(0, total - esp - boot)
+            root = int(rest * share / 100)
+            snap = rest - root
+            return f"{share}% / {100 - share}%  ({self.fmt_size(root)} / {self.fmt_size(snap)})"
+        except Exception:
+            return "—"
+
     def _make_disk_cards(self):
         box = QVBoxLayout()
         box.setSpacing(10)
@@ -2097,7 +2664,8 @@ class InstallerGUI(QMainWindow):
         idx = self.c_disk.currentIndex()
         esp, boot = 512 << 20, 1024 << 20
         rest = max(0, total - esp - boot)
-        root = int(rest * 0.78)
+        share = self.current_root_share()
+        root = int(rest * share / 100)
         snap = rest - root
         sizes = [esp + boot, root, snap]
         fs = "ext4" if self.rb_ext4.isChecked() else "XFS"
@@ -2127,7 +2695,7 @@ class InstallerGUI(QMainWindow):
             seg.setToolTip(f"{names[i]} · {pct[i]:.0f}%")
         details = [
             "EFI (FAT32) + /boot (ext4)",
-            f"{fs} · /  (LVM thin){enc}",
+            f"{fs} · /  (LVM thin · {share}%){enc}",
             self.t("ui_part_snap_d"),
         ]
         for i, (name, detail, size) in enumerate(self.preview_rows):
@@ -2141,6 +2709,14 @@ class InstallerGUI(QMainWindow):
                 self.lbl_disk_small.show()
             else:
                 self.lbl_disk_small.hide()
+
+        if hasattr(self, 'lbl_split_info'):
+            if total:
+                self.lbl_split_info.setText(
+                    f"{self.t('split_root')}: {share}% · {self.fmt_size(root)}   |   "
+                    f"{self.t('split_vgfree')}: {100 - share}% · {self.fmt_size(snap)}")
+            else:
+                self.lbl_split_info.setText("—")
 
     def slugify_username(self, name):
         import unicodedata, re
@@ -2344,6 +2920,7 @@ class InstallerGUI(QMainWindow):
             ("#10b981", self.t("step_partitions"), [
                 (self.t("ui_sum_disk"), self.c_disk.currentText() or self.conf['disk']),
                 (self.t("ui_sum_fs"), fs_type.upper()),
+                (self.t("sum_split"), self.split_summary_text()),
                 (self.t("ui_sum_enc"), on_off),
                 (self.t("ui_sum_swap"), self.t(swap_label_key)),
             ]),
@@ -2772,11 +3349,16 @@ class InstallerGUI(QMainWindow):
     def validate_current_page(self):
         idx = self.stack.currentIndex()
         if idx == 1:
+            if self.net_ok is not True and not SIMULATE:
+                QMessageBox.warning(self, "Error", self.t("net_err"))
+                self.run_net_check()
+                return False
+        elif idx == 2:
             self.sys_locale = self.c_locale.currentText()
             self.conf["timezone"] = self.i_tz.currentText()
-        elif idx == 2:
-            self.conf["keymap"] = self.c_key.currentText()
         elif idx == 3:
+            self.conf["keymap"] = self.c_key.currentText()
+        elif idx == 4:
             self.conf["de_name"] = self.c_de.currentText()
             self.conf["de_pkgs"] = self.c_de.currentData()
             app_list = []
@@ -2792,10 +3374,10 @@ class InstallerGUI(QMainWindow):
 
             self.conf["driver_pkgs"] = " ".join(driver_list)
             self.conf["extra_pkgs"] = " ".join(app_list + driver_list)
-        elif idx == 4:
+        elif idx == 5:
             if hasattr(self, 'c_swap'):
                 self.conf["swap_mode"] = self.c_swap.currentData() or "zram"
-        elif idx == 5:
+        elif idx == 6:
             if self.c_disk.currentIndex() == -1:
                 QMessageBox.warning(self, "Error", self.t("err_disk"))
                 return False
@@ -2809,7 +3391,9 @@ class InstallerGUI(QMainWindow):
             self.conf["luks"] = self.chk_luks.isChecked()
             self.conf["luks_pass"] = self.i_luks_p.text()
             self.conf["use_ext4"] = self.rb_ext4.isChecked()
-        elif idx == 6:
+            self.conf["split_mode"] = "manual" if self.rb_split_manual.isChecked() else "auto"
+            self.conf["split_root_pct"] = self.current_root_share()
+        elif idx == 7:
             display_name = self.i_display_name.text().strip()
             user = self.i_user.text().strip()
             host = self.i_host.text().strip()
@@ -2852,12 +3436,12 @@ class InstallerGUI(QMainWindow):
         idx = self.stack.currentIndex()
         if not self.validate_current_page(): return
 
-        if idx == 6:
+        if idx == 7:
             self.populate_summary()
-        elif idx in (7, 8):
+        elif idx in (8, 9):
             self.start_install()
             return
-        elif idx == 9:
+        elif idx == 10:
             if not SIMULATE:
                 Sys.run("reboot")
             sys.exit(0)
@@ -2866,7 +3450,7 @@ class InstallerGUI(QMainWindow):
 
     def go_back(self):
         idx = self.stack.currentIndex()
-        if 0 < idx < 9:
+        if 0 < idx < 10:
             self.goto_page(idx - 1)
 
     def goto_page(self, new_idx):
@@ -2887,7 +3471,7 @@ class InstallerGUI(QMainWindow):
             self.lbl_status.setText(line)
 
     def start_install(self):
-        self.stack.setCurrentIndex(8)
+        self.stack.setCurrentIndex(9)
         self.update_sidebar()
         self.nav_container.hide()
 
@@ -2928,7 +3512,7 @@ class InstallerGUI(QMainWindow):
         if success:
             self.pbar.setValue(100)
             self.set_phase(4, all_done=True)
-            self.stack.setCurrentIndex(9)
+            self.stack.setCurrentIndex(10)
             self.nav_container.show()
             self.refresh_nav()
         else:
@@ -2976,9 +3560,7 @@ if __name__ == "__main__":
     gui.net_worker = net_worker
 
     def on_net(ok):
-        if not ok:
-            QMessageBox.critical(gui, "Network Error", TEXT.get("en", {}).get("net_err", "No network connection."))
-            app.exit(1)
+        gui.refresh_net_status(ok)
 
     net_worker.result.connect(on_net)
     net_worker.start()
