@@ -1,3 +1,5 @@
+// NextFerret, 2026.
+// Maintainer: Hludwig (@hludwig-nf) Note: Compile it with GCC 16 or an compiler which supports C++26.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -307,7 +309,7 @@ void log_warning(std::string_view msg) {
 
 namespace {
 
-constexpr std::string_view kWeldVersion = "6.0.0";
+constexpr std::string_view kWeldVersion = "6.2.0";
 constexpr std::string_view kTreeRoot = "/nsm/weld/root";
 constexpr std::string_view kNfTreeBin = "/usr/bin/nsm";
 constexpr std::string_view kAutoSnapDir = "/nsm/snapshots/auto";
@@ -317,6 +319,11 @@ constexpr std::string_view kWeldSourcesFile = "/etc/weld/sources.list";
 constexpr std::string_view kWeldSourcesDir = "/etc/weld/sources.list.d";
 constexpr std::string_view kWeldCacheDir = "/etc/weld/cache";
 constexpr std::string_view kWeldTrustedKeysDir = "/etc/weld/trusted_keys";
+
+constexpr std::string_view kWeldIndexFileName = "index.wrpl";
+
+constexpr std::string_view kArvorUpdatesBaseUrl = "https://nextferret.github.io/updates/arvor";
+constexpr std::string_view kArvorWeldRepoBaseUrl = "https://thearvorindex.github.io/repo-arvorlinux--";
 
 constexpr std::size_t kWeldMinMemMb = 256;
 constexpr std::size_t kWeldMaxMetadataSize = 8ULL * 1024 * 1024;
@@ -1497,27 +1504,22 @@ public:
 };
 
 struct ConfigBackup {
-    std::string os_release_orig;
     std::string apt_sources_orig;
     std::string weld_sources_orig;
-    std::string os_release_new;
     std::string apt_sources_new;
     std::string weld_sources_new;
     bool backed_up = false;
     bool has_new = false;
 
     void backup() {
-        os_release_orig.clear();
         apt_sources_orig.clear();
         weld_sources_orig.clear();
-        read_text_file("/etc/os-release", os_release_orig);
         read_text_file("/etc/apt/sources.list", apt_sources_orig);
         read_text_file("/etc/weld/sources.list", weld_sources_orig);
         backed_up = true;
     }
 
-    void set_new(std::string_view os, std::string_view apt, std::string_view weld) {
-        os_release_new = os;
+    void set_new(std::string_view apt, std::string_view weld) {
         apt_sources_new = apt;
         weld_sources_new = weld;
         has_new = true;
@@ -1525,8 +1527,6 @@ struct ConfigBackup {
 
     void restore_orig() {
         if (!backed_up) return;
-        if (!os_release_orig.empty()) write_text_file("/etc/os-release", os_release_orig);
-        else unlink("/etc/os-release");
         if (!apt_sources_orig.empty()) write_text_file("/etc/apt/sources.list", apt_sources_orig);
         else unlink("/etc/apt/sources.list");
         if (!weld_sources_orig.empty()) write_text_file("/etc/weld/sources.list", weld_sources_orig);
@@ -1535,7 +1535,6 @@ struct ConfigBackup {
 
     void apply_new() {
         if (!has_new) return;
-        if (!os_release_new.empty()) write_text_file("/etc/os-release", os_release_new);
         if (!apt_sources_new.empty()) write_text_file("/etc/apt/sources.list", apt_sources_new);
         if (!weld_sources_new.empty()) write_text_file("/etc/weld/sources.list", weld_sources_new);
     }
@@ -1590,6 +1589,7 @@ struct InstallDecision {
 enum class PrecheckResult { Proceed, NoChanges, Failed };
 
 void perform_install_transaction(const std::vector<std::string>& pkgs, bool apply_host, bool is_upgrade = false);
+void perform_transaction(const std::string& action, const std::vector<std::string>& pkgs, bool apply_host);
 bool run_libapt_transaction(const std::string& action, const std::vector<std::string>& targets,
                             int status_fd, bool quiet);
 PrecheckResult precheck_transaction(const std::string& action, const std::vector<std::string>& pkgs, bool quiet);
@@ -2511,25 +2511,17 @@ std::vector<WeldSource> load_weld_sources() {
 #endif
 }
 
-struct TempRepoInfo {
-    std::string name;
+struct TempIndexInfo {
     std::string maintainer;
+    std::string repository_name;
 };
 
-struct TempPkg {
-    std::string name;
-    std::string description;
+struct TempIndexPkg {
     std::string sha256;
     std::string deb;
-};
-
-struct TempReplaces {
-    std::string name;
+    std::string description;
     std::string replaces;
-};
-
-struct TempRequired {
-    std::string name;
+    std::string required;
 };
 
 template <typename T>
@@ -2543,7 +2535,12 @@ constexpr void set_record_field(T& record, std::string_view key, std::string_vie
     }
 }
 
-bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& metadata, std::string& error_out) {
+bool is_truthy_flag_value(std::string_view value) {
+    const std::string v = to_lower_copy(trim(value));
+    return v == "true" || v == "yes" || v == "on" || v == "1";
+}
+
+bool parse_weld_repo_metadata_wrpl(const std::string& text, WeldRepoMetadata& metadata, std::string& error_out) {
     metadata.packages.clear();
     metadata.required_packages.clear();
     metadata.replaces.clear();
@@ -2551,94 +2548,51 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
     metadata.name.clear();
     metadata.maintainer.clear();
 
-    enum class Section { None, RepoInfo, Packages, Replaces, Required };
-    Section current_section = Section::None;
+    bool started = false;
+    bool finished = false;
+    bool seen_index_group = false;
+    bool in_group = false;
+    bool group_is_index = false;
 
-    bool seen_repoinfo = false;
-    bool seen_pkgs = false;
-    bool seen_replaces = false;
-    bool seen_required = false;
+    TempIndexInfo pending_index;
+    TempIndexPkg pending_pkg;
+    std::string pending_pkg_name;
 
-    TempRepoInfo pending_repo;
-    bool has_pending_repo = false;
-    TempPkg pending_pkg;
-    bool has_pending_pkg = false;
-    TempReplaces pending_rep;
-    bool has_pending_rep = false;
-    TempRequired pending_req;
-    bool has_pending_req = false;
-
-    auto flush_repo = [&]() -> bool {
-        if (!has_pending_repo) return true;
-        if (pending_repo.name.empty() && pending_repo.maintainer.empty()) {
-            pending_repo = TempRepoInfo();
-            has_pending_repo = false;
-            return true;
-        }
-        if (pending_repo.name.empty()) {
-            error_out = "repoinfo record missing required field: name";
-            return false;
-        }
-        if (pending_repo.maintainer.empty()) {
-            error_out = "repoinfo record missing required field: maintainer";
-            return false;
-        }
-        metadata.name = pending_repo.name;
-        metadata.maintainer = pending_repo.maintainer;
-        pending_repo = TempRepoInfo();
-        has_pending_repo = false;
-        return true;
+    auto reset_pending = [&]() {
+        in_group = false;
+        group_is_index = false;
+        pending_index = TempIndexInfo{};
+        pending_pkg = TempIndexPkg{};
+        pending_pkg_name.clear();
     };
 
-    auto flush_pkg = [&]() -> bool {
-        if (!has_pending_pkg) return true;
-        if (pending_pkg.name.empty()) {
-            has_pending_pkg = false;
-            pending_pkg = TempPkg();
-            return true;
+    auto flush_group = [&]() -> bool {
+        if (!in_group) return true;
+        if (group_is_index) {
+            if (!pending_index.maintainer.empty()) metadata.maintainer = pending_index.maintainer;
+            if (!pending_index.repository_name.empty()) metadata.name = pending_index.repository_name;
+            seen_index_group = true;
+        } else {
+            if (pending_pkg_name.empty()) {
+                reset_pending();
+                return true;
+            }
+            if (pending_pkg.sha256.empty()) {
+                error_out = std::format("package group '{}' missing required field: sha256", pending_pkg_name);
+                return false;
+            }
+            if (pending_pkg.deb.empty()) {
+                error_out = std::format("package group '{}' missing required field: deb", pending_pkg_name);
+                return false;
+            }
+            metadata.packages[pending_pkg_name] = {pending_pkg.deb, pending_pkg.sha256};
+            metadata.descriptions[pending_pkg_name] = pending_pkg.description;
+            if (!pending_pkg.replaces.empty()) metadata.replaces[pending_pkg.replaces] = pending_pkg_name;
+            if (is_truthy_flag_value(pending_pkg.required)) {
+                metadata.required_packages.push_back(pending_pkg_name);
+            }
         }
-        if (pending_pkg.sha256.empty()) {
-            error_out = std::format("package record for '{}' missing required field: sha256", pending_pkg.name);
-            return false;
-        }
-        if (pending_pkg.deb.empty()) {
-            error_out = std::format("package record for '{}' missing required field: deb", pending_pkg.name);
-            return false;
-        }
-        metadata.packages[pending_pkg.name] = {pending_pkg.deb, pending_pkg.sha256};
-        metadata.descriptions[pending_pkg.name] = pending_pkg.description;
-        pending_pkg = TempPkg();
-        has_pending_pkg = false;
-        return true;
-    };
-
-    auto flush_rep = [&]() -> bool {
-        if (!has_pending_rep) return true;
-        if (pending_rep.name.empty()) {
-            has_pending_rep = false;
-            pending_rep = TempReplaces();
-            return true;
-        }
-        if (pending_rep.replaces.empty()) {
-            error_out = std::format("replaces record for '{}' missing required field: replaces", pending_rep.name);
-            return false;
-        }
-        metadata.replaces[pending_rep.replaces] = pending_rep.name;
-        pending_rep = TempReplaces();
-        has_pending_rep = false;
-        return true;
-    };
-
-    auto flush_req = [&]() -> bool {
-        if (!has_pending_req) return true;
-        if (pending_req.name.empty()) {
-            has_pending_req = false;
-            pending_req = TempRequired();
-            return true;
-        }
-        metadata.required_packages.push_back(pending_req.name);
-        pending_req = TempRequired();
-        has_pending_req = false;
+        reset_pending();
         return true;
     };
 
@@ -2649,89 +2603,40 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
         std::string trimmed = trim(line);
         if (trimmed.empty()) continue;
 
-        if (trimmed == "[repoinfo_st]") {
-            current_section = Section::RepoInfo;
-            has_pending_repo = false;
-            pending_repo = TempRepoInfo();
-            seen_repoinfo = true;
+        if (!started) {
+            if (trimmed == "index.start") started = true;
             continue;
         }
-        if (trimmed == "[repoinfo_fn]") {
-            if (current_section != Section::RepoInfo) {
-                error_out = "[repoinfo_fn] without matching [repoinfo_st]";
+        if (finished) continue;
+
+        if (trimmed == "index.end") {
+            if (!flush_group()) return false;
+            finished = true;
+            continue;
+        }
+        if (trimmed == "{" || trimmed == "}") {
+            if (!flush_group()) return false;
+            continue;
+        }
+        if (trimmed.starts_with("group")
+            && (trimmed.size() == 5 || trimmed[5] == ' ' || trimmed[5] == '\t')) {
+            if (!flush_group()) return false;
+            std::string group_name = trim(trimmed.substr(5));
+            if (group_name.empty()) {
+                error_out = "group declaration is missing its name";
                 return false;
             }
-            if (!flush_repo()) return false;
-            current_section = Section::None;
-            continue;
-        }
-        if (trimmed == "[pkgs_st]") {
-            current_section = Section::Packages;
-            has_pending_pkg = false;
-            pending_pkg = TempPkg();
-            seen_pkgs = true;
-            continue;
-        }
-        if (trimmed == "[pkgs_fn]") {
-            if (current_section != Section::Packages) {
-                error_out = "[pkgs_fn] without matching [pkgs_st]";
+            if (group_name.size() > 256 || group_name.find("..") != std::string::npos) {
+                error_out = std::format("invalid group name '{}'", group_name);
                 return false;
             }
-            if (!flush_pkg()) return false;
-            current_section = Section::None;
-            continue;
-        }
-        if (trimmed == "[replaces_st]") {
-            current_section = Section::Replaces;
-            has_pending_rep = false;
-            pending_rep = TempReplaces();
-            seen_replaces = true;
-            continue;
-        }
-        if (trimmed == "[replaces_fn]") {
-            if (current_section != Section::Replaces) {
-                error_out = "[replaces_fn] without matching [replaces_st]";
-                return false;
-            }
-            if (!flush_rep()) return false;
-            current_section = Section::None;
-            continue;
-        }
-        if (trimmed == "[required_st]") {
-            current_section = Section::Required;
-            has_pending_req = false;
-            pending_req = TempRequired();
-            seen_required = true;
-            continue;
-        }
-        if (trimmed == "[required_fn]") {
-            if (current_section != Section::Required) {
-                error_out = "[required_fn] without matching [required_st]";
-                return false;
-            }
-            if (!flush_req()) return false;
-            current_section = Section::None;
+            in_group = true;
+            group_is_index = (group_name == "index");
+            pending_pkg_name = group_name;
             continue;
         }
 
-        if (trimmed == "}") {
-            if (current_section == Section::RepoInfo) {
-                if (!flush_repo()) return false;
-                has_pending_repo = true;
-            } else if (current_section == Section::Packages) {
-                if (!flush_pkg()) return false;
-                has_pending_pkg = true;
-            } else if (current_section == Section::Replaces) {
-                if (!flush_rep()) return false;
-                has_pending_rep = true;
-            } else if (current_section == Section::Required) {
-                if (!flush_req()) return false;
-                has_pending_req = true;
-            }
-            continue;
-        }
-
-        if (current_section == Section::None) continue;
+        if (!in_group) continue;
 
         auto colon = trimmed.find(':');
         if (colon == std::string::npos) continue;
@@ -2739,39 +2644,32 @@ bool parse_weld_repo_metadata_v2(const std::string& text, WeldRepoMetadata& meta
         std::string key = trim(trimmed.substr(0, colon));
         std::string value = strip_quotes(trim(trimmed.substr(colon + 1)));
 
-        if (current_section == Section::RepoInfo) {
-            if (!has_pending_repo) continue;
-            set_record_field(pending_repo, key, value);
-        } else if (current_section == Section::Packages) {
-            if (!has_pending_pkg) continue;
+        if (group_is_index) {
+            set_record_field(pending_index, key, value);
+        } else {
             set_record_field(pending_pkg, key, value);
-        } else if (current_section == Section::Replaces) {
-            if (!has_pending_rep) continue;
-            set_record_field(pending_rep, key, value);
-        } else if (current_section == Section::Required) {
-            if (!has_pending_req) continue;
-            set_record_field(pending_req, key, value);
         }
     }
 
-    if (!seen_repoinfo) {
-        error_out = "missing [repoinfo_st]/[repoinfo_fn] section";
+    if (!started) {
+        error_out = "missing index.start marker";
         return false;
     }
-    if (!seen_pkgs) {
-        error_out = "missing [pkgs_st]/[pkgs_fn] section";
+    if (!finished) {
+        error_out = "missing index.end marker";
         return false;
     }
-    if (!seen_replaces) {
-        error_out = "missing [replaces_st]/[replaces_fn] section";
+    if (!flush_group()) return false;
+    if (!seen_index_group) {
+        error_out = "missing 'group index' repository information block";
         return false;
     }
-    if (!seen_required) {
-        error_out = "missing [required_st]/[required_fn] section";
+    if (metadata.maintainer.empty()) {
+        error_out = "group index missing required field: maintainer";
         return false;
     }
-    if (metadata.name.empty() || metadata.maintainer.empty()) {
-        error_out = "repoinfo record missing required fields (name, maintainer)";
+    if (metadata.name.empty()) {
+        error_out = "group index missing required field: repository_name";
         return false;
     }
     return true;
@@ -2912,7 +2810,8 @@ bool sync_weld_metadata() {
 
     for (const auto& source : sources) {
         futures.push_back(std::async(std::launch::async, [source, &completed, total]() -> bool {
-            const std::string meta_url = source.base_url + "/releases/" + source.release + "/repo-metadata";
+            const std::string meta_url = source.base_url + "/releases/" + source.release
+                + "/" + std::string{kWeldIndexFileName};
             const std::string sig_url = meta_url + ".minisig";
 
             auto report_progress = [&completed, total] {
@@ -2951,12 +2850,12 @@ bool sync_weld_metadata() {
                 report_progress();
                 return false;
             }
-            std::string output_path = release_dir + "/repo-metadata";
+            std::string output_path = release_dir + "/" + std::string{kWeldIndexFileName};
             if (!write_text_file(output_path, metadata)) {
                 report_progress();
                 return false;
             }
-            std::string sig_output_path = release_dir + "/repo-metadata.minisig";
+            std::string sig_output_path = release_dir + "/" + std::string{kWeldIndexFileName} + ".minisig";
             if (!write_text_file(sig_output_path, signature)) {
                 report_progress();
                 return false;
@@ -3192,11 +3091,11 @@ std::vector<WeldRepoMetadata> load_cached_weld_metadata() {
     if (trusted_keys.empty()) return repos;
 
     for (const auto& source : sources) {
-        std::string path = g_weld_etc_dir + "/" + sanitize_filename(source.release) + "/repo-metadata";
+        std::string path = g_weld_etc_dir + "/" + sanitize_filename(source.release) + "/" + std::string{kWeldIndexFileName};
         std::string content;
         if (!read_text_file(path, content)) continue;
 
-        std::string sig_path = g_weld_etc_dir + "/" + sanitize_filename(source.release) + "/repo-metadata.minisig";
+        std::string sig_path = g_weld_etc_dir + "/" + sanitize_filename(source.release) + "/" + std::string{kWeldIndexFileName} + ".minisig";
         std::string sig_content;
         if (!read_text_file(sig_path, sig_content)) {
             log_error(std::format("repository {} is missing its minisign signature file. refusing to load.",
@@ -3216,7 +3115,7 @@ std::vector<WeldRepoMetadata> load_cached_weld_metadata() {
         metadata.release = source.release;
         metadata.trusted_comment = std::move(verified.value());
         std::string parse_err;
-        if (!parse_weld_repo_metadata_v2(content, metadata, parse_err)) {
+        if (!parse_weld_repo_metadata_wrpl(content, metadata, parse_err)) {
             log_error(std::format("metadata for {} is malformed: {}. refusing to load.",
                                   source.base_url, parse_err));
             continue;
@@ -3545,24 +3444,156 @@ bool resolve_install_decisions(const std::vector<std::string>& pkgs, std::vector
     return !had_error;
 }
 
-std::string parse_arvor_ua_version(const std::string& page) {
-    if (page.empty()) return "";
-    static constexpr std::string_view kNeedle = "ArvorLinux/";
-    auto pos = page.find(kNeedle);
-    if (pos == std::string::npos) return "";
-    pos += kNeedle.size();
-    std::string ver;
-    while (pos < page.size()) {
-        char c = page[pos];
-        if (std::isdigit(static_cast<unsigned char>(c)) || c == '.') {
-            ver += c;
-            ++pos;
-        } else {
-            break;
+struct ZtsloUpdate {
+    std::string version;
+    std::string description;
+    std::string repository_number;
+    std::string weld_repository;
+    std::string debian_repository;
+};
+
+bool parse_ztslo_update(const std::string& text, ZtsloUpdate& out, std::string& error_out) {
+    out = ZtsloUpdate{};
+
+    constexpr std::string_view kDefinePrefix = "define variable";
+
+    bool started = false;
+    bool finished = false;
+
+    std::stringstream ss(text);
+    std::string raw_line;
+    while (std::getline(ss, raw_line)) {
+        std::string line = strip_inline_comment(raw_line);
+        std::string trimmed = trim(line);
+        if (trimmed.empty()) continue;
+
+        if (trimmed == "ztslo.start") {
+            if (started) {
+                error_out = "duplicate ztslo.start marker";
+                return false;
+            }
+            started = true;
+            continue;
         }
+        if (trimmed == "ztslo.end") {
+            if (!started) {
+                error_out = "ztslo.end without a matching ztslo.start";
+                return false;
+            }
+            if (finished) {
+                error_out = "duplicate ztslo.end marker";
+                return false;
+            }
+            finished = true;
+            continue;
+        }
+        if (!started || finished) continue;
+        if (trimmed == "}" || trimmed == "{") continue;
+        if (!trimmed.starts_with(kDefinePrefix)) continue;
+
+        std::istringstream body(trim(trimmed.substr(kDefinePrefix.size())));
+        std::string name;
+        std::string as_token;
+        if (!(body >> name >> as_token) || as_token != "as") {
+            error_out = std::format("malformed define statement: {}", trimmed);
+            return false;
+        }
+        std::string value_part;
+        std::getline(body, value_part);
+        std::string value = strip_quotes(trim(value_part));
+        if (value.empty()) {
+            error_out = std::format("define statement for {} has an empty value", name);
+            return false;
+        }
+
+        if (name == "VERSION") out.version = value;
+        else if (name == "DESCRIPTION") out.description = value;
+        else if (name == "REPOSITORY_NUMBER") out.repository_number = value;
+        else if (name == "WELD_REPOSITORY") out.weld_repository = value;
+        else if (name == "DEBIAN_REPOSITORY") out.debian_repository = value;
     }
-    while (!ver.empty() && ver.back() == '.') ver.pop_back();
-    return ver;
+
+    if (!started) {
+        error_out = "missing ztslo.start marker";
+        return false;
+    }
+    if (!finished) {
+        error_out = "missing ztslo.end marker";
+        return false;
+    }
+    if (out.version.empty()) {
+        error_out = "missing required variable: VERSION";
+        return false;
+    }
+    if (out.repository_number.empty()) {
+        error_out = "missing required variable: REPOSITORY_NUMBER";
+        return false;
+    }
+    if (out.weld_repository.empty()) {
+        error_out = "missing required variable: WELD_REPOSITORY";
+        return false;
+    }
+    if (out.debian_repository.empty()) {
+        error_out = "missing required variable: DEBIAN_REPOSITORY";
+        return false;
+    }
+    return true;
+}
+
+bool valid_ztslo_repository_number(std::string_view value) {
+    if (value.empty() || value.size() > 8) return false;
+    return std::ranges::all_of(value, [](unsigned char c) {
+        return std::isdigit(c) != 0;
+    });
+}
+
+bool valid_ztslo_repository_codename(std::string_view value) {
+    if (value.empty() || value.size() > 64) return false;
+    if (value.front() == '-' || value.front() == '.') return false;
+    for (char c : value) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalnum(u) == 0 && c != '-' && c != '.' && c != '_') return false;
+    }
+    return true;
+}
+
+std::string normalize_ztslo_debian_sources(const std::string& raw, std::string& error_out) {
+    std::vector<std::string> lines;
+    std::stringstream ss(raw);
+    std::string raw_line;
+    while (std::getline(ss, raw_line)) {
+        std::string line = strip_inline_comment(raw_line);
+        std::string trimmed = trim(line);
+        if (trimmed.empty()) continue;
+        if (trimmed.size() > 2048) {
+            error_out = "a DEBIAN_REPOSITORY line is too long";
+            return {};
+        }
+        for (char c : trimmed) {
+            if (std::iscntrl(static_cast<unsigned char>(c)) != 0) {
+                error_out = "a DEBIAN_REPOSITORY line contains control characters";
+                return {};
+            }
+        }
+        std::istringstream ls(trimmed);
+        std::string type;
+        ls >> type;
+        if (type != "deb" && type != "deb-src") {
+            error_out = std::format("unsupported sources line (expected 'deb ...'): {}", trimmed);
+            return {};
+        }
+        lines.push_back(trimmed);
+    }
+    if (lines.empty()) {
+        error_out = "DEBIAN_REPOSITORY contains no valid 'deb' source line";
+        return {};
+    }
+    std::string out;
+    for (const auto& l : lines) {
+        out += l;
+        out += '\n';
+    }
+    return out;
 }
 
 int compare_arvor_versions(const std::string& a, const std::string& b) {
@@ -3609,91 +3640,154 @@ std::expected<std::string, std::string> read_arvor_version_from_os_release() {
 }
 
 void do_nflinux_upgrade(bool apply_host, const std::string& arv_version) {
-    std::string user_agent = "ArvorLinux/" + arv_version;
-    std::string ua_page = curl_fetch_string("https://nextferret.github.io/ua", user_agent);
-    std::string remote_version = parse_arvor_ua_version(ua_page);
+#ifdef nflinux
+    const std::string ztslo_url = std::format("{}/update.ztslo", kArvorUpdatesBaseUrl);
+    const std::string ztslo_sig_url = std::format("{}.minisig", ztslo_url);
 
-    if (!remote_version.empty()) {
-        int cmp = compare_arvor_versions(arv_version, remote_version);
-        if (cmp > 0) {
-            std::print("You are running a development build of Arvor Linux, or the remote release server may be outdated.\n");
-            std::print("Local version: {} | Remote version: {}\n", arv_version, remote_version);
-            std::print("No upgradeable release was found for your channel.\n");
-            return;
-        }
-        if (cmp == 0) {
-            std::print("Arvor Linux is already up to date (version {}).\n", arv_version);
-            return;
-        }
-        std::print("Arvor Linux local version: {}\n", arv_version);
-        std::print("A newer release ({}) is available. Proceed with upgrade? [Y/n] ", remote_version);
-        std::cout.flush();
-        if (!g_assume_yes) {
-            std::string answer;
-            std::getline(std::cin, answer);
-            if (!answer.empty() && answer != "y" && answer != "Y") {
-                std::print("Upgrade cancelled.\n");
-                return;
-            }
-        }
+    std::string ztslo = curl_fetch_string(ztslo_url);
+    if (ztslo.empty()) {
+        log_error(std::format("failed to download the release update file {}", ztslo_url));
+        return;
+    }
+    std::string ztslo_sig = curl_fetch_string(ztslo_sig_url);
+    if (ztslo_sig.empty()) {
+        log_error(std::format("{} is missing its minisign signature ({}).", ztslo_url, ztslo_sig_url));
+        log_error("minisign verification is mandatory; refusing to continue.");
+        return;
+    }
+    auto verified = verify_repo_metadata_signature(ztslo, ztslo_sig);
+    if (!verified) {
+        log_error(std::format("refusing to upgrade: update.ztslo signature could not be verified: {}",
+                              verified.error()));
+        return;
     }
 
-#ifdef nflinux
+    ZtsloUpdate upd;
+    std::string parse_err;
+    if (!parse_ztslo_update(ztslo, upd, parse_err)) {
+        log_error(std::format("update.ztslo is malformed: {}", parse_err));
+        return;
+    }
+
+    const int cmp = compare_arvor_versions(arv_version, upd.version);
+    if (cmp > 0) {
+        std::print("You are running a development build of Arvor Linux, or the remote release server may be outdated.\n");
+        std::print("Local version: {} | Remote version: {}\n", arv_version, upd.version);
+        std::print("No upgradeable release was found for your channel.\n");
+        return;
+    }
+    if (cmp == 0) {
+        std::print("Arvor Linux is already up to date (version {}).\n", arv_version);
+        return;
+    }
+
+    std::print("Arvor Linux local version: {}\n", arv_version);
+    std::print("A newer release ({}) is available.\n", upd.version);
+    if (!upd.description.empty()) std::print("{}\n", upd.description);
+    std::print("Proceed with upgrade? [Y/n] ");
+    std::cout.flush();
+    if (!g_assume_yes) {
+        std::string answer;
+        std::getline(std::cin, answer);
+        if (!answer.empty() && answer != "y" && answer != "Y") {
+            std::print("Upgrade cancelled.\n");
+            return;
+        }
+    } else {
+        std::print("\n");
+    }
+
+    if (!valid_ztslo_repository_number(upd.repository_number)) {
+        log_error("update.ztslo declares an invalid REPOSITORY_NUMBER; refusing to continue.");
+        return;
+    }
+    if (!valid_ztslo_repository_codename(upd.weld_repository)) {
+        log_error("update.ztslo declares an invalid WELD_REPOSITORY codename; refusing to continue.");
+        return;
+    }
+    std::string deb_err;
+    std::string apt_sources = normalize_ztslo_debian_sources(upd.debian_repository, deb_err);
+    if (apt_sources.empty()) {
+        log_error(std::format("update.ztslo declares an invalid DEBIAN_REPOSITORY: {}", deb_err));
+        return;
+    }
+
+    const std::string weld_base_url = std::format("{}{}", kArvorWeldRepoBaseUrl, upd.repository_number);
+    const std::string weld_sources = std::format("deb {} {}\n", weld_base_url, upd.weld_repository);
+
     g_config_backup.backup();
 
-    std::string os_release = curl_fetch_string("https://nextferret.github.io/etc/os-release", user_agent);
-    std::string codenames = curl_fetch_string("https://nextferret.github.io/version_codename", user_agent);
-    std::string repo_number_str = trim(curl_fetch_string("https://nextferret.github.io/repo-number", user_agent));
-    std::string weld_sources;
-    std::string apt_sources;
+    g_config_backup.set_new("", weld_sources);
+    g_config_backup.apply_new();
 
-    if (!codenames.empty() && !repo_number_str.empty()) {
-        auto comma = codenames.find(',');
-        if (comma != std::string::npos) {
-            std::string weld_code = trim(codenames.substr(0, comma));
-            std::string debian_code = trim(codenames.substr(comma + 1));
-            std::string base_repo_url = "https://thearvorindex.github.io/repo-arvorlinux--" + repo_number_str;
-            std::string meta_url = base_repo_url + "/releases/" + weld_code + "/repo-metadata";
-            std::string sig_url = meta_url + ".minisig";
-            std::string meta = curl_fetch_string(meta_url);
-            std::string sig = curl_fetch_string(sig_url);
-            if (!meta.empty() && !sig.empty()) {
-                if (auto verified = verify_repo_metadata_signature(meta, sig)) {
-                    weld_sources = "deb " + base_repo_url + " " + weld_code + "\n";
-                    apt_sources = "deb http://deb.debian.org/debian " + debian_code + " main contrib non-free non-free-firmware\n";
-                    apt_sources += "deb http://deb.debian.org/debian-security " + debian_code + "-security main contrib non-free non-free-firmware\n";
-                    apt_sources += "deb http://deb.debian.org/debian " + debian_code + "-updates main contrib non-free non-free-firmware\n";
-                } else {
-                    log_error(std::format(
-                        "refusing to switch to release {} because its signature could not be verified: {}",
-                        weld_code, verified.error()));
+    std::print("Syncing Weld repository {} (release {})...\n", weld_base_url, upd.weld_repository);
+    if (!sync_weld_metadata()) {
+        log_error("failed to synchronize the new Weld repository; aborting the upgrade.");
+        g_config_backup.restore_orig();
+        return;
+    }
+
+    {
+        std::vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
+        if (!repos.empty()) {
+            std::vector<std::string> weld_upgrade_names;
+            pkgCacheFile cache_file;
+            for (const auto& repo : repos) {
+                for (const auto& entry : repo.packages) {
+                    const std::string& pkg_name = entry.first;
+                    AptPackageState st = get_apt_package_state(cache_file, pkg_name);
+                    if (!st.installed) continue;
+                    WeldPackageCandidate cand = find_best_weld_candidate(repos, pkg_name);
+                    if (!cand.found) continue;
+                    if (compare_versions(cand.version, st.installed_version) <= 0) continue;
+                    weld_upgrade_names.push_back(pkg_name);
+                }
+                for (const auto& req : repo.required_packages) {
+                    AptPackageState st = get_apt_package_state(cache_file, req);
+                    if (!st.installed) weld_upgrade_names.push_back(req);
                 }
             }
+            std::ranges::sort(weld_upgrade_names);
+            auto last = std::ranges::unique(weld_upgrade_names);
+            weld_upgrade_names.erase(last.begin(), weld_upgrade_names.end());
+            if (!weld_upgrade_names.empty()) {
+                std::print("Upgrading applications from the Weld repository first...\n");
+                perform_install_transaction(weld_upgrade_names, apply_host, true);
+            } else {
+                std::print("Weld repository applications are already up to date.\n");
+            }
+        } else {
+            std::print("W: no Weld repositories are configured; skipping the Weld application upgrade phase.\n");
         }
     }
 
-    if (!os_release.empty() || !apt_sources.empty() || !weld_sources.empty()) {
-        g_config_backup.set_new(os_release, apt_sources, weld_sources);
-        g_config_backup.apply_new();
-    }
+    g_config_backup.set_new(apt_sources, weld_sources);
+    g_config_backup.apply_new();
 
-    std::vector<WeldRepoMetadata> repos = load_cached_weld_metadata();
-    std::vector<std::string> pkgs_to_install;
-    for (const auto& repo : repos) {
-        for (const auto& req : repo.required_packages) {
-            pkgs_to_install.push_back(req);
+    std::print("Refreshing package indexes for release {}...\n", upd.version);
+    {
+        pkgCacheFile cache_file;
+        pkgSourceList* src_list = cache_file.GetSourceList();
+        if (src_list == nullptr) {
+            _error->DumpErrors();
+            log_error("unable to read the APT source list; aborting the upgrade.");
+            g_config_backup.restore_orig();
+            return;
+        }
+        WeldSyncStatus status("Refreshing APT Repositories");
+        if (!ListUpdate(status, *src_list)) {
+            _error->DumpErrors();
+            log_error("failed to refresh the package indexes for the new release; aborting the upgrade.");
+            g_config_backup.restore_orig();
+            return;
         }
     }
 
-    if (!pkgs_to_install.empty()) {
-        std::ranges::sort(pkgs_to_install);
-        auto last = std::ranges::unique(pkgs_to_install);
-        pkgs_to_install.erase(last.begin(), pkgs_to_install.end());
-        std::print("Installing required packages from repositories...\n");
-        perform_install_transaction(pkgs_to_install, apply_host);
-    }
+    std::print("Performing the Arvor Linux release upgrade to {}...\n", upd.version);
+    perform_transaction("dist-upgrade", std::vector<std::string>(), apply_host);
 #else
     (void)apply_host;
+    (void)arv_version;
 #endif
 }
 
