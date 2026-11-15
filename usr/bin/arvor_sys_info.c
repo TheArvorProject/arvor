@@ -1,4 +1,3 @@
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -243,6 +242,11 @@ static int get_meminfo_kb(unsigned long long *memtotal_kb, unsigned long long *s
     return got_mem ? 0 : -1;
 }
 
+static long kb_to_gb_rounded(unsigned long long kb) {
+    double gb = (double)kb / 1024.0 / 1024.0;
+    return (long)(gb + 0.5);
+}
+
 static int is_plain_card_name(const char *name) {
     if (strncmp(name, "card", 4) != 0) return 0;
     const char *p = name + 4;
@@ -371,7 +375,8 @@ static void print_help(void) {
         {"get.sys.manufacturer",   "hardware manufacturer"},
         {"get.sys.cpu",            "CPU model"},
         {"get.sys.fs",             "root filesystem type"},
-        {"get.sys.memory",         "total RAM, includes swap/zram"},
+        {"get.sys.memory",         "total physical RAM (swap/zram not included)"},
+        {"get.sys.swap",           "total swap/zram"},
         {"get.sys.vram",           "video memory"},
         {"get.sys.build-code",     "build code"}
     };
@@ -423,9 +428,14 @@ int main(int argc, char **argv) {
         if (get_meminfo_kb(&memtotal, &swaptotal) != 0) {
             printf("Unknown\n");
         } else {
-            double gb = (double)(memtotal + swaptotal) / 1024.0 / 1024.0;
-            long rounded = (long)(gb + 0.5);
-            printf("%ld GB\n", rounded);
+            printf("%ld GB\n", kb_to_gb_rounded(memtotal));
+        }
+    } else if (strcmp(cmd, "get.sys.swap") == 0) {
+        unsigned long long memtotal = 0, swaptotal = 0;
+        if (get_meminfo_kb(&memtotal, &swaptotal) != 0) {
+            printf("Unknown\n");
+        } else {
+            printf("%ld GB\n", kb_to_gb_rounded(swaptotal));
         }
     } else if (strcmp(cmd, "get.sys.vram") == 0) {
         unsigned long long vram_mb = 0;
