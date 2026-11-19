@@ -6,7 +6,7 @@
 
 ### nsm 
 
-nsm (NextFerret Snapshot Manager) It is the tool responsible for LVM Thin snapshots,made in C and with integration with weld.
+nsm is the tool responsible for LVM Thin snapshots,made in C and with integration with weld.
 
 ### Weld
 
@@ -14,7 +14,7 @@ Weld is the package manager for Arvor Linux, written in C++26 and dependent on L
 
 ### NFLXS
 
-NFLXS (NextFerret Linux Sandboxes) is a container manager that uses the Docker API, without relying on insecure kernel modules like OverlayFS. 
+NFLXS is a container manager that uses the Docker API, without relying on insecure kernel modules like OverlayFS. 
 
 
 ## Minimum Requirements 
