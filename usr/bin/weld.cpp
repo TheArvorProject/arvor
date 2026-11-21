@@ -1,5 +1,6 @@
-// NextFerret, 2026.
+// The Arvor Project, 2026.
 // Maintainer: Hludwig (@hludwig-nf) Note: Compile it with GCC 16 or an compiler which supports C++26.
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -322,7 +323,7 @@ constexpr std::string_view kWeldTrustedKeysDir = "/etc/weld/trusted_keys";
 
 constexpr std::string_view kWeldIndexFileName = "index.wrpl";
 
-constexpr std::string_view kArvorUpdatesBaseUrl = "https://nextferret.github.io/updates/arvor";
+constexpr std::string_view kArvorUpdatesBaseUrl = "https://thearvorproject.github.io/updates/arvor";
 constexpr std::string_view kArvorWeldRepoBaseUrl = "https://thearvorindex.github.io/repo-arvorlinux--";
 
 constexpr std::size_t kWeldMinMemMb = 256;
