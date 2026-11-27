@@ -1,4 +1,4 @@
-// NextFerret, 2026.
+// The Arvor Project, 2026.
 // Maintainer: Hludwig (@hludwig-nf) Note: Compile it with GCC 16 or an compiler which supports C++26.
 
 #include <algorithm>
@@ -2113,6 +2113,46 @@ bool terminal_is_utf8() {
     return false;
 }
 
+int terminal_height() {
+    struct winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+        return static_cast<int>(ws.ws_row);
+    }
+    return 24;
+}
+
+std::string apt_size_str(double size) {
+    if (size < 0) size = -size;
+    static constexpr std::string_view kUnits[] = {"", "k", "M", "G", "T", "P", "E", "Z", "Y"};
+    int unit = 0;
+    while (unit < 8) {
+        if (size < 100 && unit != 0) return std::format("{:.1f} {}", size, kUnits[unit]);
+        if (size < 10000) return std::format("{:.0f} {}", size, kUnits[unit]);
+        size /= 1000.0;
+        ++unit;
+    }
+    return std::format("{:.1f} {}", size, kUnits[8]);
+}
+
+std::string apt_time_str(std::uint64_t sec) {
+    if (sec > 60ull * 60 * 24) {
+        return std::format("{}d {}h {}min {}s", sec / 60 / 60 / 24, (sec / 60 / 60) % 24,
+                           (sec / 60) % 60, sec % 60);
+    }
+    if (sec > 60ull * 60) {
+        return std::format("{}h {}min {}s", sec / 60 / 60, (sec / 60) % 60, sec % 60);
+    }
+    if (sec > 60) {
+        return std::format("{}min {}s", sec / 60, sec % 60);
+    }
+    return std::format("{}s", sec);
+}
+
+std::string render_error_line(std::string_view msg) {
+    if (isatty(STDOUT_FILENO) != 1) return std::format("E: {}", msg);
+    return std::format("\033[1;31mE:\033[0m {}", msg);
+}
+
 class CompactSpinner {
 public:
     CompactSpinner(std::string label, std::string dots, bool keep_frame)
@@ -2232,25 +2272,231 @@ public:
     }
 };
 
-class WeldSyncStatus final : public pkgAcquireStatus {
-    std::string label_;
-    int last_pct_ = -1;
+class FetchLineDisplay {
 public:
-    explicit WeldSyncStatus(std::string label) : label_(std::move(label)) {}
+    enum class ItemOutcome { Done, Hit, Err };
+
+    explicit FetchLineDisplay(std::string label)
+        : label_(std::move(label)), tty_(isatty(STDOUT_FILENO) == 1) {}
+
+    void set_status(int percentage) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!tty_) return;
+        if (percentage < 0) percentage = 0;
+        if (percentage > 100) percentage = 100;
+        if (percentage == last_pct_) return;
+        last_pct_ = percentage;
+        render_status_locked();
+    }
+
+    void begin_item(const void* key, const std::string& desc, std::uint64_t expected_bytes) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = std::ranges::find_if(slots_, [&](const Slot& s) { return s.key == key; });
+        if (it != slots_.end()) {
+            it->expected = expected_bytes;
+            if (tty_) {
+                int distance = status_row_ - it->row;
+                move_to_locked(distance);
+                std::cout << "\033[K" << make_fetch_line(it->desc, it->expected) << std::flush;
+                move_back_locked(distance);
+                render_status_locked();
+            }
+            return;
+        }
+        if (tty_) {
+            int max_slots = terminal_height() - 2;
+            if (max_slots < 1) max_slots = 1;
+            if (static_cast<int>(slots_.size()) >= max_slots) return;
+        }
+        Slot slot;
+        slot.key = key;
+        slot.desc = desc;
+        slot.expected = expected_bytes;
+        slot.row = status_row_;
+        slots_.push_back(slot);
+        ++status_row_;
+        if (!tty_) return;
+        std::cout << "\r\033[K" << make_fetch_line(slot.desc, slot.expected) << "\033[K\n" << std::flush;
+        render_status_locked();
+    }
+
+    void finish_item(const void* key, const std::string& desc, ItemOutcome outcome,
+                     std::uint64_t got_bytes) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::string outcome_str = outcome_text(outcome);
+        auto it = std::ranges::find_if(slots_, [&](const Slot& s) { return s.key == key; });
+        if (it != slots_.end()) {
+            std::uint64_t size = got_bytes > 0 ? got_bytes : it->expected;
+            std::string line = make_fetch_line(it->desc, size) + " .. " + outcome_str;
+            if (tty_) {
+                int distance = status_row_ - it->row;
+                move_to_locked(distance);
+                std::cout << "\033[K" << line << std::flush;
+                move_back_locked(distance);
+                render_status_locked();
+            } else {
+                std::cout << line << "\n" << std::flush;
+            }
+            return;
+        }
+        std::string line = make_fetch_line(desc, got_bytes) + " .. " + outcome_str;
+        if (tty_) {
+            std::cout << "\r\033[K" << line << "\n" << std::flush;
+            ++status_row_;
+            render_status_locked();
+        } else {
+            std::cout << line << "\n" << std::flush;
+        }
+    }
+
+    void print_message(const std::string& line) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!tty_) {
+            std::cout << line << "\n" << std::flush;
+            return;
+        }
+        int width = terminal_width();
+        if (width < 20) width = 20;
+        for (const std::string& part : wrap_plain_lines(line, static_cast<std::size_t>(width - 1))) {
+            std::cout << "\r\033[K" << part << "\n" << std::flush;
+            ++status_row_;
+        }
+        render_status_locked();
+    }
+
+    void finish() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!tty_) return;
+        std::cout << "\r\033[K" << std::flush;
+    }
+
+private:
+    struct Slot {
+        const void* key = nullptr;
+        std::string desc;
+        std::uint64_t expected = 0;
+        int row = 0;
+    };
+
+    void move_to_locked(int distance) {
+        if (distance > 0) std::cout << "\r\033[" << distance << "F";
+    }
+
+    void move_back_locked(int distance) {
+        if (distance > 0) std::cout << "\r\033[" << distance << "E";
+    }
+
+    void render_status_locked() {
+        std::cout << "\033[33m"
+                  << render_sync_progress(last_pct_ < 0 ? 0 : last_pct_, label_)
+                  << "\033[0m\033[K" << std::flush;
+    }
+
+    std::string truncate_desc(const std::string& desc) const {
+        if (!tty_) return desc;
+        std::size_t budget = static_cast<std::size_t>(terminal_width());
+        if (budget < 60) budget = 60;
+        budget -= 40;
+        if (desc.size() <= budget) return desc;
+        return desc.substr(0, budget - 3) + "...";
+    }
+
+    static std::vector<std::string> wrap_plain_lines(const std::string& line, std::size_t limit) {
+        std::vector<std::string> out;
+        std::size_t start = 0;
+        std::size_t cols = 0;
+        bool in_escape = false;
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            char c = line[i];
+            if (in_escape) {
+                if (c == 'm') in_escape = false;
+                continue;
+            }
+            if (c == '\033') {
+                in_escape = true;
+                continue;
+            }
+            if (cols == limit) {
+                out.push_back(line.substr(start, i - start));
+                start = i;
+                cols = 0;
+            }
+            ++cols;
+        }
+        out.push_back(line.substr(start));
+        return out;
+    }
+
+    std::string make_fetch_line(const std::string& desc, std::uint64_t size) const {
+        std::string trimmed = truncate_desc(desc);
+        std::string size_part;
+        if (size > 0) {
+            size_part = std::format(" [{}B]", apt_size_str(static_cast<double>(size)));
+        }
+        if (!tty_) return std::format("Fetching: {}{}", trimmed, size_part);
+        return std::format("\033[1;36mFetching:\033[0m {}\033[2m{}\033[0m", trimmed, size_part);
+    }
+
+    std::string outcome_text(ItemOutcome outcome) const {
+        if (!tty_) {
+            switch (outcome) {
+                case ItemOutcome::Done: return "Done";
+                case ItemOutcome::Hit: return "Hit";
+                case ItemOutcome::Err: return "Err";
+            }
+            return {};
+        }
+        switch (outcome) {
+            case ItemOutcome::Done: return "\033[1;32mDone\033[0m";
+            case ItemOutcome::Hit: return "\033[1;34mHit\033[0m";
+            case ItemOutcome::Err: return "\033[1;31mErr\033[0m";
+        }
+        return {};
+    }
+
+    std::string label_;
+    bool tty_ = false;
+    int last_pct_ = -1;
+    int status_row_ = 0;
+    std::vector<Slot> slots_;
+    std::mutex mtx_;
+};
+
+class WeldSyncStatus final : public pkgAcquireStatus {
+    FetchLineDisplay display_;
+public:
+    explicit WeldSyncStatus(std::string label) : display_(std::move(label)) {}
     bool MediaChange(std::string, std::string) override { return false; }
+    void Fetch(pkgAcquire::ItemDesc& itm) override {
+        if (itm.Owner->Complete) return;
+        display_.begin_item(itm.Owner, itm.Description,
+                            static_cast<std::uint64_t>(itm.Owner->FileSize));
+        Update = true;
+    }
+    void IMSHit(pkgAcquire::ItemDesc& itm) override {
+        display_.finish_item(itm.Owner, itm.Description, FetchLineDisplay::ItemOutcome::Hit, 0);
+        Update = true;
+    }
+    void Done(pkgAcquire::ItemDesc& itm) override {
+        if (!itm.Owner->Complete) return;
+        display_.finish_item(itm.Owner, itm.Description, FetchLineDisplay::ItemOutcome::Done,
+                             static_cast<std::uint64_t>(itm.Owner->FileSize));
+        Update = true;
+    }
+    void Fail(pkgAcquire::ItemDesc& itm) override {
+        display_.finish_item(itm.Owner, itm.Description, FetchLineDisplay::ItemOutcome::Err, 0);
+        Update = true;
+    }
     bool Pulse(pkgAcquire* owner) override {
         pkgAcquireStatus::Pulse(owner);
-        int pct = static_cast<int>(Percent);
-        if (pct != last_pct_) {
-            std::cout << render_sync_progress(pct, label_) << std::flush;
-            last_pct_ = pct;
-        }
+        display_.set_status(static_cast<int>(Percent));
         return true;
     }
     void Stop() override {
         pkgAcquireStatus::Stop();
-        std::cout << render_sync_progress(100, label_) << "\n";
+        display_.finish();
     }
+    std::uint64_t fetched_bytes() const { return FetchedBytes; }
 };
 
 std::string local_deb_package_name(const std::string& path) {
@@ -2785,8 +3031,13 @@ bool curl_download_file(const std::string& url, const std::string& dest_path,
     return true;
 }
 
-bool sync_weld_metadata() {
+struct SyncTotals {
+    std::uint64_t bytes = 0;
+};
+
+bool sync_weld_metadata(SyncTotals* totals = nullptr) {
 #ifndef allow_weld_repositories
+    (void)totals;
     return true;
 #else
     std::vector<WeldSource> sources = load_weld_sources();
@@ -2802,65 +3053,77 @@ bool sync_weld_metadata() {
         return false;
     }
 
+    FetchLineDisplay display("Syncing Weld Repositories");
     std::atomic<int> completed(0);
+    std::atomic<std::uint64_t> fetched_bytes(0);
     const int total = static_cast<int>(sources.size());
-    safe_log(render_sync_progress(0, "Syncing Weld Repositories"));
+    display.set_status(0);
 
     std::vector<std::future<bool>> futures;
     futures.reserve(sources.size());
 
     for (const auto& source : sources) {
-        futures.push_back(std::async(std::launch::async, [source, &completed, total]() -> bool {
+        futures.push_back(std::async(std::launch::async,
+                                     [source, &display, &completed, &fetched_bytes, total]() -> bool {
             const std::string meta_url = source.base_url + "/releases/" + source.release
                 + "/" + std::string{kWeldIndexFileName};
             const std::string sig_url = meta_url + ".minisig";
 
-            auto report_progress = [&completed, total] {
+            auto report_progress = [&display, &completed, total] {
                 int done = completed.fetch_add(1) + 1;
-                int pct = (done * 100) / total;
-                safe_log(render_sync_progress(pct, "Syncing Weld Repositories"));
+                display.set_status((done * 100) / total);
             };
+
+            display.begin_item(&source, source.base_url, 0);
 
             std::string metadata = curl_fetch_string(meta_url);
             if (metadata.empty()) {
-                safe_log("\nE: Failed to fetch repository metadata from ", meta_url, "\n");
+                display.finish_item(&source, source.base_url, FetchLineDisplay::ItemOutcome::Err, 0);
+                display.print_message(render_error_line(
+                    "Failed to fetch repository metadata from " + meta_url + "."));
                 report_progress();
                 return false;
             }
 
             std::string signature = curl_fetch_string(sig_url);
             if (signature.empty()) {
-                safe_log("\nE: Repository ", source.base_url, " is missing its minisign signature.\n");
-                safe_log("E: Expected signature file: ", sig_url, "\n");
-                safe_log("E: Weld refuses to trust unsigned repository metadata.\n");
+                display.finish_item(&source, source.base_url, FetchLineDisplay::ItemOutcome::Err,
+                                    metadata.size());
+                display.print_message(render_error_line(
+                    "The repository (" + source.base_url
+                    + ") could not have its minisign signature verified. Skipping."));
                 report_progress();
                 return false;
             }
 
             auto verified = verify_repo_metadata_signature(metadata, signature);
             if (!verified) {
-                safe_log("\nE: Signature verification failed for ", source.base_url, ": ", verified.error(), "\n");
-                safe_log("E: Weld refuses to use this repository.\n");
+                display.finish_item(&source, source.base_url, FetchLineDisplay::ItemOutcome::Err,
+                                    metadata.size() + signature.size());
+                display.print_message(render_error_line(
+                    "The repository (" + source.base_url
+                    + ") could not have its minisign signature verified. Skipping."));
                 report_progress();
                 return false;
             }
 
             std::string safe_release = sanitize_filename(source.release);
             std::string release_dir = g_weld_etc_dir + "/" + safe_release;
-            if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0) {
+            if (exec_argv_devnull_out({"mkdir", "-p", release_dir}) != 0
+                || !write_text_file(release_dir + "/" + std::string{kWeldIndexFileName}, metadata)
+                || !write_text_file(release_dir + "/" + std::string{kWeldIndexFileName} + ".minisig",
+                                    signature)) {
+                display.finish_item(&source, source.base_url, FetchLineDisplay::ItemOutcome::Err,
+                                    metadata.size() + signature.size());
+                display.print_message(render_error_line(
+                    "Failed to store repository metadata for " + source.base_url + "."));
                 report_progress();
                 return false;
             }
-            std::string output_path = release_dir + "/" + std::string{kWeldIndexFileName};
-            if (!write_text_file(output_path, metadata)) {
-                report_progress();
-                return false;
-            }
-            std::string sig_output_path = release_dir + "/" + std::string{kWeldIndexFileName} + ".minisig";
-            if (!write_text_file(sig_output_path, signature)) {
-                report_progress();
-                return false;
-            }
+
+            display.finish_item(&source, source.base_url, FetchLineDisplay::ItemOutcome::Done,
+                                metadata.size() + signature.size());
+            fetched_bytes.fetch_add(metadata.size() + signature.size());
             report_progress();
             return true;
         }));
@@ -2870,7 +3133,9 @@ bool sync_weld_metadata() {
     for (auto& fut : futures) {
         if (!fut.get()) ok = false;
     }
-    safe_log(render_sync_progress(100, "Syncing Weld Repositories"), "\n");
+    display.set_status(100);
+    display.finish();
+    if (totals != nullptr) totals->bytes = fetched_bytes.load();
     return ok;
 #endif
 }
@@ -4954,8 +5219,66 @@ void report_upgradeable_packages() {
         ++count;
     }
     if (count <= 0) return;
-    if (count == 1) std::print("W: 1 package can be upgraded. Run 'weld upgrade' to upgrade it.\n");
-    else std::print("W: {} packages can be upgraded. Run 'weld upgrade' to upgrade them.\n", count);
+    const bool use_color = isatty(STDOUT_FILENO) == 1;
+    const char* prefix = use_color ? "\033[1;33mW:\033[0m " : "W: ";
+    if (count == 1) std::print("{}1 package needs to be updated; run weld upgrade to update it.\n", prefix);
+    else std::print("{}{} packages need to be updated; run weld upgrade to update them.\n", prefix, count);
+}
+
+bool is_gpg_signature_error(const std::string& msg) {
+    std::string lower = to_lower_copy(msg);
+    return lower.find("signature verification failed") != std::string::npos
+        || lower.find("is not signed") != std::string::npos
+        || lower.find("no longer signed") != std::string::npos
+        || lower.find("invalid signature was encountered") != std::string::npos
+        || lower.find("signatures were invalid") != std::string::npos
+        || lower.find("couldn't be verified") != std::string::npos
+        || lower.find("isn't valid, got 'nodata'") != std::string::npos;
+}
+
+std::string extract_repo_url(const std::string& msg) {
+    std::size_t pos = msg.find("http");
+    if (pos == std::string::npos) return {};
+    std::size_t end = msg.find_first_of(" \t\n'\"", pos);
+    std::string url = msg.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    for (std::string_view marker : {"/dists/", "/pool/"}) {
+        std::size_t cut = url.find(marker);
+        if (cut != std::string::npos) url.resize(cut);
+    }
+    return url;
+}
+
+void drain_acq_errors() {
+    const bool use_color = isatty(STDOUT_FILENO) == 1;
+    const char* err_prefix = use_color ? "\033[1;31mE:\033[0m " : "E: ";
+    const char* warn_prefix = use_color ? "\033[1;33mW:\033[0m " : "W: ";
+    while (!_error->empty(GlobalError::NOTICE)) {
+        std::string msg;
+        bool is_err = _error->PopMessage(msg);
+        if (is_gpg_signature_error(msg)) {
+            std::string url = extract_repo_url(msg);
+            if (!url.empty()) {
+                std::print("{}The repository ({}) could not have its GPG signature verified. Skipping.\n",
+                           err_prefix, url);
+                continue;
+            }
+        }
+        std::print("{}{}\n", is_err ? err_prefix : warn_prefix, msg);
+    }
+    _error->MergeWithStack();
+}
+
+void print_fetch_summary(std::chrono::steady_clock::time_point start, std::uint64_t total_bytes) {
+    if (total_bytes == 0) return;
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::uint64_t cps = seconds < 0.01
+        ? 0
+        : static_cast<std::uint64_t>(total_bytes / seconds);
+    std::uint64_t elapsed = static_cast<std::uint64_t>(seconds + 0.5);
+    const bool use_color = isatty(STDOUT_FILENO) == 1;
+    const char* label = use_color ? "\033[1;36mFetched\033[0m " : "Fetched ";
+    std::print("{}{}B in {} ({}B/s)\n", label, apt_size_str(static_cast<double>(total_bytes)),
+               apt_time_str(elapsed), apt_size_str(static_cast<double>(cps)));
 }
 
 void simulate_transaction(const std::string& action, const std::vector<std::string>& pkgs) {
@@ -5339,20 +5662,26 @@ int main(int argc, char** argv) {
     if (!check_system_locks()) return 1;
 
     if (command == "sync") {
+        const auto sync_start = std::chrono::steady_clock::now();
         bool apt_ok = false;
+        std::uint64_t apt_bytes = 0;
         {
             pkgCacheFile cache_file;
             pkgSourceList* src_list = cache_file.GetSourceList();
             if (src_list != nullptr) {
                 WeldSyncStatus status("Syncing APT Repositories");
+                _error->PushToStack();
                 apt_ok = ListUpdate(status, *src_list);
-                if (!apt_ok) _error->DumpErrors();
+                apt_bytes = status.fetched_bytes();
+                drain_acq_errors();
             } else {
                 _error->DumpErrors();
             }
         }
-        bool weld_ok = sync_weld_metadata();
+        SyncTotals weld_totals;
+        bool weld_ok = sync_weld_metadata(&weld_totals);
         if (apt_ok && weld_ok) {
+            print_fetch_summary(sync_start, apt_bytes + weld_totals.bytes);
             report_upgradeable_packages();
             return 0;
         }
