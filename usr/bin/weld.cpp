@@ -310,7 +310,7 @@ void log_warning(std::string_view msg) {
 
 namespace {
 
-constexpr std::string_view kWeldVersion = "6.2.0";
+constexpr std::string_view kWeldVersion = "6.3.0";
 constexpr std::string_view kTreeRoot = "/nsm/weld/root";
 constexpr std::string_view kNfTreeBin = "/usr/bin/nsm";
 constexpr std::string_view kAutoSnapDir = "/nsm/snapshots/auto";
