@@ -4,7 +4,7 @@
 # to compile it use ztc: https://github.com/hludwig-nf/ztc
 # this code also can be compiled as an ELF and an .c,but it is not tha case here.
 # Hludwig (@hludwig-nf)
-# use it with ztc -ztv=p26
+# use it with ztc -ztv=p26 (pre-ztsl 26)
 # Minimum requirements: Debian 14 (Forky/Sid) with GCC 16.
 ztsl.start # start
 }
@@ -17,13 +17,7 @@ gcc -o ./usr/bin/nsm ./usr/bin/nsm.c
 func "weld"
 sys.exec # compiles weld
 ```shell
-
-g++-16 -std=c++26 -O2 -fcontracts -Wall -Wextra \
-  -Dallow_weld_repositories -Dnflinux \
-  -static-libstdc++ -static-libgcc \
-  -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
-  -o weld weld.cpp -lapt-pkg -lcurl -lssl -lcrypto
-
+ g++-16 -std=c++26 -O2 -freflection -Wall -Wextra   -Dallow_weld_repositories -Dnflinux   -static-libstdc++ -static-libgcc   -fstack-protector-strong -D_FORTIFY_SOURCE=3   -o weld weld.cpp -lapt-pkg -lcurl -lssl -lcrypto
 ```
 }
 func "arvor_sys_info" # compiles arvor_sys_info
