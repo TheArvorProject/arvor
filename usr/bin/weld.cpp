@@ -1,4 +1,4 @@
-// The Arvor Project, 2026.
+// NextFerret, 2026.
 // Maintainer: Hludwig (@hludwig-nf) Note: Compile it with GCC 16 or an compiler which supports C++26.
 
 #include <algorithm>
