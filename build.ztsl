@@ -81,6 +81,10 @@ sudo cp {./usr/bin/nsm./usr/bin/,./usr/bin/weld.,./usr/bin/nflxs,./usr/bin/arvor
 ```
 }
 func "chroot"
+sys.exec
+```exec
+sudo chroot arvor
+```
 text.show # prints the text
 ```
  █████  ██████  ██    ██  ██████  ██████      ██      ██ ███    ██ ██    ██ ██   ██
